@@ -1,0 +1,36 @@
+name: "srl-eigrpd"
+arch: "amd64"
+platform: "linux"
+version: "0.1.0"
+section: "default"
+priority: "extra"
+maintainer: "SRL EIGRP <dev@example.com>"
+description: "EIGRP NDK Protocol Daemon for Nokia SR Linux"
+vendor: "SRL Community"
+license: "GPL-2.0-or-later"
+
+contents:
+  - src: ./bin/srl-eigrpd
+    dst: /usr/local/bin/srl-eigrpd
+    file_info:
+      mode: 0755
+  - src: ./appmgr/srl-eigrpd.yml
+    dst: /etc/opt/srlinux/appmgr/srl-eigrpd.yml
+    file_info:
+      mode: 0644
+  - src: ./yang/srl_nokia-eigrp.yang
+    dst: /etc/opt/srlinux/appmgr/yang/srl_nokia-eigrp.yang
+    file_info:
+      mode: 0644
+  - src: ./cli/show_eigrp.py
+    dst: /etc/opt/srlinux/cli/plugins/show_eigrp.py
+    file_info:
+      mode: 0644
+  - src: ./cli/tools_eigrp.py
+    dst: /etc/opt/srlinux/cli/plugins/tools_eigrp.py
+    file_info:
+      mode: 0644
+
+scripts:
+  postinstall: ./packaging/postinstall.sh
+  preremove: ./packaging/preremove.sh

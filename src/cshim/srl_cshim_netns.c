@@ -1,0 +1,123 @@
+#define _GNU_SOURCE
+#include <sched.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+
+#define IPPROTO_EIGRPIGP 88
+
+static __thread int t_netns_depth = 0;
+
+int srl_netns_restore_root(void) {
+    int root_fd = open("/proc/1/ns/net", O_RDONLY | O_CLOEXEC);
+    if (root_fd < 0) {
+        root_fd = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
+    }
+    if (root_fd >= 0) {
+        int ret = setns(root_fd, CLONE_NEWNET);
+        close(root_fd);
+        t_netns_depth = 0;
+        return ret;
+    }
+    t_netns_depth = 0;
+    return -1;
+}
+
+int srl_netns_enter(const char *netinst, int *saved_ns) {
+    if (saved_ns) *saved_ns = 0;
+
+    char path[256];
+    if (netinst && strcmp(netinst, "default") != 0 && strlen(netinst) > 0) {
+        snprintf(path, sizeof(path), "/var/run/netns/srbase-%s", netinst);
+    } else {
+        snprintf(path, sizeof(path), "/var/run/netns/srbase-default");
+    }
+
+    int target_ns = open(path, O_RDONLY | O_CLOEXEC);
+    if (target_ns < 0) {
+        // Wait up to 5 seconds if network-instance netns is being created
+        for (int i = 0; i < 50; i++) {
+            usleep(100000); // 100ms
+            target_ns = open(path, O_RDONLY | O_CLOEXEC);
+            if (target_ns >= 0) break;
+        }
+    }
+    if (target_ns < 0) {
+        return -1;
+    }
+
+    if (setns(target_ns, CLONE_NEWNET) < 0) {
+        close(target_ns);
+        return -1;
+    }
+
+    close(target_ns);
+    t_netns_depth++;
+    return 0;
+}
+
+void srl_netns_leave(int saved_ns) {
+    (void)saved_ns;
+    if (t_netns_depth > 0) {
+        t_netns_depth--;
+    }
+    if (t_netns_depth == 0) {
+        srl_netns_restore_root();
+    }
+}
+
+int srl_netns_socket_open(const char *netinst) {
+    int saved_ns = -1;
+    if (srl_netns_enter(netinst, &saved_ns) < 0) {
+        return -1;
+    }
+
+    int fd = socket(AF_INET, SOCK_RAW, IPPROTO_EIGRPIGP);
+
+    srl_netns_leave(saved_ns);
+
+    if (fd < 0) return -1;
+
+    int hincl = 1;
+    setsockopt(fd, IPPROTO_IP, IP_HDRINCL, &hincl, sizeof(hincl));
+
+    int pktinfo = 1;
+    setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &pktinfo, sizeof(pktinfo));
+
+    uint8_t loop = 0;
+    setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
+
+    uint8_t ttl = 1;
+    setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+
+    return fd;
+}
+
+int srl_netns_ipv6_socket_open(const char *netinst) {
+    int saved_ns = -1;
+    if (srl_netns_enter(netinst, &saved_ns) < 0) {
+        return -1;
+    }
+
+    int fd = socket(AF_INET6, SOCK_RAW, IPPROTO_EIGRPIGP);
+
+    srl_netns_leave(saved_ns);
+
+    if (fd < 0) return -1;
+
+    int pktinfo = 1;
+    setsockopt(fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &pktinfo, sizeof(pktinfo));
+
+    int loop = 0;
+    setsockopt(fd, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, &loop, sizeof(loop));
+
+    int hops = 1;
+    setsockopt(fd, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &hops, sizeof(hops));
+    setsockopt(fd, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &hops, sizeof(hops));
+
+    return fd;
+}

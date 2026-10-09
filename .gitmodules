@@ -1,0 +1,3 @@
+[submodule "src/upstream/eigrp"]
+	path = src/upstream/eigrp
+	url = https://github.com/diivious/eigrp.git

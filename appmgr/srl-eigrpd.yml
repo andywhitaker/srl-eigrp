@@ -1,0 +1,27 @@
+srl_eigrpd:
+  path: /usr/local/bin
+  launch-command: srl-eigrpd
+  search-command: srl-eigrpd
+  version-command: srl-eigrpd --version
+  wait-for-config: No
+  failure-action: 'wait=10'
+  config-delivery-format: json
+  run-as-user: root
+  capabilities:
+    - SYS_ADMIN
+    - NET_ADMIN
+    - NET_RAW
+    - NET_BIND_SERVICE
+  yang-modules:
+    names:
+      - "srl_nokia-eigrp"
+      - "srl_nokia-keychains"
+    source-directories:
+      - "/opt/srlinux/models/iana"
+      - "/opt/srlinux/models/ietf"
+      - "/opt/srlinux/models/srl_nokia/models"
+      - "/opt/srlinux/models/srl_nokia/models/network-instance"
+      - "/opt/srlinux/models/srl_nokia/models/system"
+      - "/opt/srlinux/models/srl_nokia/models/routing-policy"
+      - "/etc/opt/srlinux/appmgr/yang"
+

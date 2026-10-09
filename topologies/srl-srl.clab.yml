@@ -1,0 +1,30 @@
+name: srl-srl-eigrp
+
+topology:
+  nodes:
+    srl1:
+      kind: nokia_srlinux
+      image: ghcr.io/nokia/srlinux:latest
+      type: ixr-d2l
+      binds:
+        - ../dist/srl-eigrpd_0.1.0_linux_amd64.deb:/tmp/srl-eigrpd.deb:ro
+        - ../configs/srl1.cli:/tmp/srl1.cli:ro
+      exec:
+        - dpkg -i /tmp/srl-eigrpd.deb
+        - sleep 10
+        - bash -c "sr_cli -ec < /tmp/srl1.cli"
+
+    srl2:
+      kind: nokia_srlinux
+      image: ghcr.io/nokia/srlinux:latest
+      type: ixr-d2l
+      binds:
+        - ../dist/srl-eigrpd_0.1.0_linux_amd64.deb:/tmp/srl-eigrpd.deb:ro
+        - ../configs/srl2.cli:/tmp/srl2.cli:ro
+      exec:
+        - dpkg -i /tmp/srl-eigrpd.deb
+        - sleep 10
+        - bash -c "sr_cli -ec < /tmp/srl2.cli"
+
+  links:
+    - endpoints: ["srl1:e1-1", "srl2:e1-1"]

@@ -1,0 +1,26 @@
+name: srl-frr-eigrp
+
+topology:
+  nodes:
+    srl1:
+      kind: nokia_srlinux
+      image: ghcr.io/nokia/srlinux:latest
+      type: ixr-d2l
+      binds:
+        - ../dist/srl-eigrpd_0.1.0_linux_amd64.deb:/tmp/srl-eigrpd.deb:ro
+        - ../configs/srl1.cli:/tmp/srl1.cli:ro
+      exec:
+        - dpkg -i /tmp/srl-eigrpd.deb
+        - sleep 10
+        - bash -c "sr_cli -ec < /tmp/srl1.cli"
+
+    frr1:
+      kind: linux
+      image: quay.io/frrouting/frr:10.6.1
+      binds:
+        - ../configs/frr.conf:/etc/frr/frr.conf:ro
+        - ../configs/daemons:/etc/frr/daemons:ro
+        - ../configs/vtysh.conf:/etc/frr/vtysh.conf:ro
+
+  links:
+    - endpoints: ["srl1:e1-1", "frr1:eth1"]

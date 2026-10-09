@@ -1,0 +1,44 @@
+# Binaries and build artifacts
+bin/
+build/
+dist/
+*.deb
+*.o
+*.a
+*.so
+*.tar.gz
+
+# Python and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+ENV/
+
+# Containerlab and runtime artifacts
+clab-*/
+topologies/clab-*
+*.clab.yml.bak
+*.log
+*.sock
+
+# Agent and AI artifacts
+.gemini/
+.antigravity/
+.agy/
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment and sensitive local files
+.env
+.env.*
+*.pem
+*.key

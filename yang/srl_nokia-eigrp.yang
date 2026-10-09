@@ -1,0 +1,698 @@
+module srl_nokia-eigrp {
+  yang-version 1.1;
+  namespace "urn:nokia.com:srlinux:eigrp:eigrp";
+  prefix srl_nokia-eigrp;
+
+  import srl_nokia-common { prefix srl_nokia-comm; }
+  import srl_nokia-network-instance { prefix srl_nokia-netinst; }
+  import srl_nokia-routing-policy { prefix srl-rpol; }
+  import srl_nokia-extensions { prefix srl_nokia-ext; }
+  import srl_nokia-system { prefix srl_nokia-system; }
+  import srl_nokia-keychains { prefix srl_nokia-keychains; }
+
+  description "YANG model for EIGRP protocol in Nokia SR Linux";
+
+  grouping eigrp-actions {
+    description "EIGRP policy actions";
+    container eigrp {
+      description "Enter the eigrp context";
+      container metric {
+        description "Policy actions related to EIGRP route metrics";
+        leaf bandwidth {
+          type uint32;
+          default 100000;
+          description "Bandwidth metric in kilobits per second (K1)";
+        }
+        leaf delay {
+          type uint32;
+          default 100;
+          description "Delay metric in 10-microsecond units (K3)";
+        }
+        leaf reliability {
+          type uint8 {
+            range "1..255";
+          }
+          default 255;
+          description "Reliability metric from 1 to 255 (K4)";
+        }
+        leaf load {
+          type uint8 {
+            range "1..255";
+          }
+          default 1;
+          description "Effective load metric from 1 to 255 (K2)";
+        }
+        leaf mtu {
+          type uint32 {
+            range "576..65535";
+          }
+          default 1500;
+          description "Maximum Transmission Unit in bytes (K5)";
+        }
+      }
+    }
+  }
+
+  grouping eigrp-default-interface-config {
+    leaf admin-state {
+      type srl_nokia-comm:admin-state;
+      default "enable";
+      description "Administrative state of EIGRP interfaces by default";
+    }
+    leaf oper-state {
+      config false;
+      type srl_nokia-comm:oper-state;
+      description "Operational state of EIGRP default-interface";
+    }
+    leaf passive {
+      type boolean;
+      default false;
+      description "Suppress sending/receiving EIGRP hellos on interfaces by default";
+    }
+    leaf hello-interval {
+      type uint16 { range "1..65535"; }
+      default 5;
+      units "seconds";
+      description "Hello interval in seconds by default";
+    }
+    leaf hold-time {
+      type uint16 { range "1..65535"; }
+      default 15;
+      units "seconds";
+      description "Hold time in seconds by default";
+    }
+    leaf split-horizon {
+      type boolean;
+      default true;
+      description "Enable or disable split-horizon on interfaces by default";
+    }
+    leaf next-hop-self {
+      type boolean;
+      default false;
+      description "Advertise this router as next hop on interfaces by default";
+    }
+    leaf bandwidth {
+      type uint32 { range "1..10000000"; }
+      units "kilobits-per-second";
+      description "Interface bandwidth in Kbps by default";
+    }
+    leaf delay {
+      type uint32 { range "1..16777215"; }
+      units "10-microseconds";
+      description "Interface delay in 10-microsecond units by default";
+    }
+    container authentication {
+      description "Authentication configuration applied by default to interfaces";
+      leaf mode {
+        type enumeration {
+          enum md5;
+          enum hmac-sha-256;
+        }
+        description "Authentication mode for EIGRP packets";
+      }
+      leaf keychain {
+        type leafref {
+          path "/srl_nokia-system:system/srl_nokia-keychains:authentication/srl_nokia-keychains:keychain/srl_nokia-keychains:name";
+        }
+        description "Reference to system authentication keychain (/system/authentication/keychain)";
+      }
+      leaf authentication-key {
+        type string;
+        description "Direct plaintext authentication key or password";
+      }
+    }
+    container bfd {
+      description "Bidirectional Forwarding Detection (BFD) default interface configuration";
+      leaf admin-state {
+        type srl_nokia-comm:admin-state;
+        default "disable";
+        description "Administrative state of BFD on interfaces by default";
+      }
+      leaf oper-state {
+        config false;
+        type srl_nokia-comm:oper-state;
+        description "Operational state of BFD on default interface";
+      }
+      leaf desired-minimum-tx-interval {
+        type uint32 {
+          range "10000..100000000";
+        }
+        units "microseconds";
+        default "1000000";
+        description "Desired minimum transmit interval in microseconds";
+      }
+      leaf required-minimum-receive {
+        type uint32 {
+          range "10000..100000000";
+        }
+        units "microseconds";
+        default "1000000";
+        description "Required minimum receive interval in microseconds";
+      }
+      leaf detection-multiplier {
+        type uint8 {
+          range "1..20";
+        }
+        default "3";
+        description "Detection multiplier for BFD session";
+      }
+    }
+  }
+
+  grouping eigrp-interface-config {
+    leaf admin-state {
+      type srl_nokia-comm:admin-state;
+      description "Administrative state of the EIGRP interface";
+    }
+    leaf oper-state {
+      config false;
+      type srl_nokia-comm:oper-state;
+      description "Operational state of the EIGRP interface";
+    }
+    leaf passive {
+      type boolean;
+      description "Suppress sending/receiving EIGRP hellos on this interface";
+    }
+    leaf hello-interval {
+      type uint16 { range "1..65535"; }
+      units "seconds";
+      description "Hello interval in seconds";
+    }
+    leaf hold-time {
+      type uint16 { range "1..65535"; }
+      units "seconds";
+      description "Hold time in seconds";
+    }
+    leaf split-horizon {
+      type boolean;
+      description "Enable or disable split-horizon on this interface";
+    }
+    leaf next-hop-self {
+      type boolean;
+      description "Advertise this router as next hop on this interface";
+    }
+    leaf bandwidth {
+      type uint32 { range "1..10000000"; }
+      units "kilobits-per-second";
+      description "Configured interface bandwidth in Kbps";
+    }
+    leaf delay {
+      type uint32 { range "1..16777215"; }
+      units "10-microseconds";
+      description "Configured interface delay in 10-microsecond units";
+    }
+    list summary-address {
+      key "prefix";
+      description "Configure summary address on this interface";
+      leaf prefix {
+        type srl_nokia-comm:ip-prefix;
+        description "Summary IP prefix to advertise";
+      }
+      leaf distance {
+        type uint8 { range "1..255"; }
+        default 5;
+        description "Administrative distance for summary discard route";
+      }
+    }
+    container authentication {
+      description "Interface packet authentication configuration";
+      leaf mode {
+        type enumeration {
+          enum md5;
+          enum hmac-sha-256;
+        }
+        description "Authentication mode for EIGRP packets";
+      }
+      leaf keychain {
+        type leafref {
+          path "/srl_nokia-system:system/srl_nokia-keychains:authentication/srl_nokia-keychains:keychain/srl_nokia-keychains:name";
+        }
+        description "Reference to system authentication keychain (/system/authentication/keychain)";
+      }
+      leaf authentication-key {
+        type string;
+        description "Direct plaintext authentication key or password";
+      }
+    }
+    container bfd {
+      description "Bidirectional Forwarding Detection (BFD) interface configuration";
+      leaf admin-state {
+        type srl_nokia-comm:admin-state;
+        description "Enable or disable BFD on this interface";
+      }
+      leaf oper-state {
+        config false;
+        type srl_nokia-comm:oper-state;
+        description "Operational state of BFD on this interface";
+      }
+      leaf desired-minimum-tx-interval {
+        type uint32 {
+          range "10000..100000000";
+        }
+        units "microseconds";
+        description "Desired minimum transmit interval in microseconds";
+      }
+      leaf required-minimum-receive {
+        type uint32 {
+          range "10000..100000000";
+        }
+        units "microseconds";
+        description "Required minimum receive interval in microseconds";
+      }
+      leaf detection-multiplier {
+        type uint8 {
+          range "1..20";
+        }
+        description "Detection multiplier for BFD session";
+      }
+    }
+    container bfd-state {
+      config false;
+      description "Operational state of BFD on the interface";
+      leaf session-state {
+        type string;
+        description "BFD session state (up, down, admin-down, init)";
+      }
+      leaf remote-address {
+        type srl_nokia-comm:ip-address;
+        description "Remote peer address monitored by BFD";
+      }
+    }
+  }
+
+  grouping eigrp-top {
+    container eigrp {
+      presence "Configure EIGRP protocol";
+      leaf admin-state {
+        type srl_nokia-comm:admin-state;
+        default "enable";
+        description "Administrative state of the EIGRP protocol instance";
+      }
+      leaf autonomous-system {
+        type uint16 {
+          range "1..65535";
+        }
+        mandatory true;
+        description "EIGRP Autonomous System Number";
+      }
+      leaf router-id {
+        type srl_nokia-comm:ipv4-address;
+        description "EIGRP 32-bit Router ID";
+      }
+      leaf export-policy {
+        type leafref {
+          path "/srl-rpol:routing-policy/srl-rpol:policy/srl-rpol:name";
+        }
+        description "Export policy for EIGRP route redistribution";
+      }
+      leaf import-policy {
+        type leafref {
+          path "/srl-rpol:routing-policy/srl-rpol:policy/srl-rpol:name";
+        }
+        description "Import policy for filtering EIGRP routes";
+      }
+      leaf variance {
+        type uint8 {
+          range "1..128";
+        }
+        default 1;
+        description "Multiplier for unequal-cost load balancing";
+      }
+      leaf maximum-paths {
+        type uint8 {
+          range "1..64";
+        }
+        default 4;
+        description "Maximum number of parallel equal-cost paths (ECMP)";
+      }
+      leaf maximum-hops {
+        type uint8 {
+          range "1..255";
+        }
+        default 100;
+        description "Maximum hop count limit for EIGRP routes";
+      }
+      leaf rib-scale {
+        type uint8 {
+          range "1..255";
+        }
+        default 128;
+        description "Scale factor for converting 64-bit wide metrics to 32-bit RIB metrics";
+      }
+      leaf wide-metrics {
+        type boolean;
+        default true;
+        description "Enable RFC 7868 64-bit wide metrics";
+      }
+      container graceful-restart {
+        description "Graceful restart (Non-Stop Forwarding / NSF) configuration";
+        leaf admin-state {
+          type srl_nokia-comm:admin-state;
+          default "enable";
+          description "Administrative state of graceful restart";
+        }
+        leaf restart-time {
+          type uint16 {
+            range "1..3600";
+          }
+          default 120;
+          units "seconds";
+          description "Maximum time allowed to complete restart signaling and resynchronization";
+        }
+        leaf helper-mode {
+          type boolean;
+          default true;
+          description "Enable graceful restart helper mode to retain forwarding for restarting peers";
+        }
+        leaf oper-state {
+          config false;
+          type srl_nokia-comm:oper-state;
+          description "Operational state of graceful restart";
+        }
+      }
+      container metrics {
+        description "K-values for composite metric calculation";
+        leaf bandwidth {
+          type uint8;
+          default 1;
+          description "Bandwidth weight (K1)";
+        }
+        leaf load {
+          type uint8;
+          default 0;
+          description "Load weight (K2)";
+        }
+        leaf delay {
+          type uint8;
+          default 1;
+          description "Delay weight (K3)";
+        }
+        leaf reliability {
+          type uint8;
+          default 0;
+          description "Reliability weight (K4)";
+        }
+        leaf mtu {
+          type uint8;
+          default 0;
+          description "MTU weight (K5)";
+        }
+        leaf k6 {
+          type uint8;
+          default 0;
+          description "Extended attributes weight (K6)";
+        }
+        leaf extended-attributes {
+          type uint8;
+          default 0;
+          description "Extended attributes weight (K6)";
+        }
+        leaf rib-scale {
+          type uint8 {
+            range "1..255";
+          }
+          default 128;
+          description "Scale factor for converting 64-bit wide metrics to 32-bit RIB metrics";
+        }
+      }
+      container metric-weights {
+        status deprecated;
+        description "Deprecated: Use metrics instead. K-values for composite metric calculation";
+        leaf bandwidth {
+          type uint8;
+          default 1;
+          description "Bandwidth weight (K1)";
+        }
+        leaf load {
+          type uint8;
+          default 0;
+          description "Load weight (K2)";
+        }
+        leaf delay {
+          type uint8;
+          default 1;
+          description "Delay weight (K3)";
+        }
+        leaf reliability {
+          type uint8;
+          default 0;
+          description "Reliability weight (K4)";
+        }
+        leaf mtu {
+          type uint8;
+          default 0;
+          description "MTU weight (K5)";
+        }
+      }
+      container default-interface {
+        description "Default interface configuration for EIGRP";
+        uses eigrp-default-interface-config;
+      }
+      container timers {
+        leaf active-time {
+          type uint16;
+          default 3;
+          units "minutes";
+          description "DUAL SIA timer";
+        }
+      }
+      list interface {
+        key "interface-name";
+        description "List of interfaces participating in EIGRP";
+        leaf interface-name {
+          type srl_nokia-comm:subinterface-all;
+          description "Router logical subinterface name (e.g. ethernet-1/1.0, system0.0)";
+        }
+        uses eigrp-interface-config;
+        leaf ip-address {
+          config false;
+          type srl_nokia-comm:ip-address;
+          description "IPv4 address assigned to the interface";
+        }
+        leaf prefix-length {
+          config false;
+          type uint8;
+          description "IPv4 prefix length of the interface";
+        }
+      }
+      leaf-list network {
+        status deprecated;
+        type srl_nokia-comm:ipv4-prefix;
+        description "Deprecated: Use interface instead. IPv4 networks participating in EIGRP";
+      }
+      list static-neighbor {
+        key "ip-address";
+        description "Statically configured EIGRP neighbors";
+        leaf ip-address {
+          type srl_nokia-comm:ipv4-address;
+          description "IPv4 address of the static neighbor";
+        }
+        leaf interface {
+          type srl_nokia-comm:subinterface-all;
+          description "Interface connected to the static neighbor";
+        }
+        leaf oper-state {
+          config false;
+          type srl_nokia-comm:oper-state;
+          description "Operational state of the static neighbor";
+        }
+      }
+      container authentication {
+        description "Instance-wide packet authentication configuration";
+        leaf mode {
+          type enumeration {
+            enum md5;
+            enum hmac-sha-256;
+          }
+          description "Authentication mode for EIGRP packets";
+        }
+        leaf keychain {
+          type leafref {
+            path "/srl_nokia-system:system/srl_nokia-keychains:authentication/srl_nokia-keychains:keychain/srl_nokia-keychains:name";
+          }
+          description "Reference to system authentication keychain (/system/authentication/keychain)";
+        }
+        leaf authentication-key {
+          type string;
+          description "Direct plaintext authentication key or password";
+        }
+      }
+
+      container ipv6-unicast {
+        presence "Enable IPv6 unicast address family for EIGRP";
+        description "IPv6 unicast address family configuration";
+        leaf admin-state {
+          type srl_nokia-comm:admin-state;
+          default "enable";
+          description "Administrative state of IPv6 address family";
+        }
+        leaf oper-state {
+          config false;
+          type srl_nokia-comm:oper-state;
+          description "Operational state of IPv6 address family";
+        }
+        leaf export-policy {
+          type leafref {
+            path "/srl-rpol:routing-policy/srl-rpol:policy/srl-rpol:name";
+          }
+          description "Export policy for IPv6 EIGRP route redistribution";
+        }
+        leaf import-policy {
+          type leafref {
+            path "/srl-rpol:routing-policy/srl-rpol:policy/srl-rpol:name";
+          }
+          description "Import policy for filtering IPv6 EIGRP routes";
+        }
+        list interface {
+          key "interface-name";
+          description "List of IPv6 interfaces participating in EIGRP";
+          leaf interface-name {
+            type srl_nokia-comm:subinterface-all;
+            description "Router logical subinterface name";
+          }
+          uses eigrp-interface-config;
+        }
+      }
+
+      list address-family {
+        key "name";
+        description "List of address families participating in EIGRP";
+        leaf name {
+          type string;
+          description "Address family name (e.g. ipv6, ipv6-unicast, ipv4, ipv4-unicast)";
+        }
+        leaf admin-state {
+          type srl_nokia-comm:admin-state;
+          default "enable";
+          description "Administrative state of the address family";
+        }
+        leaf oper-state {
+          config false;
+          type srl_nokia-comm:oper-state;
+          description "Operational state of the address family";
+        }
+        leaf export-policy {
+          type leafref {
+            path "/srl-rpol:routing-policy/srl-rpol:policy/srl-rpol:name";
+          }
+          description "Export policy for EIGRP route redistribution";
+        }
+        leaf import-policy {
+          type leafref {
+            path "/srl-rpol:routing-policy/srl-rpol:policy/srl-rpol:name";
+          }
+          description "Import policy for filtering EIGRP routes";
+        }
+        list interface {
+          key "interface-name";
+          description "List of interfaces participating in this address family";
+          leaf interface-name {
+            type srl_nokia-comm:subinterface-all;
+            description "Router logical subinterface name";
+          }
+          uses eigrp-interface-config;
+        }
+      }
+
+      // Operational state leaves and lists directly under eigrp:
+      leaf oper-state {
+        config false;
+        type srl_nokia-comm:oper-state;
+        description "Operational state of the EIGRP protocol instance";
+      }
+      leaf total-interfaces {
+        config false;
+        type uint32;
+        description "Number of participating interfaces";
+      }
+      leaf total-neighbors {
+        config false;
+        type uint32;
+        description "Number of active EIGRP neighbors";
+      }
+      leaf total-routes {
+        config false;
+        type uint32;
+        description "Number of learned EIGRP routes";
+      }
+      list neighbor {
+        key "ip-address";
+        config false;
+        srl_nokia-ext:unordered-state-list "true";
+        description "Active EIGRP neighbors";
+        leaf ip-address { type srl_nokia-comm:ip-address; }
+        leaf interface { type string; }
+        leaf state { type string; }
+        leaf hold-time { type uint16; }
+        leaf uptime { type string; }
+        leaf srtt-ms { type uint32; }
+        leaf rto-ms { type uint32; }
+        leaf bfd-state { type string; description "BFD session operational state"; }
+        leaf restart-state { type string; description "Graceful restart status"; }
+        leaf auth-mode { type string; description "Authentication mode negotiated/used"; }
+      }
+      list route {
+        key "prefix";
+        config false;
+        srl_nokia-ext:unordered-state-list "true";
+        description "Learned EIGRP routes";
+        leaf prefix { type srl_nokia-comm:ip-prefix; }
+        leaf next-hop { type srl_nokia-comm:ip-address; }
+        leaf metric { type uint32; }
+        leaf wide-metric { type uint64; description "64-bit RFC 7868 wide composite metric"; }
+        leaf rib-scale { type uint8; description "RIB scale factor used to derive metric"; }
+        leaf external { type boolean; }
+        leaf preference { type uint8; }
+      }
+      list topology {
+        key "destination";
+        config false;
+        srl_nokia-ext:unordered-state-list "true";
+        description "DUAL topology table entries";
+        leaf destination { type srl_nokia-comm:ip-prefix; }
+        leaf active { type boolean; }
+        leaf feasible-distance { type uint32; }
+        leaf wide-feasible-distance { type uint64; description "64-bit feasible distance"; }
+        leaf successor-count { type uint32; }
+        list route {
+          key "next-hop";
+          srl_nokia-ext:unordered-state-list "true";
+          description "Candidate paths and feasible successors for this topology destination";
+          leaf next-hop { type srl_nokia-comm:ip-address; }
+          leaf interface { type string; }
+          leaf successor { type boolean; }
+          leaf feasible-successor { type boolean; }
+          leaf distance { type uint32; }
+          leaf wide-distance { type uint64; }
+          leaf reported-distance { type uint32; }
+          leaf wide-reported-distance { type uint64; }
+        }
+      }
+      list traffic {
+        key "interface";
+        config false;
+        srl_nokia-ext:unordered-state-list "true";
+        description "Per-interface protocol traffic statistics";
+        leaf interface { type string; }
+        leaf reliable-multicast { type uint64; }
+        leaf unreliable-multicast { type uint64; }
+        leaf reliable-unicast { type uint64; }
+        leaf unreliable-unicast { type uint64; }
+        leaf retransmissions { type uint64; }
+        leaf cr-packets { type uint64; }
+      }
+    }
+  }
+
+  augment "/srl_nokia-netinst:network-instance/srl_nokia-netinst:protocols" {
+    uses eigrp-top;
+  }
+
+  augment "/srl-rpol:routing-policy/srl-rpol:policy/srl-rpol:statement/srl-rpol:action" {
+    uses eigrp-actions;
+  }
+
+  augment "/srl-rpol:routing-policy/srl-rpol:policy/srl-rpol:default-action" {
+    uses eigrp-actions;
+  }
+}
