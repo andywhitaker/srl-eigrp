@@ -211,6 +211,12 @@ typedef struct srl_intf {
     char auth_mode[32];
     char keychain[64];
     char auth_key[256];
+    char auth_mode_v4[32];
+    char keychain_v4[64];
+    char auth_key_v4[256];
+    char auth_mode_v6[32];
+    char keychain_v6[64];
+    char auth_key_v6[256];
     struct srl_intf *next;
 } srl_intf_t;
 
@@ -1048,6 +1054,7 @@ bool eigrp_sys_ipv4_packet_receive(eigrp_instance_t *eigrp, uint8_t *buffer, siz
             pthread_mutex_lock(&g_data_lock);
             for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
                 if (strcmp(ci->netinst, b->netinst) != 0) continue;
+                if (!ci->active) continue;
                 if (memcmp(ci->address.address.bytes, &iph->ip_dst, sizeof(iph->ip_dst)) == 0) {
                     *ifindex = ci->ifindex;
                     break;
@@ -1057,12 +1064,12 @@ bool eigrp_sys_ipv4_packet_receive(eigrp_instance_t *eigrp, uint8_t *buffer, siz
                 uint32_t src_ip = ntohl(iph->ip_src.s_addr);
                 for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
                     if (strcmp(ci->netinst, b->netinst) != 0) continue;
-                    if (ci->address.prefix_length <= 32) {
+                    if (!ci->active) continue;
+                    if (ci->address.prefix_length > 0 && ci->address.prefix_length <= 32) {
                         uint32_t if_ip;
                         memcpy(&if_ip, ci->address.address.bytes, sizeof(if_ip));
                         if_ip = ntohl(if_ip);
-                        uint32_t mask = (ci->address.prefix_length == 0) ? 0 :
-                                        (0xffffffffU << (32U - ci->address.prefix_length));
+                        uint32_t mask = (0xffffffffU << (32U - ci->address.prefix_length));
                         if ((src_ip & mask) == (if_ip & mask)) {
                             *ifindex = ci->ifindex;
                             break;
@@ -1072,7 +1079,11 @@ bool eigrp_sys_ipv4_packet_receive(eigrp_instance_t *eigrp, uint8_t *buffer, siz
             }
             if (*ifindex == 0) {
                 for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
-                    if (strcmp(ci->netinst, b->netinst) == 0) {
+                    if (strcmp(ci->netinst, b->netinst) == 0 &&
+                        ci->active &&
+                        ci->address.prefix_length > 0 &&
+                        strcmp(ci->ifname, "system0.0") != 0 &&
+                        strncmp(ci->ifname, "lo", 2) != 0) {
                         *ifindex = ci->ifindex;
                         break;
                     }
@@ -1081,14 +1092,28 @@ bool eigrp_sys_ipv4_packet_receive(eigrp_instance_t *eigrp, uint8_t *buffer, siz
             pthread_mutex_unlock(&g_data_lock);
         }
 
-        char s_str[INET_ADDRSTRLEN] = "", d_str[INET_ADDRSTRLEN] = "";
-        inet_ntop(AF_INET, &iph->ip_src, s_str, sizeof(s_str));
-        inet_ntop(AF_INET, &iph->ip_dst, d_str, sizeof(d_str));
-        fprintf(stderr, "CSHIM RX (fd %s): src=%s dst=%s len=%zd ifindex=%u mcast=%d\n",
-                b->netinst, s_str, d_str, n, ifindex ? (unsigned)*ifindex : 0,
-                meta ? (int)meta->destination_multicast : 0);
+        bool is_active_v4 = false;
+        if (ifindex && *ifindex > 0) {
+            pthread_mutex_lock(&g_data_lock);
+            for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+                if (strcmp(ci->netinst, b->netinst) == 0 && ci->ifindex == *ifindex && ci->active) {
+                    is_active_v4 = true;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&g_data_lock);
+        }
 
-        return true;
+        if (is_active_v4) {
+            char s_str[INET_ADDRSTRLEN] = "", d_str[INET_ADDRSTRLEN] = "";
+            inet_ntop(AF_INET, &iph->ip_src, s_str, sizeof(s_str));
+            inet_ntop(AF_INET, &iph->ip_dst, d_str, sizeof(d_str));
+            fprintf(stderr, "CSHIM RX (fd %s): src=%s dst=%s len=%zd ifindex=%u mcast=%d\n",
+                    b->netinst, s_str, d_str, n, ifindex ? (unsigned)*ifindex : 0,
+                    meta ? (int)meta->destination_multicast : 0);
+
+            return true;
+        }
     }
 
     // Fallback: Check AF_PACKET raw socket for packets dropped by SR Linux DP
@@ -1164,28 +1189,49 @@ bool eigrp_sys_ipv4_packet_receive(eigrp_instance_t *eigrp, uint8_t *buffer, siz
             }
             if (rx_len) *rx_len = ip_len;
 
+            char ifname_raw[IFNAMSIZ] = "";
+            if_indextoname((unsigned)sll.sll_ifindex, ifname_raw);
+            char mapped_name[64] = "";
+            strncpy(mapped_name, ifname_raw, sizeof(mapped_name) - 1);
+            char *last_dash = strrchr(mapped_name, '-');
+            if (last_dash && isdigit((unsigned char)*(last_dash + 1))) {
+                *last_dash = '.';
+            }
+
             // Match interface in g_interfaces:
             // 1. Try destination IP match (for unicast to interface IP)
             eigrp_ifindex_t found_idx = 0;
             pthread_mutex_lock(&g_data_lock);
             for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
                 if (strcmp(ci->netinst, b->netinst) != 0) continue;
-                if (memcmp(ci->address.address.bytes, &iph->ip_dst, sizeof(iph->ip_dst)) == 0) {
+                if (!ci->active) continue;
+                if (ci->address.prefix_length > 0 && memcmp(ci->address.address.bytes, &iph->ip_dst, sizeof(iph->ip_dst)) == 0) {
                     found_idx = ci->ifindex;
                     break;
                 }
             }
-            // 2. Try subnet match on source IP (for multicast/broadcast or point-to-point)
+            // 2. Try mapped interface name from packet socket
+            if (found_idx == 0 && mapped_name[0]) {
+                for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+                    if (strcmp(ci->netinst, b->netinst) != 0) continue;
+                    if (!ci->active) continue;
+                    if (srl_match_ifname(ci->ifname, mapped_name)) {
+                        found_idx = ci->ifindex;
+                        break;
+                    }
+                }
+            }
+            // 3. Try subnet match on source IP (for multicast/broadcast or point-to-point)
             if (found_idx == 0) {
                 uint32_t src_ip = ntohl(iph->ip_src.s_addr);
                 for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
                     if (strcmp(ci->netinst, b->netinst) != 0) continue;
-                    if (ci->address.prefix_length <= 32) {
+                    if (!ci->active) continue;
+                    if (ci->address.prefix_length > 0 && ci->address.prefix_length <= 32) {
                         uint32_t if_ip;
                         memcpy(&if_ip, ci->address.address.bytes, sizeof(if_ip));
                         if_ip = ntohl(if_ip);
-                        uint32_t mask = (ci->address.prefix_length == 0) ? 0 :
-                                        (0xffffffffU << (32U - ci->address.prefix_length));
+                        uint32_t mask = (0xffffffffU << (32U - ci->address.prefix_length));
                         if ((src_ip & mask) == (if_ip & mask)) {
                             found_idx = ci->ifindex;
                             break;
@@ -1338,19 +1384,33 @@ bool eigrp_sys_ipv6_packet_receive(eigrp_instance_t *eigrp, uint8_t *buffer, siz
                     is_mcast = IN6_IS_ADDR_MULTICAST(&dst_ip);
                 }
             }
-            if (dst) {
-                dst->afi = EIGRP_AFI_IPV6;
-                memcpy(dst->bytes, &dst_ip, 16);
-            }
-            if (ifindex) *ifindex = rx_idx;
 
-            if (meta) {
-                meta->ingress_vrf_id = eigrp->vrf_id;
-                meta->network_header_length = 0;
-                meta->eigrp_length = (uint16_t)n;
-                meta->destination_multicast = is_mcast;
+            bool is_active_v6 = false;
+            if (rx_idx > 0) {
+                pthread_mutex_lock(&g_data_lock);
+                for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+                    if (strcmp(ci->netinst, b->netinst) == 0 && ci->ifindex == rx_idx && ci->active_v6) {
+                        is_active_v6 = true;
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&g_data_lock);
             }
-            return true;
+            if (is_active_v6) {
+                if (dst) {
+                    dst->afi = EIGRP_AFI_IPV6;
+                    memcpy(dst->bytes, &dst_ip, 16);
+                }
+                if (ifindex) *ifindex = rx_idx;
+
+                if (meta) {
+                    meta->ingress_vrf_id = eigrp->vrf_id;
+                    meta->network_header_length = 0;
+                    meta->eigrp_length = (uint16_t)n;
+                    meta->destination_multicast = is_mcast;
+                }
+                return true;
+            }
         }
     }
 
@@ -1415,6 +1475,7 @@ bool eigrp_sys_ipv6_packet_receive(eigrp_instance_t *eigrp, uint8_t *buffer, siz
             pthread_mutex_lock(&g_data_lock);
             for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
                 if (strcmp(ci->netinst, b->netinst) != 0) continue;
+                if (!ci->active_v6) continue;
                 if (memcmp(ci->address_v6.address.bytes, dst_ip6, 16) == 0 ||
                     memcmp(ci->global_v6.address.bytes, dst_ip6, 16) == 0) {
                     found_idx = ci->ifindex;
@@ -1428,6 +1489,7 @@ bool eigrp_sys_ipv6_packet_receive(eigrp_instance_t *eigrp, uint8_t *buffer, siz
             if (found_idx == 0 && IN6_IS_ADDR_MULTICAST(dst_ip6)) {
                 for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
                     if (strcmp(ci->netinst, b->netinst) != 0) continue;
+                    if (!ci->active_v6) continue;
                     if (ci->address_v6.address.afi == EIGRP_AFI_IPV6 &&
                         strcmp(ci->ifname, "system0.0") != 0 &&
                         strncmp(ci->ifname, "lo", 2) != 0) {
@@ -2137,17 +2199,40 @@ static eigrp_result_t srl_nbr_iter_cb(const eigrp_nbr_state_t *st, void *arg) {
     inet_ntop(afi, st->address.bytes, ip_str, sizeof(ip_str));
 
     char auth_mode[32] = "none";
+    bool is_passive = false;
     pthread_mutex_lock(&g_data_lock);
     for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
         if (strcmp(ci->netinst, ni) == 0 && ci->ifname[0] && st->interface_name &&
             strcmp(ci->ifname, st->interface_name) == 0) {
-            if (ci->auth_mode[0] && strcasecmp(ci->auth_mode, "none") != 0) {
-                strncpy(auth_mode, ci->auth_mode, sizeof(auth_mode) - 1);
+            if (st->address.afi == EIGRP_AFI_IPV6) {
+                if (ci->passive_v6) is_passive = true;
+            } else {
+                if (ci->passive) is_passive = true;
+            }
+            const char *eff_mode = NULL;
+            if (st->address.afi == EIGRP_AFI_IPV6) {
+                if (ci->auth_mode_v6[0] && strcasecmp(ci->auth_mode_v6, "none") != 0) {
+                    eff_mode = ci->auth_mode_v6;
+                } else if (ci->auth_mode[0] && strcasecmp(ci->auth_mode, "none") != 0) {
+                    eff_mode = ci->auth_mode;
+                }
+            } else {
+                if (ci->auth_mode_v4[0] && strcasecmp(ci->auth_mode_v4, "none") != 0) {
+                    eff_mode = ci->auth_mode_v4;
+                } else if (ci->auth_mode[0] && strcasecmp(ci->auth_mode, "none") != 0) {
+                    eff_mode = ci->auth_mode;
+                }
+            }
+            if (eff_mode) {
+                strncpy(auth_mode, eff_mode, sizeof(auth_mode) - 1);
             }
             break;
         }
     }
     pthread_mutex_unlock(&g_data_lock);
+    if (is_passive) {
+        return EIGRP_RESULT_SUCCESS;
+    }
 
     srlGoNeighborReport((char *)ni,
                         ip_str,
@@ -2182,21 +2267,38 @@ void srlShimNeighborsReport(const char *netinst) {
 
 void srlShimInterfacesReport(const char *netinst) {
     const char *ni = (netinst && netinst[0]) ? netinst : "default";
+    typedef struct {
+        char ifname[64];
+        char ip_str[INET6_ADDRSTRLEN];
+        uint32_t prefix_length;
+    } rep_intf_t;
+    rep_intf_t reports[128];
+    int count = 0;
+
     pthread_mutex_lock(&g_data_lock);
-    for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+    for (srl_intf_t *ci = g_interfaces; ci && count < 128; ci = ci->next) {
         if (!ci->active && !ci->active_v6) continue;
         if (strcmp(ci->netinst, ni) != 0) continue;
         if (ci->active && ci->address.prefix_length > 0) {
-            char ip_str[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, ci->address.address.bytes, ip_str, sizeof(ip_str));
-            srlGoInterfaceReport((char *)ni, ci->ifname, ip_str, ci->address.prefix_length, "Up");
-        } else if (ci->active_v6 && ci->address_v6.address.afi == EIGRP_AFI_IPV6) {
-            char ip6_str[INET6_ADDRSTRLEN];
-            inet_ntop(AF_INET6, ci->address_v6.address.bytes, ip6_str, sizeof(ip6_str));
-            srlGoInterfaceReport((char *)ni, ci->ifname, ip6_str, ci->address_v6.prefix_length, "Up");
+            strncpy(reports[count].ifname, ci->ifname, sizeof(reports[count].ifname) - 1);
+            reports[count].ifname[sizeof(reports[count].ifname) - 1] = '\0';
+            inet_ntop(AF_INET, ci->address.address.bytes, reports[count].ip_str, sizeof(reports[count].ip_str));
+            reports[count].prefix_length = ci->address.prefix_length;
+            count++;
+        }
+        if (ci->active_v6 && ci->address_v6.address.afi == EIGRP_AFI_IPV6 && count < 128) {
+            strncpy(reports[count].ifname, ci->ifname, sizeof(reports[count].ifname) - 1);
+            reports[count].ifname[sizeof(reports[count].ifname) - 1] = '\0';
+            inet_ntop(AF_INET6, ci->address_v6.address.bytes, reports[count].ip_str, sizeof(reports[count].ip_str));
+            reports[count].prefix_length = ci->address_v6.prefix_length;
+            count++;
         }
     }
     pthread_mutex_unlock(&g_data_lock);
+
+    for (int i = 0; i < count; i++) {
+        srlGoInterfaceReport((char *)ni, reports[i].ifname, reports[i].ip_str, reports[i].prefix_length, "Up");
+    }
 }
 
 int srlShimNeighborClear(const char *netinst, const char *neighbor_ip) {
@@ -2562,6 +2664,9 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
     strncpy(actual_ifname, found->ifname, sizeof(actual_ifname) - 1);
     actual_ifname[sizeof(actual_ifname) - 1] = '\0';
     eigrp_ifindex_t ifidx = found->ifindex;
+    eigrp_prefix_t intf_addr = found->address;
+    uint32_t intf_bw = found->bandwidth;
+    uint32_t intf_mtu = found->mtu;
     pthread_mutex_unlock(&g_data_lock);
 
     eigrp_instance_context_t ctx;
@@ -2574,6 +2679,23 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
         eigrp_intf_t *ei = eigrp_intf_lookup_by_name(runtime, actual_ifname);
         if (!ei) {
             ei = eigrp_intf_lookup_by_ifindex(runtime, ifidx);
+        }
+        if (!ei && admin_up && intf_addr.prefix_length > 0) {
+            eigrp_intf_runtime_state_t st;
+            memset(&st, 0, sizeof(st));
+            st.interface_name = actual_ifname;
+            st.ifindex = ifidx;
+            st.address = intf_addr;
+            st.type = 1;
+            st.secondary = false;
+            st.operative = true;
+            st.bandwidth = (bandwidth > 0) ? bandwidth : intf_bw;
+            st.mtu = intf_mtu;
+            eigrp_intf_runtime_update(EIGRP_SET, runtime, &st, NULL);
+            ei = eigrp_intf_lookup_by_name(runtime, actual_ifname);
+            if (!ei) {
+                ei = eigrp_intf_lookup_by_ifindex(runtime, ifidx);
+            }
         }
         if (ei) {
             bool was_passive = (ei->params.passive_interface == EIGRP_INTF_PASSIVE);
@@ -2602,13 +2724,24 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
             }
             eigrp_intf_multicast_update(EIGRP_SET, ei);
             if (passive) {
-                if (!was_passive && !strstr(actual_ifname, "system") && !strstr(actual_ifname, "lo")) {
-                    eigrp_hello_send(ei, EIGRP_HELLO_GRACEFUL_SHUTDOWN, NULL);
+                if (!strstr(actual_ifname, "system") && !strstr(actual_ifname, "lo")) {
+                    if (!was_passive) {
+                        eigrp_hello_send(ei, EIGRP_HELLO_GRACEFUL_SHUTDOWN, NULL);
+                    }
                     eigrp_nbr_clear_request_t req;
                     memset(&req, 0, sizeof(req));
-                    req.interface_name = actual_ifname;
+                    req.interface_name = (ei->name && ei->name[0]) ? ei->name : actual_ifname;
                     size_t affected = 0;
                     (void)eigrp_nbr_clear(runtime, &req, NULL, NULL, &affected);
+                    if (ei->nbrs) {
+                        eigrp_list_item_t *nbr_node = NULL, *next_node = NULL;
+                        eigrp_nbr_t *nbr = NULL;
+                        for (EIGRP_LIST_ITERATE(ei->nbrs, nbr_node, next_node, nbr)) {
+                            if (nbr) {
+                                eigrp_nbr_delete(nbr);
+                            }
+                        }
+                    }
                 }
             } else if (was_passive && !strstr(actual_ifname, "system") && !strstr(actual_ifname, "lo")) {
                 eigrp_hello_send(ei, EIGRP_HELLO_NORMAL, NULL);
@@ -2621,15 +2754,18 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
             }
             for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
                 if (strcmp(ci->netinst, ni) == 0 && strcmp(ci->ifname, actual_ifname) == 0) {
-                    if (ci->auth_mode[0] && strcasecmp(ci->auth_mode, "none") != 0) {
-                        ei->params.auth_type = (strcasecmp(ci->auth_mode, "md5") == 0) ? EIGRP_AUTH_TYPE_MD5 : EIGRP_AUTH_TYPE_SHA256;
-                        if (ci->auth_key[0]) {
+                    const char *eff_mode = (ci->auth_mode_v4[0]) ? ci->auth_mode_v4 : ci->auth_mode;
+                    const char *eff_key = (ci->auth_key_v4[0]) ? ci->auth_key_v4 : ci->auth_key;
+                    const char *eff_kc = (ci->keychain_v4[0]) ? ci->keychain_v4 : ci->keychain;
+                    if (eff_mode[0] && strcasecmp(eff_mode, "none") != 0) {
+                        ei->params.auth_type = (strcasecmp(eff_mode, "md5") == 0) ? EIGRP_AUTH_TYPE_MD5 : EIGRP_AUTH_TYPE_SHA256;
+                        if (eff_key[0]) {
                             if (ei->params.auth_password) free(ei->params.auth_password);
-                            ei->params.auth_password = strdup(ci->auth_key);
+                            ei->params.auth_password = strdup(eff_key);
                         }
-                        if (ci->keychain[0]) {
+                        if (eff_kc[0]) {
                             if (ei->params.auth_keychain) free(ei->params.auth_keychain);
-                            ei->params.auth_keychain = strdup(ci->keychain);
+                            ei->params.auth_keychain = strdup(eff_kc);
                         }
                     } else {
                         ei->params.auth_type = EIGRP_AUTH_TYPE_NONE;
@@ -2660,7 +2796,7 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
                 eigrp_hello_send(ei, EIGRP_HELLO_GRACEFUL_SHUTDOWN, NULL);
                 eigrp_nbr_clear_request_t req;
                 memset(&req, 0, sizeof(req));
-                req.interface_name = actual_ifname;
+                req.interface_name = (ei->name && ei->name[0]) ? ei->name : actual_ifname;
                 size_t affected = 0;
                 (void)eigrp_nbr_clear(runtime, &req, NULL, NULL, &affected);
             }
@@ -2781,13 +2917,24 @@ int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passi
             }
             eigrp_intf_multicast_update(EIGRP_SET, ei6);
             if (passive) {
-                if (!was_passive && !strstr(actual_ifname, "system") && !strstr(actual_ifname, "lo")) {
-                    eigrp_hello_send(ei6, EIGRP_HELLO_GRACEFUL_SHUTDOWN, NULL);
+                if (!strstr(actual_ifname, "system") && !strstr(actual_ifname, "lo")) {
+                    if (!was_passive) {
+                        eigrp_hello_send(ei6, EIGRP_HELLO_GRACEFUL_SHUTDOWN, NULL);
+                    }
                     eigrp_nbr_clear_request_t req;
                     memset(&req, 0, sizeof(req));
-                    req.interface_name = actual_ifname;
+                    req.interface_name = (ei6->name && ei6->name[0]) ? ei6->name : actual_ifname;
                     size_t affected = 0;
                     (void)eigrp_nbr_clear(runtime_v6, &req, NULL, NULL, &affected);
+                    if (ei6->nbrs) {
+                        eigrp_list_item_t *nbr_node = NULL, *next_node = NULL;
+                        eigrp_nbr_t *nbr = NULL;
+                        for (EIGRP_LIST_ITERATE(ei6->nbrs, nbr_node, next_node, nbr)) {
+                            if (nbr) {
+                                eigrp_nbr_delete(nbr);
+                            }
+                        }
+                    }
                 }
             } else if (was_passive && !strstr(actual_ifname, "system") && !strstr(actual_ifname, "lo")) {
                 eigrp_hello_send(ei6, EIGRP_HELLO_NORMAL, NULL);
@@ -2800,15 +2947,18 @@ int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passi
             }
             for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
                 if (strcmp(ci->netinst, ni) == 0 && strcmp(ci->ifname, actual_ifname) == 0) {
-                    if (ci->auth_mode[0] && strcasecmp(ci->auth_mode, "none") != 0) {
-                        ei6->params.auth_type = (strcasecmp(ci->auth_mode, "md5") == 0) ? EIGRP_AUTH_TYPE_MD5 : EIGRP_AUTH_TYPE_SHA256;
-                        if (ci->auth_key[0]) {
+                    const char *eff_mode = (ci->auth_mode_v6[0]) ? ci->auth_mode_v6 : ci->auth_mode;
+                    const char *eff_key = (ci->auth_key_v6[0]) ? ci->auth_key_v6 : ci->auth_key;
+                    const char *eff_kc = (ci->keychain_v6[0]) ? ci->keychain_v6 : ci->keychain;
+                    if (eff_mode[0] && strcasecmp(eff_mode, "none") != 0) {
+                        ei6->params.auth_type = (strcasecmp(eff_mode, "md5") == 0) ? EIGRP_AUTH_TYPE_MD5 : EIGRP_AUTH_TYPE_SHA256;
+                        if (eff_key[0]) {
                             if (ei6->params.auth_password) free(ei6->params.auth_password);
-                            ei6->params.auth_password = strdup(ci->auth_key);
+                            ei6->params.auth_password = strdup(eff_key);
                         }
-                        if (ci->keychain[0]) {
+                        if (eff_kc[0]) {
                             if (ei6->params.auth_keychain) free(ei6->params.auth_keychain);
-                            ei6->params.auth_keychain = strdup(ci->keychain);
+                            ei6->params.auth_keychain = strdup(eff_kc);
                         }
                     } else {
                         ei6->params.auth_type = EIGRP_AUTH_TYPE_NONE;
@@ -2831,7 +2981,7 @@ int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passi
                     eigrp_hello_send(ei6, EIGRP_HELLO_GRACEFUL_SHUTDOWN, NULL);
                     eigrp_nbr_clear_request_t req;
                     memset(&req, 0, sizeof(req));
-                    req.interface_name = actual_ifname;
+                    req.interface_name = (ei6->name && ei6->name[0]) ? ei6->name : actual_ifname;
                     size_t affected = 0;
                     (void)eigrp_nbr_clear(runtime_v6, &req, NULL, NULL, &affected);
                 }
@@ -2857,6 +3007,14 @@ int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passi
             ei6 = eigrp_intf_lookup_by_ifindex(runtime_v6, ifidx);
         }
         if (ei6) {
+            if (!strstr(actual_ifname, "system") && !strstr(actual_ifname, "lo")) {
+                eigrp_hello_send(ei6, EIGRP_HELLO_GRACEFUL_SHUTDOWN, NULL);
+                eigrp_nbr_clear_request_t req;
+                memset(&req, 0, sizeof(req));
+                req.interface_name = (ei6->name && ei6->name[0]) ? ei6->name : actual_ifname;
+                size_t affected = 0;
+                (void)eigrp_nbr_clear(runtime_v6, &req, NULL, NULL, &affected);
+            }
             eigrp_intf_down(ei6);
         }
     }
@@ -2882,6 +3040,11 @@ int srlShimInstanceDeleteV6(const char *netinst, uint16_t asn) {
     char inst_name[128];
     snprintf(inst_name, sizeof(inst_name), "srl-v6-%s-%u", ni, asn);
     eigrp_af_config_delete(inst_name, EIGRP_AFI_IPV6, ni, asn);
+
+    eigrp_instance_t *runtime_v6 = srl_instance_get_afi(ni, EIGRP_AFI_IPV6);
+    if (runtime_v6) {
+        eigrp_instance_delete(runtime_v6);
+    }
     return 0;
 }
 
@@ -3029,6 +3192,160 @@ int srlShimRouteWithdrawV6(const char *netinst, const char *prefix_str) {
     return (res == EIGRP_RESULT_SUCCESS) ? 0 : -1;
 }
 
+int srlShimRouteRedistributeAdd(const char *netinst, const char *prefix_str, const char *proto_str,
+                                const char *nexthop_str, uint32_t bw, uint32_t delay,
+                                uint8_t reliability, uint8_t load, uint32_t mtu) {
+    if (!prefix_str || !prefix_str[0]) return -1;
+    const char *ni = (netinst && netinst[0]) ? netinst : "default";
+
+    bool is_v6 = (strchr(prefix_str, ':') != NULL);
+    int afi = is_v6 ? EIGRP_AFI_IPV6 : EIGRP_AFI_IPV4;
+    eigrp_instance_t *runtime = srl_instance_get_afi(ni, afi);
+    if (!runtime) return -1;
+
+    char pfx_copy[128];
+    strncpy(pfx_copy, prefix_str, sizeof(pfx_copy) - 1);
+    pfx_copy[sizeof(pfx_copy) - 1] = '\0';
+
+    char *slash = strchr(pfx_copy, '/');
+    uint8_t plen = is_v6 ? 128 : 32;
+    if (slash) {
+        *slash = '\0';
+        plen = (uint8_t)atoi(slash + 1);
+    }
+
+    eigrp_prefix_t pfx;
+    memset(&pfx, 0, sizeof(pfx));
+    pfx.address.afi = afi;
+    int af_family = is_v6 ? AF_INET6 : AF_INET;
+    if (inet_pton(af_family, pfx_copy, pfx.address.bytes) != 1) {
+        return -1;
+    }
+    pfx.prefix_length = plen;
+    eigrp_prefix_normalize(&pfx);
+
+    eigrp_redist_protocol_t protocol = EIGRP_REDISTRIBUTE_PROTOCOL_STATIC;
+    if (proto_str) {
+        if (strcasestr(proto_str, "ospf") != NULL) {
+            protocol = EIGRP_REDISTRIBUTE_PROTOCOL_OSPF;
+        } else if (strcasestr(proto_str, "bgp") != NULL) {
+            protocol = EIGRP_REDISTRIBUTE_PROTOCOL_BGP;
+        } else if (strcasestr(proto_str, "isis") != NULL || strcasestr(proto_str, "is-is") != NULL) {
+            protocol = EIGRP_REDISTRIBUTE_PROTOCOL_ISIS;
+        } else if (strcasestr(proto_str, "connected") != NULL || strcasestr(proto_str, "local") != NULL || strcasestr(proto_str, "host") != NULL) {
+            protocol = EIGRP_REDISTRIBUTE_PROTOCOL_CONNECTED;
+        } else if (strcasestr(proto_str, "static") != NULL) {
+            protocol = EIGRP_REDISTRIBUTE_PROTOCOL_STATIC;
+        }
+    }
+
+    eigrp_rib_route_t sr;
+    memset(&sr, 0, sizeof(sr));
+    sr.prefix = pfx;
+    sr.redist.source.protocol = protocol;
+    sr.redist.source.route_instance = 0;
+    sr.install.type = EIGRP_RIB_ROUTE_EXTERNAL;
+
+    eigrp_rib_nexthop_t nh;
+    memset(&nh, 0, sizeof(nh));
+    if (nexthop_str && nexthop_str[0] && strcmp(nexthop_str, "::") != 0 && strcmp(nexthop_str, "0.0.0.0") != 0) {
+        nh.gateway_present = true;
+        nh.gateway.afi = afi;
+        if (inet_pton(af_family, nexthop_str, nh.gateway.bytes) == 1) {
+            sr.nexthops = &nh;
+            sr.nexthop_count = 1;
+        }
+    }
+
+    eigrp_metrics_t metric;
+    memset(&metric, 0, sizeof(metric));
+    metric.bandwidth = eigrp_bandwidth_to_scaled((bw > 0) ? bw : 100000);
+    metric.delay = (delay > 0) ? delay : 100;
+    metric.reliability = (reliability > 0) ? reliability : 255;
+    metric.load = (load > 0) ? load : 1;
+    uint32_t m = (mtu > 0) ? mtu : 1500;
+    metric.mtu[0] = m & 0xff;
+    metric.mtu[1] = (m >> 8) & 0xff;
+    metric.mtu[2] = (m >> 16) & 0xff;
+    metric.hop_count = 0;
+
+    eigrp_result_t res = eigrp_topology_redistributed_route_update(runtime, &sr, &metric);
+    return (res == EIGRP_RESULT_SUCCESS) ? 0 : -1;
+}
+
+int srlShimRouteRedistributeRemove(const char *netinst, const char *prefix_str, const char *proto_str) {
+    if (!prefix_str || !prefix_str[0]) return -1;
+    const char *ni = (netinst && netinst[0]) ? netinst : "default";
+
+    bool is_v6 = (strchr(prefix_str, ':') != NULL);
+    int afi = is_v6 ? EIGRP_AFI_IPV6 : EIGRP_AFI_IPV4;
+    eigrp_instance_t *runtime = srl_instance_get_afi(ni, afi);
+    if (!runtime) return -1;
+
+    char pfx_copy[128];
+    strncpy(pfx_copy, prefix_str, sizeof(pfx_copy) - 1);
+    pfx_copy[sizeof(pfx_copy) - 1] = '\0';
+
+    char *slash = strchr(pfx_copy, '/');
+    uint8_t plen = is_v6 ? 128 : 32;
+    if (slash) {
+        *slash = '\0';
+        plen = (uint8_t)atoi(slash + 1);
+    }
+
+    eigrp_prefix_t pfx;
+    memset(&pfx, 0, sizeof(pfx));
+    pfx.address.afi = afi;
+    int af_family = is_v6 ? AF_INET6 : AF_INET;
+    if (inet_pton(af_family, pfx_copy, pfx.address.bytes) != 1) {
+        return -1;
+    }
+    pfx.prefix_length = plen;
+    eigrp_prefix_normalize(&pfx);
+
+    eigrp_redist_protocol_t protos[] = {
+        EIGRP_REDISTRIBUTE_PROTOCOL_OSPF,
+        EIGRP_REDISTRIBUTE_PROTOCOL_BGP,
+        EIGRP_REDISTRIBUTE_PROTOCOL_ISIS,
+        EIGRP_REDISTRIBUTE_PROTOCOL_STATIC,
+        EIGRP_REDISTRIBUTE_PROTOCOL_CONNECTED
+    };
+    int nprotos = sizeof(protos) / sizeof(protos[0]);
+
+    if (proto_str && proto_str[0]) {
+        if (strcasestr(proto_str, "ospf") != NULL) {
+            protos[0] = EIGRP_REDISTRIBUTE_PROTOCOL_OSPF;
+            nprotos = 1;
+        } else if (strcasestr(proto_str, "bgp") != NULL) {
+            protos[0] = EIGRP_REDISTRIBUTE_PROTOCOL_BGP;
+            nprotos = 1;
+        } else if (strcasestr(proto_str, "isis") != NULL || strcasestr(proto_str, "is-is") != NULL) {
+            protos[0] = EIGRP_REDISTRIBUTE_PROTOCOL_ISIS;
+            nprotos = 1;
+        } else if (strcasestr(proto_str, "static") != NULL) {
+            protos[0] = EIGRP_REDISTRIBUTE_PROTOCOL_STATIC;
+            nprotos = 1;
+        } else if (strcasestr(proto_str, "connected") != NULL || strcasestr(proto_str, "local") != NULL || strcasestr(proto_str, "host") != NULL) {
+            protos[0] = EIGRP_REDISTRIBUTE_PROTOCOL_CONNECTED;
+            nprotos = 1;
+        }
+    }
+
+    int success = 0;
+    for (int i = 0; i < nprotos; i++) {
+        eigrp_rib_route_t sr;
+        memset(&sr, 0, sizeof(sr));
+        sr.prefix = pfx;
+        sr.redist.source.protocol = protos[i];
+        sr.redist.source.route_instance = 0;
+        sr.install.type = EIGRP_RIB_ROUTE_EXTERNAL;
+        if (eigrp_topology_redistributed_route_remove(runtime, &sr) == EIGRP_RESULT_SUCCESS) {
+            success = 1;
+        }
+    }
+    return success ? 0 : -1;
+}
+
 int srlShimInstanceCreateV6(const char *netinst, uint16_t asn, const char *router_id) {
     const char *ni = (netinst && netinst[0]) ? netinst : "default";
 
@@ -3106,6 +3423,7 @@ int srlShimInstanceCreateV6(const char *netinst, uint16_t asn, const char *route
     pthread_mutex_lock(&g_data_lock);
     for (srl_intf_t *ci = g_interfaces; ci && snap_count < 32; ci = ci->next) {
         if (strcmp(ci->netinst, ni) != 0) continue;
+        if (!ci->active_v6) continue;
         eigrp_prefix_t cur_v6 = ci->address_v6;
         if (cur_v6.address.afi != EIGRP_AFI_IPV6 && ci->global_v6.address.afi == EIGRP_AFI_IPV6) {
             cur_v6 = ci->global_v6;
@@ -3325,10 +3643,10 @@ bool eigrp_sys_auth_key_lookup(const char *keychain_name, uint32_t *key_id, char
     return false;
 }
 
-int srlShimInterfaceAuthSet(const char *netinst, const char *ifname, const char *mode, const char *keychain, const char *auth_key) {
+int srlShimInterfaceAuthSetAfi(const char *netinst, const char *ifname, const char *afi, const char *mode, const char *keychain, const char *auth_key) {
     if (!ifname) return -1;
     if (!mode || strcasecmp(mode, "none") == 0) {
-        return srlShimInterfaceAuthClear(netinst, ifname);
+        return srlShimInterfaceAuthClearAfi(netinst, ifname, afi);
     }
     const char *ni = (netinst && netinst[0]) ? netinst : "default";
 
@@ -3346,6 +3664,15 @@ int srlShimInterfaceAuthSet(const char *netinst, const char *ifname, const char 
         srl_decrypt_password(auth_key, decrypted_key, sizeof(decrypted_key));
     }
 
+    int target_afi = -1;
+    if (afi && afi[0]) {
+        if (strcasecmp(afi, "ipv4-unicast") == 0 || strcasecmp(afi, "ipv4") == 0) {
+            target_afi = (int)EIGRP_AFI_IPV4;
+        } else if (strcasecmp(afi, "ipv6-unicast") == 0 || strcasecmp(afi, "ipv6") == 0) {
+            target_afi = (int)EIGRP_AFI_IPV6;
+        }
+    }
+
     pthread_mutex_lock(&g_data_lock);
     char actual_ifname[64] = {0};
     eigrp_ifindex_t ifidx = 0;
@@ -3353,17 +3680,34 @@ int srlShimInterfaceAuthSet(const char *netinst, const char *ifname, const char 
         if (strcmp(ci->netinst, ni) == 0 && srl_match_ifname(ci->ifname, ifname)) {
             strncpy(actual_ifname, ci->ifname, sizeof(actual_ifname) - 1);
             ifidx = ci->ifindex;
-            strncpy(ci->auth_mode, mode, sizeof(ci->auth_mode) - 1);
-            if (keychain && keychain[0]) strncpy(ci->keychain, keychain, sizeof(ci->keychain) - 1);
-            else ci->keychain[0] = '\0';
-            if (decrypted_key[0]) strncpy(ci->auth_key, decrypted_key, sizeof(ci->auth_key) - 1);
-            else ci->auth_key[0] = '\0';
+            if (target_afi == (int)EIGRP_AFI_IPV4) {
+                strncpy(ci->auth_mode_v4, mode, sizeof(ci->auth_mode_v4) - 1);
+                if (keychain && keychain[0]) strncpy(ci->keychain_v4, keychain, sizeof(ci->keychain_v4) - 1);
+                else ci->keychain_v4[0] = '\0';
+                if (decrypted_key[0]) strncpy(ci->auth_key_v4, decrypted_key, sizeof(ci->auth_key_v4) - 1);
+                else ci->auth_key_v4[0] = '\0';
+            } else if (target_afi == (int)EIGRP_AFI_IPV6) {
+                strncpy(ci->auth_mode_v6, mode, sizeof(ci->auth_mode_v6) - 1);
+                if (keychain && keychain[0]) strncpy(ci->keychain_v6, keychain, sizeof(ci->keychain_v6) - 1);
+                else ci->keychain_v6[0] = '\0';
+                if (decrypted_key[0]) strncpy(ci->auth_key_v6, decrypted_key, sizeof(ci->auth_key_v6) - 1);
+                else ci->auth_key_v6[0] = '\0';
+            } else {
+                strncpy(ci->auth_mode, mode, sizeof(ci->auth_mode) - 1);
+                if (keychain && keychain[0]) strncpy(ci->keychain, keychain, sizeof(ci->keychain) - 1);
+                else ci->keychain[0] = '\0';
+                if (decrypted_key[0]) strncpy(ci->auth_key, decrypted_key, sizeof(ci->auth_key) - 1);
+                else ci->auth_key[0] = '\0';
+            }
             break;
         }
     }
 
     for (srl_binding_t *b = g_bindings; b; b = b->next) {
         if (strcmp(b->netinst, ni) == 0 && b->eigrp) {
+            if (target_afi != -1 && (int)eigrp_instance_afi(b->eigrp) != target_afi) {
+                continue;
+            }
             eigrp_intf_t *ei = NULL;
             if (actual_ifname[0]) {
                 ei = eigrp_intf_lookup_by_name(b->eigrp, actual_ifname);
@@ -3398,9 +3742,22 @@ int srlShimInterfaceAuthSet(const char *netinst, const char *ifname, const char 
     return 0;
 }
 
-int srlShimInterfaceAuthClear(const char *netinst, const char *ifname) {
+int srlShimInterfaceAuthSet(const char *netinst, const char *ifname, const char *mode, const char *keychain, const char *auth_key) {
+    return srlShimInterfaceAuthSetAfi(netinst, ifname, NULL, mode, keychain, auth_key);
+}
+
+int srlShimInterfaceAuthClearAfi(const char *netinst, const char *ifname, const char *afi) {
     if (!ifname) return -1;
     const char *ni = (netinst && netinst[0]) ? netinst : "default";
+
+    int target_afi = -1;
+    if (afi && afi[0]) {
+        if (strcasecmp(afi, "ipv4-unicast") == 0 || strcasecmp(afi, "ipv4") == 0) {
+            target_afi = (int)EIGRP_AFI_IPV4;
+        } else if (strcasecmp(afi, "ipv6-unicast") == 0 || strcasecmp(afi, "ipv6") == 0) {
+            target_afi = (int)EIGRP_AFI_IPV6;
+        }
+    }
 
     pthread_mutex_lock(&g_data_lock);
     char actual_ifname[64] = {0};
@@ -3409,15 +3766,34 @@ int srlShimInterfaceAuthClear(const char *netinst, const char *ifname) {
         if (strcmp(ci->netinst, ni) == 0 && srl_match_ifname(ci->ifname, ifname)) {
             strncpy(actual_ifname, ci->ifname, sizeof(actual_ifname) - 1);
             ifidx = ci->ifindex;
-            ci->auth_mode[0] = '\0';
-            ci->keychain[0] = '\0';
-            ci->auth_key[0] = '\0';
+            if (target_afi == (int)EIGRP_AFI_IPV4) {
+                ci->auth_mode_v4[0] = '\0';
+                ci->keychain_v4[0] = '\0';
+                ci->auth_key_v4[0] = '\0';
+            } else if (target_afi == (int)EIGRP_AFI_IPV6) {
+                ci->auth_mode_v6[0] = '\0';
+                ci->keychain_v6[0] = '\0';
+                ci->auth_key_v6[0] = '\0';
+            } else {
+                ci->auth_mode[0] = '\0';
+                ci->keychain[0] = '\0';
+                ci->auth_key[0] = '\0';
+                ci->auth_mode_v4[0] = '\0';
+                ci->keychain_v4[0] = '\0';
+                ci->auth_key_v4[0] = '\0';
+                ci->auth_mode_v6[0] = '\0';
+                ci->keychain_v6[0] = '\0';
+                ci->auth_key_v6[0] = '\0';
+            }
             break;
         }
     }
 
     for (srl_binding_t *b = g_bindings; b; b = b->next) {
         if (strcmp(b->netinst, ni) == 0 && b->eigrp) {
+            if (target_afi != -1 && (int)eigrp_instance_afi(b->eigrp) != target_afi) {
+                continue;
+            }
             eigrp_intf_t *ei = NULL;
             if (actual_ifname[0]) {
                 ei = eigrp_intf_lookup_by_name(b->eigrp, actual_ifname);
@@ -3444,6 +3820,10 @@ int srlShimInterfaceAuthClear(const char *netinst, const char *ifname) {
     }
     pthread_mutex_unlock(&g_data_lock);
     return 0;
+}
+
+int srlShimInterfaceAuthClear(const char *netinst, const char *ifname) {
+    return srlShimInterfaceAuthClearAfi(netinst, ifname, NULL);
 }
 
 /* ------------------------------------------------------------------------

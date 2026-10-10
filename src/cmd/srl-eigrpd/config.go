@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"net"
+	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 	"unsafe"
 
 	ndk "github.com/nokia/srlinux-ndk-go/ndk"
@@ -63,11 +66,25 @@ type StaticNeighborConfig struct {
 	Interface string `json:"interface"`
 }
 
+type BfdStateConfig struct {
+	SessionState  string `json:"session-state,omitempty"`
+	RemoteAddress string `json:"remote-address,omitempty"`
+}
+
 type InterfaceAddressFamilyConfig struct {
-	Name       string `json:"name"`
-	AdminState string `json:"admin-state,omitempty"`
-	OperState  string `json:"oper-state,omitempty"`
-	Passive    *bool  `json:"passive,omitempty"`
+	Name           string                 `json:"name"`
+	AdminState     string                 `json:"admin-state,omitempty"`
+	OperState      string                 `json:"oper-state,omitempty"`
+	OperDownReason string                 `json:"oper-down-reason,omitempty"`
+	Passive        *bool                  `json:"passive,omitempty"`
+	HelloInterval  *uint16                `json:"hello-interval,omitempty"`
+	HoldTime       *uint16                `json:"hold-time,omitempty"`
+	SplitHorizon   *bool                  `json:"split-horizon,omitempty"`
+	NextHopSelf    *bool                  `json:"next-hop-self,omitempty"`
+	SummaryAddress []SummaryAddressConfig `json:"summary-address,omitempty"`
+	Authentication *AuthConfig            `json:"authentication,omitempty"`
+	Bfd            *BfdConfig             `json:"bfd,omitempty"`
+	BfdState       *BfdStateConfig        `json:"bfd-state,omitempty"`
 }
 
 type InterfaceConfig struct {
@@ -100,6 +117,31 @@ type DefaultInterfaceConfig struct {
 	AddressFamily  []InterfaceAddressFamilyConfig `json:"address-family,omitempty"`
 }
 
+func (ic *InterfaceConfig) GetAfiConfig(afi string) *InterfaceAddressFamilyConfig {
+	if ic == nil {
+		return nil
+	}
+	for i := range ic.AddressFamily {
+		if ic.AddressFamily[i].Name == afi {
+			return &ic.AddressFamily[i]
+		}
+	}
+	return nil
+}
+
+func (ic *InterfaceConfig) GetOrCreateAfiConfig(afi string) *InterfaceAddressFamilyConfig {
+	if ic == nil {
+		return nil
+	}
+	for i := range ic.AddressFamily {
+		if ic.AddressFamily[i].Name == afi {
+			return &ic.AddressFamily[i]
+		}
+	}
+	ic.AddressFamily = append(ic.AddressFamily, InterfaceAddressFamilyConfig{Name: afi})
+	return &ic.AddressFamily[len(ic.AddressFamily)-1]
+}
+
 func (ic *InterfaceConfig) IsAfiEnabled(afi string, defAdmin string) bool {
 	if ic == nil {
 		return defAdmin != "disable"
@@ -107,23 +149,16 @@ func (ic *InterfaceConfig) IsAfiEnabled(afi string, defAdmin string) bool {
 	if ic.AdminState == "disable" {
 		return false
 	}
-	for _, af := range ic.AddressFamily {
-		if af.Name == afi {
-			if af.AdminState != "" {
-				return af.AdminState != "disable"
-			}
-			return defAdmin != "disable"
-		}
+	if af := ic.GetAfiConfig(afi); af != nil && af.AdminState != "" {
+		return af.AdminState != "disable"
 	}
 	return defAdmin != "disable"
 }
 
 func (ic *InterfaceConfig) IsAfiPassive(afi string, defPassive bool) bool {
 	if ic != nil {
-		for _, af := range ic.AddressFamily {
-			if af.Name == afi && af.Passive != nil {
-				return *af.Passive
-			}
+		if af := ic.GetAfiConfig(afi); af != nil && af.Passive != nil {
+			return *af.Passive
 		}
 		if ic.Passive != nil {
 			return *ic.Passive
@@ -132,30 +167,232 @@ func (ic *InterfaceConfig) IsAfiPassive(afi string, defPassive bool) bool {
 	return defPassive
 }
 
-func (ic *InterfaceConfig) SetAfiAdminState(afi string, state string) {
-	for i, af := range ic.AddressFamily {
-		if af.Name == afi {
-			ic.AddressFamily[i].AdminState = state
-			return
+func (ic *InterfaceConfig) GetAfiHelloInterval(afi string, defIntf *DefaultInterfaceConfig) uint16 {
+	if ic != nil {
+		if af := ic.GetAfiConfig(afi); af != nil && af.HelloInterval != nil && *af.HelloInterval > 0 {
+			return *af.HelloInterval
+		}
+		if ic.HelloInterval != nil && *ic.HelloInterval > 0 {
+			return *ic.HelloInterval
 		}
 	}
-	ic.AddressFamily = append(ic.AddressFamily, InterfaceAddressFamilyConfig{
-		Name:       afi,
-		AdminState: state,
-	})
+	if defIntf != nil {
+		return defIntf.GetAfiHelloInterval(afi)
+	}
+	return 5
+}
+
+func (ic *InterfaceConfig) GetAfiHoldTime(afi string, defIntf *DefaultInterfaceConfig) uint16 {
+	if ic != nil {
+		if af := ic.GetAfiConfig(afi); af != nil && af.HoldTime != nil && *af.HoldTime > 0 {
+			return *af.HoldTime
+		}
+		if ic.HoldTime != nil && *ic.HoldTime > 0 {
+			return *ic.HoldTime
+		}
+	}
+	if defIntf != nil {
+		return defIntf.GetAfiHoldTime(afi)
+	}
+	return 15
+}
+
+func (ic *InterfaceConfig) GetAfiSplitHorizon(afi string, defIntf *DefaultInterfaceConfig) bool {
+	if ic != nil {
+		if af := ic.GetAfiConfig(afi); af != nil && af.SplitHorizon != nil {
+			return *af.SplitHorizon
+		}
+		if ic.SplitHorizon != nil {
+			return *ic.SplitHorizon
+		}
+	}
+	if defIntf != nil {
+		return defIntf.GetAfiSplitHorizon(afi)
+	}
+	return true
+}
+
+func (ic *InterfaceConfig) GetAfiNextHopSelf(afi string, defIntf *DefaultInterfaceConfig) bool {
+	if ic != nil {
+		if af := ic.GetAfiConfig(afi); af != nil && af.NextHopSelf != nil {
+			return *af.NextHopSelf
+		}
+		if ic.NextHopSelf != nil {
+			return *ic.NextHopSelf
+		}
+	}
+	if defIntf != nil {
+		return defIntf.GetAfiNextHopSelf(afi)
+	}
+	return false
+}
+
+func (ic *InterfaceConfig) GetAfiAuthentication(afi string, defIntf *DefaultInterfaceConfig, instAuth *AuthConfig) *AuthConfig {
+	if ic != nil {
+		if af := ic.GetAfiConfig(afi); af != nil && af.Authentication != nil {
+			return af.Authentication
+		}
+		if ic.Authentication != nil {
+			return ic.Authentication
+		}
+	}
+	if defIntf != nil {
+		if auth := defIntf.GetAfiAuthentication(afi); auth != nil {
+			return auth
+		}
+	}
+	if instAuth != nil {
+		return instAuth
+	}
+	return nil
+}
+
+func (ic *InterfaceConfig) GetAfiBfd(afi string, defIntf *DefaultInterfaceConfig) *BfdConfig {
+	if ic != nil {
+		if af := ic.GetAfiConfig(afi); af != nil && af.Bfd != nil {
+			return af.Bfd
+		}
+		if ic.Bfd != nil {
+			return ic.Bfd
+		}
+	}
+	if defIntf != nil {
+		return defIntf.GetAfiBfd(afi)
+	}
+	return nil
+}
+
+func (ic *InterfaceConfig) GetAfiSummaryAddresses(afi string) []SummaryAddressConfig {
+	if ic == nil {
+		return nil
+	}
+	if af := ic.GetAfiConfig(afi); af != nil && len(af.SummaryAddress) > 0 {
+		return af.SummaryAddress
+	}
+	if len(ic.SummaryAddress) > 0 {
+		var res []SummaryAddressConfig
+		for _, sa := range ic.SummaryAddress {
+			isV6 := strings.Contains(sa.Prefix, ":")
+			if (afi == "ipv6-unicast" && isV6) || (afi == "ipv4-unicast" && !isV6) {
+				res = append(res, sa)
+			}
+		}
+		return res
+	}
+	return nil
+}
+
+func (ic *InterfaceConfig) SetAfiAdminState(afi string, state string) {
+	af := ic.GetOrCreateAfiConfig(afi)
+	if af != nil {
+		af.AdminState = state
+	}
 }
 
 func (ic *InterfaceConfig) SetAfiPassive(afi string, passive *bool) {
-	for i, af := range ic.AddressFamily {
-		if af.Name == afi {
-			ic.AddressFamily[i].Passive = passive
+	af := ic.GetOrCreateAfiConfig(afi)
+	if af != nil {
+		af.Passive = passive
+	}
+}
+
+func (ic *InterfaceConfig) SetAfiHelloInterval(afi string, interval *uint16) {
+	af := ic.GetOrCreateAfiConfig(afi)
+	if af != nil {
+		af.HelloInterval = interval
+	}
+}
+
+func (ic *InterfaceConfig) SetAfiHoldTime(afi string, holdTime *uint16) {
+	af := ic.GetOrCreateAfiConfig(afi)
+	if af != nil {
+		af.HoldTime = holdTime
+	}
+}
+
+func (ic *InterfaceConfig) SetAfiSplitHorizon(afi string, sh *bool) {
+	af := ic.GetOrCreateAfiConfig(afi)
+	if af != nil {
+		af.SplitHorizon = sh
+	}
+}
+
+func (ic *InterfaceConfig) SetAfiNextHopSelf(afi string, nhs *bool) {
+	af := ic.GetOrCreateAfiConfig(afi)
+	if af != nil {
+		af.NextHopSelf = nhs
+	}
+}
+
+func (ic *InterfaceConfig) SetAfiAuthentication(afi string, auth *AuthConfig) {
+	af := ic.GetOrCreateAfiConfig(afi)
+	if af != nil {
+		af.Authentication = auth
+	}
+}
+
+func (ic *InterfaceConfig) SetAfiBfd(afi string, bfd *BfdConfig) {
+	af := ic.GetOrCreateAfiConfig(afi)
+	if af != nil {
+		af.Bfd = bfd
+	}
+}
+
+func (ic *InterfaceConfig) AddOrUpdateAfiSummaryAddress(afi string, sa SummaryAddressConfig) {
+	af := ic.GetOrCreateAfiConfig(afi)
+	if af == nil {
+		return
+	}
+	for i, existing := range af.SummaryAddress {
+		if existing.Prefix == sa.Prefix {
+			af.SummaryAddress[i] = sa
 			return
 		}
 	}
-	ic.AddressFamily = append(ic.AddressFamily, InterfaceAddressFamilyConfig{
-		Name:    afi,
-		Passive: passive,
-	})
+	af.SummaryAddress = append(af.SummaryAddress, sa)
+}
+
+func (ic *InterfaceConfig) DeleteAfiSummaryAddress(afi string, prefix string) {
+	af := ic.GetAfiConfig(afi)
+	if af == nil {
+		return
+	}
+	if prefix == "" {
+		af.SummaryAddress = nil
+		return
+	}
+	var updated []SummaryAddressConfig
+	for _, sa := range af.SummaryAddress {
+		if sa.Prefix != prefix {
+			updated = append(updated, sa)
+		}
+	}
+	af.SummaryAddress = updated
+}
+
+func (dc *DefaultInterfaceConfig) GetAfiConfig(afi string) *InterfaceAddressFamilyConfig {
+	if dc == nil {
+		return nil
+	}
+	for i := range dc.AddressFamily {
+		if dc.AddressFamily[i].Name == afi {
+			return &dc.AddressFamily[i]
+		}
+	}
+	return nil
+}
+
+func (dc *DefaultInterfaceConfig) GetOrCreateAfiConfig(afi string) *InterfaceAddressFamilyConfig {
+	if dc == nil {
+		return nil
+	}
+	for i := range dc.AddressFamily {
+		if dc.AddressFamily[i].Name == afi {
+			return &dc.AddressFamily[i]
+		}
+	}
+	dc.AddressFamily = append(dc.AddressFamily, InterfaceAddressFamilyConfig{Name: afi})
+	return &dc.AddressFamily[len(dc.AddressFamily)-1]
 }
 
 func (dc *DefaultInterfaceConfig) IsAfiEnabled(afi string) bool {
@@ -165,27 +402,144 @@ func (dc *DefaultInterfaceConfig) IsAfiEnabled(afi string) bool {
 	if dc.AdminState == "disable" {
 		return false
 	}
-	for _, af := range dc.AddressFamily {
-		if af.Name == afi {
-			if af.AdminState != "" {
-				return af.AdminState != "disable"
-			}
-			return dc.AdminState != "disable"
-		}
+	if af := dc.GetAfiConfig(afi); af != nil && af.AdminState != "" {
+		return af.AdminState != "disable"
 	}
 	return dc.AdminState != "disable"
 }
 
 func (dc *DefaultInterfaceConfig) IsAfiPassive(afi string) bool {
 	if dc != nil {
-		for _, af := range dc.AddressFamily {
-			if af.Name == afi && af.Passive != nil {
-				return *af.Passive
-			}
+		if af := dc.GetAfiConfig(afi); af != nil && af.Passive != nil {
+			return *af.Passive
 		}
 		return dc.Passive
 	}
 	return false
+}
+
+func (dc *DefaultInterfaceConfig) GetAfiHelloInterval(afi string) uint16 {
+	if dc != nil {
+		if af := dc.GetAfiConfig(afi); af != nil && af.HelloInterval != nil && *af.HelloInterval > 0 {
+			return *af.HelloInterval
+		}
+		if dc.HelloInterval > 0 {
+			return dc.HelloInterval
+		}
+	}
+	return 5
+}
+
+func (dc *DefaultInterfaceConfig) GetAfiHoldTime(afi string) uint16 {
+	if dc != nil {
+		if af := dc.GetAfiConfig(afi); af != nil && af.HoldTime != nil && *af.HoldTime > 0 {
+			return *af.HoldTime
+		}
+		if dc.HoldTime > 0 {
+			return dc.HoldTime
+		}
+	}
+	return 15
+}
+
+func (dc *DefaultInterfaceConfig) GetAfiSplitHorizon(afi string) bool {
+	if dc != nil {
+		if af := dc.GetAfiConfig(afi); af != nil && af.SplitHorizon != nil {
+			return *af.SplitHorizon
+		}
+		if dc.SplitHorizon != nil {
+			return *dc.SplitHorizon
+		}
+	}
+	return true
+}
+
+func (dc *DefaultInterfaceConfig) GetAfiNextHopSelf(afi string) bool {
+	if dc != nil {
+		if af := dc.GetAfiConfig(afi); af != nil && af.NextHopSelf != nil {
+			return *af.NextHopSelf
+		}
+		if dc.NextHopSelf != nil {
+			return *dc.NextHopSelf
+		}
+	}
+	return false
+}
+
+func (dc *DefaultInterfaceConfig) GetAfiAuthentication(afi string) *AuthConfig {
+	if dc != nil {
+		if af := dc.GetAfiConfig(afi); af != nil && af.Authentication != nil {
+			return af.Authentication
+		}
+		return dc.Authentication
+	}
+	return nil
+}
+
+func (dc *DefaultInterfaceConfig) GetAfiBfd(afi string) *BfdConfig {
+	if dc != nil {
+		if af := dc.GetAfiConfig(afi); af != nil && af.Bfd != nil {
+			return af.Bfd
+		}
+		return dc.Bfd
+	}
+	return nil
+}
+
+func (dc *DefaultInterfaceConfig) SetAfiAdminState(afi string, state string) {
+	af := dc.GetOrCreateAfiConfig(afi)
+	if af != nil {
+		af.AdminState = state
+	}
+}
+
+func (dc *DefaultInterfaceConfig) SetAfiPassive(afi string, passive *bool) {
+	af := dc.GetOrCreateAfiConfig(afi)
+	if af != nil {
+		af.Passive = passive
+	}
+}
+
+func (dc *DefaultInterfaceConfig) SetAfiHelloInterval(afi string, interval *uint16) {
+	af := dc.GetOrCreateAfiConfig(afi)
+	if af != nil {
+		af.HelloInterval = interval
+	}
+}
+
+func (dc *DefaultInterfaceConfig) SetAfiHoldTime(afi string, holdTime *uint16) {
+	af := dc.GetOrCreateAfiConfig(afi)
+	if af != nil {
+		af.HoldTime = holdTime
+	}
+}
+
+func (dc *DefaultInterfaceConfig) SetAfiSplitHorizon(afi string, sh *bool) {
+	af := dc.GetOrCreateAfiConfig(afi)
+	if af != nil {
+		af.SplitHorizon = sh
+	}
+}
+
+func (dc *DefaultInterfaceConfig) SetAfiNextHopSelf(afi string, nhs *bool) {
+	af := dc.GetOrCreateAfiConfig(afi)
+	if af != nil {
+		af.NextHopSelf = nhs
+	}
+}
+
+func (dc *DefaultInterfaceConfig) SetAfiAuthentication(afi string, auth *AuthConfig) {
+	af := dc.GetOrCreateAfiConfig(afi)
+	if af != nil {
+		af.Authentication = auth
+	}
+}
+
+func (dc *DefaultInterfaceConfig) SetAfiBfd(afi string, bfd *BfdConfig) {
+	af := dc.GetOrCreateAfiConfig(afi)
+	if af != nil {
+		af.Bfd = bfd
+	}
 }
 
 type TimersConfig struct {
@@ -213,6 +567,39 @@ type PolicyMetricConfig struct {
 	Reliability uint8  `json:"reliability"`
 	Load        uint8  `json:"load"`
 	Mtu         uint32 `json:"mtu"`
+}
+
+type PolicyMatch struct {
+	Protocol string `json:"protocol"`
+}
+
+type PolicyEigrpAction struct {
+	Metric PolicyMetricConfig `json:"metric"`
+}
+
+type PolicyAction struct {
+	PolicyResult string            `json:"policy-result"`
+	Eigrp        PolicyEigrpAction `json:"eigrp"`
+}
+
+type PolicyStatement struct {
+	Name   string       `json:"name"`
+	Match  PolicyMatch  `json:"match"`
+	Action PolicyAction `json:"action"`
+}
+
+type PolicyDef struct {
+	Name          string            `json:"name"`
+	DefaultAction PolicyAction      `json:"default-action"`
+	Statement     []PolicyStatement `json:"statement"`
+}
+
+type CandidateRoute struct {
+	Prefix     string
+	RouteType  string
+	RouteOwner string
+	NextHop    string
+	AFI        string
 }
 
 type AddressFamilyConfig struct {
@@ -325,7 +712,16 @@ func extractSummaryPrefix(cfg *ndk.ConfigNotification) string {
 			}
 		}
 		keys := cfg.GetKey().GetKeys()
-		if len(keys) >= 3 && keys[2] != "" {
+		for _, k := range keys {
+			if _, _, err := net.ParseCIDR(k); err == nil {
+				return k
+			}
+		}
+		jsPath := cfg.GetKey().GetJsPath()
+		if strings.Contains(jsPath, ".address-family") && len(keys) >= 4 && keys[3] != "" {
+			return keys[3]
+		}
+		if len(keys) >= 3 && keys[2] != "" && keys[2] != "ipv4-unicast" && keys[2] != "ipv6-unicast" {
 			return keys[2]
 		}
 	}
@@ -352,6 +748,19 @@ func extractPolicyName(cfg *ndk.ConfigNotification) string {
 }
 
 func (d *EigrpDaemon) applyInterface(inst *EigrpInstance, ifcfg *InterfaceConfig) {
+	if ifcfg == nil || ifcfg.InterfaceName == "" {
+		return
+	}
+	d.mu.RLock()
+	_, exists := inst.configuredInterfaces[ifcfg.InterfaceName]
+	if !exists {
+		_, exists = inst.configuredInterfaces[normalizeIfName(ifcfg.InterfaceName)]
+	}
+	d.mu.RUnlock()
+	if !exists {
+		return
+	}
+
 	cNetinst := C.CString(inst.netinst)
 	defer C.free(unsafe.Pointer(cNetinst))
 
@@ -375,37 +784,17 @@ func (d *EigrpDaemon) applyInterface(inst *EigrpInstance, ifcfg *InterfaceConfig
 
 	adminUp4 := inst.IsAfiEnabled("ipv4-unicast") && ifcfg.IsAfiEnabled("ipv4-unicast", defAdmin4)
 	passive4 := ifcfg.IsAfiPassive("ipv4-unicast", defPassive4)
+	hello4 := ifcfg.GetAfiHelloInterval("ipv4-unicast", inst.defaultIntf)
+	hold4 := ifcfg.GetAfiHoldTime("ipv4-unicast", inst.defaultIntf)
+	sh4 := ifcfg.GetAfiSplitHorizon("ipv4-unicast", inst.defaultIntf)
+	nhs4 := ifcfg.GetAfiNextHopSelf("ipv4-unicast", inst.defaultIntf)
 
 	adminUp6 := inst.IsAfiEnabled("ipv6-unicast") && ifcfg.IsAfiEnabled("ipv6-unicast", defAdmin6)
 	passive6 := ifcfg.IsAfiPassive("ipv6-unicast", defPassive6)
-
-	hello := uint16(5)
-	if ifcfg.HelloInterval != nil && *ifcfg.HelloInterval > 0 {
-		hello = *ifcfg.HelloInterval
-	} else if inst.defaultIntf != nil && inst.defaultIntf.HelloInterval > 0 {
-		hello = inst.defaultIntf.HelloInterval
-	}
-
-	hold := uint16(15)
-	if ifcfg.HoldTime != nil && *ifcfg.HoldTime > 0 {
-		hold = *ifcfg.HoldTime
-	} else if inst.defaultIntf != nil && inst.defaultIntf.HoldTime > 0 {
-		hold = inst.defaultIntf.HoldTime
-	}
-
-	splitHorizon := true
-	if ifcfg.SplitHorizon != nil {
-		splitHorizon = *ifcfg.SplitHorizon
-	} else if inst.defaultIntf != nil && inst.defaultIntf.SplitHorizon != nil {
-		splitHorizon = *inst.defaultIntf.SplitHorizon
-	}
-
-	nextHopSelf := false
-	if ifcfg.NextHopSelf != nil {
-		nextHopSelf = *ifcfg.NextHopSelf
-	} else if inst.defaultIntf != nil && inst.defaultIntf.NextHopSelf != nil {
-		nextHopSelf = *inst.defaultIntf.NextHopSelf
-	}
+	hello6 := ifcfg.GetAfiHelloInterval("ipv6-unicast", inst.defaultIntf)
+	hold6 := ifcfg.GetAfiHoldTime("ipv6-unicast", inst.defaultIntf)
+	sh6 := ifcfg.GetAfiSplitHorizon("ipv6-unicast", inst.defaultIntf)
+	nhs6 := ifcfg.GetAfiNextHopSelf("ipv6-unicast", inst.defaultIntf)
 
 	bandwidth := uint32(0)
 	if ifcfg.Bandwidth != nil && *ifcfg.Bandwidth > 0 {
@@ -421,75 +810,87 @@ func (d *EigrpDaemon) applyInterface(inst *EigrpInstance, ifcfg *InterfaceConfig
 		delay = *inst.defaultIntf.Delay
 	}
 
-	C.srlShimInterfaceEnable(cNetinst, cIfname, C.bool(passive4), C.uint16_t(hello), C.uint16_t(hold), C.bool(adminUp4), C.bool(splitHorizon), C.bool(nextHopSelf), C.uint32_t(bandwidth), C.uint32_t(delay))
-	C.srlShimInterfaceEnableV6(cNetinst, cIfname, C.bool(passive6), C.uint16_t(hello), C.uint16_t(hold), C.bool(adminUp6), C.bool(splitHorizon), C.bool(nextHopSelf), C.uint32_t(bandwidth), C.uint32_t(delay))
+	C.srlShimInterfaceEnable(cNetinst, cIfname, C.bool(passive4), C.uint16_t(hello4), C.uint16_t(hold4), C.bool(adminUp4), C.bool(sh4), C.bool(nhs4), C.uint32_t(bandwidth), C.uint32_t(delay))
+	C.srlShimInterfaceEnableV6(cNetinst, cIfname, C.bool(passive6), C.uint16_t(hello6), C.uint16_t(hold6), C.bool(adminUp6), C.bool(sh6), C.bool(nhs6), C.uint32_t(bandwidth), C.uint32_t(delay))
 
-	authMode := ""
-	authAdmin := ""
-	keychain := ""
-	authKey := ""
-	if ifcfg.Authentication != nil {
-		authAdmin = ifcfg.Authentication.AdminState
-		authMode = ifcfg.Authentication.Mode
-		keychain = ifcfg.Authentication.Keychain
-		authKey = ifcfg.Authentication.AuthenticationKey
-	} else if inst.defaultIntf != nil && inst.defaultIntf.Authentication != nil {
-		authAdmin = inst.defaultIntf.Authentication.AdminState
-		authMode = inst.defaultIntf.Authentication.Mode
-		keychain = inst.defaultIntf.Authentication.Keychain
-		authKey = inst.defaultIntf.Authentication.AuthenticationKey
-	} else if inst.authentication != nil {
-		authAdmin = inst.authentication.AdminState
-		authMode = inst.authentication.Mode
-		keychain = inst.authentication.Keychain
-		authKey = inst.authentication.AuthenticationKey
-	}
-
-	if authAdmin != "disable" && authMode != "" && authMode != "none" {
-		cMode := C.CString(authMode)
-		cKc := C.CString(keychain)
-		cKey := C.CString(authKey)
-		C.srlShimInterfaceAuthSet(cNetinst, cIfname, cMode, cKc, cKey)
+	// IPv4 authentication
+	cAfi4 := C.CString("ipv4-unicast")
+	defer C.free(unsafe.Pointer(cAfi4))
+	auth4 := ifcfg.GetAfiAuthentication("ipv4-unicast", inst.defaultIntf, inst.authentication)
+	if auth4 != nil && auth4.AdminState != "disable" && auth4.Mode != "" && auth4.Mode != "none" {
+		cMode := C.CString(auth4.Mode)
+		cKc := C.CString(auth4.Keychain)
+		cKey := C.CString(auth4.AuthenticationKey)
+		C.srlShimInterfaceAuthSetAfi(cNetinst, cIfname, cAfi4, cMode, cKc, cKey)
 		C.free(unsafe.Pointer(cMode))
 		C.free(unsafe.Pointer(cKc))
 		C.free(unsafe.Pointer(cKey))
 	} else {
-		C.srlShimInterfaceAuthClear(cNetinst, cIfname)
+		C.srlShimInterfaceAuthClearAfi(cNetinst, cIfname, cAfi4)
 	}
 
-	bfdAdmin := "disable"
-	var bfdTx, bfdRx uint32 = 1000000, 1000000
-	var bfdMult uint8 = 3
-	if ifcfg.Bfd != nil {
-		if ifcfg.Bfd.AdminState != "" {
-			bfdAdmin = ifcfg.Bfd.AdminState
+	// IPv6 authentication
+	cAfi6 := C.CString("ipv6-unicast")
+	defer C.free(unsafe.Pointer(cAfi6))
+	auth6 := ifcfg.GetAfiAuthentication("ipv6-unicast", inst.defaultIntf, inst.authentication)
+	if auth6 != nil && auth6.AdminState != "disable" && auth6.Mode != "" && auth6.Mode != "none" {
+		cMode := C.CString(auth6.Mode)
+		cKc := C.CString(auth6.Keychain)
+		cKey := C.CString(auth6.AuthenticationKey)
+		C.srlShimInterfaceAuthSetAfi(cNetinst, cIfname, cAfi6, cMode, cKc, cKey)
+		C.free(unsafe.Pointer(cMode))
+		C.free(unsafe.Pointer(cKc))
+		C.free(unsafe.Pointer(cKey))
+	} else {
+		C.srlShimInterfaceAuthClearAfi(cNetinst, cIfname, cAfi6)
+	}
+
+	// BFD resolution per AFI
+	bfd4 := ifcfg.GetAfiBfd("ipv4-unicast", inst.defaultIntf)
+	bfdAdmin4 := "disable"
+	var bfdTx4, bfdRx4 uint32 = 1000000, 1000000
+	var bfdMult4 uint8 = 3
+	if bfd4 != nil {
+		if bfd4.AdminState != "" {
+			bfdAdmin4 = bfd4.AdminState
 		}
-		if ifcfg.Bfd.DesiredMinimumTxInterval != nil && *ifcfg.Bfd.DesiredMinimumTxInterval > 0 {
-			bfdTx = *ifcfg.Bfd.DesiredMinimumTxInterval
+		if bfd4.DesiredMinimumTxInterval != nil && *bfd4.DesiredMinimumTxInterval > 0 {
+			bfdTx4 = *bfd4.DesiredMinimumTxInterval
 		}
-		if ifcfg.Bfd.RequiredMinimumReceive != nil && *ifcfg.Bfd.RequiredMinimumReceive > 0 {
-			bfdRx = *ifcfg.Bfd.RequiredMinimumReceive
+		if bfd4.RequiredMinimumReceive != nil && *bfd4.RequiredMinimumReceive > 0 {
+			bfdRx4 = *bfd4.RequiredMinimumReceive
 		}
-		if ifcfg.Bfd.DetectionMultiplier != nil && *ifcfg.Bfd.DetectionMultiplier > 0 {
-			bfdMult = *ifcfg.Bfd.DetectionMultiplier
-		}
-	} else if inst.defaultIntf != nil && inst.defaultIntf.Bfd != nil {
-		if inst.defaultIntf.Bfd.AdminState != "" {
-			bfdAdmin = inst.defaultIntf.Bfd.AdminState
-		}
-		if inst.defaultIntf.Bfd.DesiredMinimumTxInterval != nil && *inst.defaultIntf.Bfd.DesiredMinimumTxInterval > 0 {
-			bfdTx = *inst.defaultIntf.Bfd.DesiredMinimumTxInterval
-		}
-		if inst.defaultIntf.Bfd.RequiredMinimumReceive != nil && *inst.defaultIntf.Bfd.RequiredMinimumReceive > 0 {
-			bfdRx = *inst.defaultIntf.Bfd.RequiredMinimumReceive
-		}
-		if inst.defaultIntf.Bfd.DetectionMultiplier != nil && *inst.defaultIntf.Bfd.DetectionMultiplier > 0 {
-			bfdMult = *inst.defaultIntf.Bfd.DetectionMultiplier
+		if bfd4.DetectionMultiplier != nil && *bfd4.DetectionMultiplier > 0 {
+			bfdMult4 = *bfd4.DetectionMultiplier
 		}
 	}
+
+	bfd6 := ifcfg.GetAfiBfd("ipv6-unicast", inst.defaultIntf)
+	bfdAdmin6 := "disable"
+	var bfdTx6, bfdRx6 uint32 = 1000000, 1000000
+	var bfdMult6 uint8 = 3
+	if bfd6 != nil {
+		if bfd6.AdminState != "" {
+			bfdAdmin6 = bfd6.AdminState
+		}
+		if bfd6.DesiredMinimumTxInterval != nil && *bfd6.DesiredMinimumTxInterval > 0 {
+			bfdTx6 = *bfd6.DesiredMinimumTxInterval
+		}
+		if bfd6.RequiredMinimumReceive != nil && *bfd6.RequiredMinimumReceive > 0 {
+			bfdRx6 = *bfd6.RequiredMinimumReceive
+		}
+		if bfd6.DetectionMultiplier != nil && *bfd6.DetectionMultiplier > 0 {
+			bfdMult6 = *bfd6.DetectionMultiplier
+		}
+	}
+
 	for nbrIP, nbr := range inst.neighbors {
 		if normalizeIfName(nbr.Interface) == normalizeIfName(ifcfg.InterfaceName) {
-			_ = d.BfdSessionAddOrUpdate(inst.netinst, nbrIP, ifcfg.InterfaceName, bfdAdmin, bfdTx, bfdRx, bfdMult)
+			if strings.Contains(nbrIP, ":") {
+				_ = d.BfdSessionAddOrUpdate(inst.netinst, nbrIP, ifcfg.InterfaceName, bfdAdmin6, bfdTx6, bfdRx6, bfdMult6)
+			} else {
+				_ = d.BfdSessionAddOrUpdate(inst.netinst, nbrIP, ifcfg.InterfaceName, bfdAdmin4, bfdTx4, bfdRx4, bfdMult4)
+			}
 		}
 	}
 }
@@ -647,6 +1048,7 @@ func (d *EigrpDaemon) applyRedistribute(netinst string, policyName string) {
 
 	if policyName == "" {
 		C.srlShimRedistributeUpdate(cNetinst, nil, 0, 0, 0, 0, 0)
+		d.TriggerRedistSync(netinst)
 		return
 	}
 
@@ -680,6 +1082,7 @@ func (d *EigrpDaemon) applyRedistribute(netinst string, policyName string) {
 	d.mu.RUnlock()
 
 	C.srlShimRedistributeUpdate(cNetinst, cPName, C.uint32_t(bw), C.uint32_t(delay), C.uint8_t(rel), C.uint8_t(load), C.uint32_t(mtu))
+	d.TriggerRedistSync(netinst)
 }
 
 func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
@@ -704,33 +1107,33 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 	// 1. Handle Routing Policy notifications
 	if strings.Contains(jsPath, ".routing-policy") {
 		policyName := extractPolicyName(cfg)
-		if policyName == "" {
-			return
+		d.mu.Lock()
+		if policyName != "" {
+			delete(d.policyDefs, policyName)
+			if op == ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE {
+				delete(d.policies, policyName)
+			}
+		} else {
+			d.policyDefs = make(map[string]*PolicyDef)
 		}
-		if op == ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE {
-			d.mu.Lock()
-			delete(d.policies, policyName)
-			d.mu.Unlock()
-			log.Info().Str("policy", policyName).Msg("Removed routing-policy EIGRP metrics")
+		d.mu.Unlock()
 
+		if op == ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE {
+			log.Info().Str("policy", policyName).Msg("Removed routing-policy statement or policy")
 			d.mu.RLock()
-			var affectedInstances []string
 			for ni, inst := range d.instances {
-				if inst.exportPolicy == policyName {
-					affectedInstances = append(affectedInstances, ni)
+				if policyName == "" || inst.exportPolicy == policyName || inst.GetAfiExportPolicy("ipv4-unicast") == policyName || inst.GetAfiExportPolicy("ipv6-unicast") == policyName {
+					d.TriggerRedistSync(ni)
 				}
 			}
 			d.mu.RUnlock()
-			for _, ni := range affectedInstances {
-				d.applyRedistribute(ni, "")
-			}
 			return
 		}
 
 		var polWrapper struct {
 			Metric PolicyMetricConfig `json:"metric"`
 		}
-		if err := json.Unmarshal([]byte(jsonStr), &polWrapper); err == nil {
+		if err := json.Unmarshal([]byte(jsonStr), &polWrapper); err == nil && (polWrapper.Metric.Bandwidth > 0 || polWrapper.Metric.Delay > 0) {
 			metric := polWrapper.Metric
 			if metric.Bandwidth == 0 {
 				metric.Bandwidth = 100000
@@ -757,7 +1160,7 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			d.mu.RLock()
 			var affectedInstances []string
 			for ni, inst := range d.instances {
-				if inst.exportPolicy == policyName {
+				if inst.exportPolicy == policyName || inst.GetAfiExportPolicy("ipv4-unicast") == policyName || inst.GetAfiExportPolicy("ipv6-unicast") == policyName {
 					affectedInstances = append(affectedInstances, ni)
 				}
 			}
@@ -765,7 +1168,34 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			for _, ni := range affectedInstances {
 				d.applyRedistribute(ni, policyName)
 			}
+		} else {
+			d.mu.RLock()
+			for ni, inst := range d.instances {
+				if policyName == "" || inst.exportPolicy == policyName || inst.GetAfiExportPolicy("ipv4-unicast") == policyName || inst.GetAfiExportPolicy("ipv6-unicast") == policyName {
+					d.TriggerRedistSync(ni)
+				}
+			}
+			d.mu.RUnlock()
 		}
+		return
+	}
+
+	// 2. Handle Commit End
+	if strings.Contains(jsPath, ".commit.end") {
+		d.mu.Lock()
+		d.policyDefs = make(map[string]*PolicyDef)
+		d.mu.Unlock()
+		d.mu.RLock()
+		for ni, inst := range d.instances {
+			if inst != nil && inst.adminState != "disable" && inst.asn > 0 {
+				v4Policy := inst.GetAfiExportPolicy("ipv4-unicast")
+				v6Policy := inst.GetAfiExportPolicy("ipv6-unicast")
+				if v4Policy != "" || v6Policy != "" {
+					d.TriggerRedistSync(ni)
+				}
+			}
+		}
+		d.mu.RUnlock()
 		return
 	}
 
@@ -825,6 +1255,7 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			C.srlShimInstanceDeleteV6(cNetinst, C.uint16_t(inst.asn))
 			d.WithdrawAfRoutes(netinst, "ipv4-unicast")
 			d.WithdrawAfRoutes(netinst, "ipv6-unicast")
+			d.withdrawAllRedistributed(netinst)
 			log.Info().Str("netinst", netinst).Msg("EIGRP instance disabled via admin-state sub-path")
 		} else if inst.asn > 0 {
 			cRouterId := C.CString(inst.routerId)
@@ -844,7 +1275,35 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			for _, ic := range allIntfs {
 				d.applyInterface(inst, ic)
 			}
+			d.TriggerRedistSync(netinst)
 			log.Info().Str("netinst", netinst).Msg("EIGRP instance enabled via admin-state sub-path")
+		}
+		go d.CollectAndPublish(context.Background())
+		return
+	}
+
+	// 1a2. Handle sub-path export-policy notification
+	if strings.Contains(jsPath, ".protocols.eigrp.export-policy") {
+		inst := d.GetOrCreateInstance(netinst)
+		if op == ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE {
+			d.mu.Lock()
+			inst.exportPolicy = ""
+			d.mu.Unlock()
+			d.applyRedistribute(netinst, "")
+		} else {
+			var polName string
+			_ = json.Unmarshal([]byte(jsonStr), &polName)
+			if polName == "" {
+				var wrap struct {
+					ExportPolicy string `json:"export-policy"`
+				}
+				_ = json.Unmarshal([]byte(jsonStr), &wrap)
+				polName = wrap.ExportPolicy
+			}
+			d.mu.Lock()
+			inst.exportPolicy = polName
+			d.mu.Unlock()
+			d.applyRedistribute(netinst, polName)
 		}
 		go d.CollectAndPublish(context.Background())
 		return
@@ -885,8 +1344,143 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 		return
 	}
 
+	// 2a. Handle sub-path default-interface address-family notification
+	if strings.Contains(jsPath, ".protocols.eigrp.default-interface") && strings.Contains(jsPath, ".address-family") {
+		afName := extractAfName(cfg)
+		if afName == "" {
+			return
+		}
+		inst := d.GetOrCreateInstance(netinst)
+		d.mu.Lock()
+		if inst.defaultIntf == nil {
+			inst.defaultIntf = &DefaultInterfaceConfig{AdminState: "enable"}
+		}
+		if op == ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE {
+			if strings.Contains(jsPath, ".passive") {
+				inst.defaultIntf.SetAfiPassive(afName, nil)
+			} else if strings.Contains(jsPath, ".hello-interval") {
+				inst.defaultIntf.SetAfiHelloInterval(afName, nil)
+			} else if strings.Contains(jsPath, ".hold-time") {
+				inst.defaultIntf.SetAfiHoldTime(afName, nil)
+			} else if strings.Contains(jsPath, ".split-horizon") {
+				inst.defaultIntf.SetAfiSplitHorizon(afName, nil)
+			} else if strings.Contains(jsPath, ".next-hop-self") {
+				inst.defaultIntf.SetAfiNextHopSelf(afName, nil)
+			} else if strings.Contains(jsPath, ".authentication") {
+				inst.defaultIntf.SetAfiAuthentication(afName, nil)
+			} else if strings.Contains(jsPath, ".bfd") {
+				inst.defaultIntf.SetAfiBfd(afName, nil)
+			} else if strings.Contains(jsPath, ".admin-state") {
+				inst.defaultIntf.SetAfiAdminState(afName, "")
+			} else {
+				var updatedAF []InterfaceAddressFamilyConfig
+				for _, af := range inst.defaultIntf.AddressFamily {
+					if af.Name != afName {
+						updatedAF = append(updatedAF, af)
+					}
+				}
+				inst.defaultIntf.AddressFamily = updatedAF
+			}
+			intfs := make([]*InterfaceConfig, 0, len(inst.configuredInterfaces))
+			for _, ic := range inst.configuredInterfaces {
+				intfs = append(intfs, ic)
+			}
+			d.mu.Unlock()
+			for _, ic := range intfs {
+				d.applyInterface(inst, ic)
+			}
+			log.Info().Str("netinst", netinst).Str("af", afName).Msg("Deleted default-interface address-family and refreshed interfaces")
+			go d.CollectAndPublish(context.Background())
+			return
+		}
+
+		var afCfg InterfaceAddressFamilyConfig
+		if err := json.Unmarshal([]byte(jsonStr), &afCfg); err == nil && (afCfg.Name != "" || afCfg.AdminState != "" || afCfg.Passive != nil || afCfg.HelloInterval != nil || afCfg.HoldTime != nil || afCfg.SplitHorizon != nil || afCfg.NextHopSelf != nil || afCfg.Authentication != nil || afCfg.Bfd != nil) {
+			if afCfg.Name == "" {
+				afCfg.Name = afName
+			}
+			if afCfg.AdminState != "" {
+				inst.defaultIntf.SetAfiAdminState(afCfg.Name, afCfg.AdminState)
+			}
+			if afCfg.Passive != nil {
+				inst.defaultIntf.SetAfiPassive(afCfg.Name, afCfg.Passive)
+			}
+			if afCfg.HelloInterval != nil {
+				inst.defaultIntf.SetAfiHelloInterval(afCfg.Name, afCfg.HelloInterval)
+			}
+			if afCfg.HoldTime != nil {
+				inst.defaultIntf.SetAfiHoldTime(afCfg.Name, afCfg.HoldTime)
+			}
+			if afCfg.SplitHorizon != nil {
+				inst.defaultIntf.SetAfiSplitHorizon(afCfg.Name, afCfg.SplitHorizon)
+			}
+			if afCfg.NextHopSelf != nil {
+				inst.defaultIntf.SetAfiNextHopSelf(afCfg.Name, afCfg.NextHopSelf)
+			}
+			if afCfg.Authentication != nil {
+				inst.defaultIntf.SetAfiAuthentication(afCfg.Name, afCfg.Authentication)
+			}
+			if afCfg.Bfd != nil {
+				inst.defaultIntf.SetAfiBfd(afCfg.Name, afCfg.Bfd)
+			}
+		} else {
+			if strings.Contains(jsPath, ".passive") {
+				var p bool
+				if err := json.Unmarshal([]byte(jsonStr), &p); err == nil {
+					inst.defaultIntf.SetAfiPassive(afName, &p)
+				}
+			} else if strings.Contains(jsPath, ".hello-interval") {
+				var h uint16
+				if err := json.Unmarshal([]byte(jsonStr), &h); err == nil {
+					inst.defaultIntf.SetAfiHelloInterval(afName, &h)
+				}
+			} else if strings.Contains(jsPath, ".hold-time") {
+				var h uint16
+				if err := json.Unmarshal([]byte(jsonStr), &h); err == nil {
+					inst.defaultIntf.SetAfiHoldTime(afName, &h)
+				}
+			} else if strings.Contains(jsPath, ".split-horizon") {
+				var sh bool
+				if err := json.Unmarshal([]byte(jsonStr), &sh); err == nil {
+					inst.defaultIntf.SetAfiSplitHorizon(afName, &sh)
+				}
+			} else if strings.Contains(jsPath, ".next-hop-self") {
+				var nhs bool
+				if err := json.Unmarshal([]byte(jsonStr), &nhs); err == nil {
+					inst.defaultIntf.SetAfiNextHopSelf(afName, &nhs)
+				}
+			} else if strings.Contains(jsPath, ".admin-state") {
+				var s string
+				if err := json.Unmarshal([]byte(jsonStr), &s); err == nil {
+					inst.defaultIntf.SetAfiAdminState(afName, s)
+				}
+			} else if strings.Contains(jsPath, ".authentication") {
+				var auth AuthConfig
+				if err := json.Unmarshal([]byte(jsonStr), &auth); err == nil {
+					inst.defaultIntf.SetAfiAuthentication(afName, &auth)
+				}
+			} else if strings.Contains(jsPath, ".bfd") {
+				var bfd BfdConfig
+				if err := json.Unmarshal([]byte(jsonStr), &bfd); err == nil {
+					inst.defaultIntf.SetAfiBfd(afName, &bfd)
+				}
+			}
+		}
+		intfs := make([]*InterfaceConfig, 0, len(inst.configuredInterfaces))
+		for _, ic := range inst.configuredInterfaces {
+			intfs = append(intfs, ic)
+		}
+		d.mu.Unlock()
+		for _, ic := range intfs {
+			d.applyInterface(inst, ic)
+		}
+		log.Info().Str("netinst", netinst).Str("af", afName).Msg("Configured default-interface address-family and refreshed interfaces")
+		go d.CollectAndPublish(context.Background())
+		return
+	}
+
 	// 2. Handle sub-path default-interface notification
-	if strings.Contains(jsPath, ".protocols.eigrp.default-interface") {
+	if strings.Contains(jsPath, ".protocols.eigrp.default-interface") && !strings.Contains(jsPath, ".address-family") {
 		inst := d.GetOrCreateInstance(netinst)
 
 		if op == ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE {
@@ -1052,9 +1646,7 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 				if defCfg.AdminState != "" {
 					inst.defaultIntf.AdminState = defCfg.AdminState
 				}
-				if strings.Contains(jsonStr, "\"passive\"") {
-					inst.defaultIntf.Passive = defCfg.Passive
-				}
+				inst.defaultIntf.Passive = defCfg.Passive
 				if defCfg.HelloInterval != 0 {
 					inst.defaultIntf.HelloInterval = defCfg.HelloInterval
 				}
@@ -1078,6 +1670,9 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 				}
 				if defCfg.Bfd != nil {
 					inst.defaultIntf.Bfd = defCfg.Bfd
+				}
+				if len(defCfg.AddressFamily) > 0 {
+					inst.defaultIntf.AddressFamily = defCfg.AddressFamily
 				}
 			}
 		}
@@ -1263,15 +1858,29 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 		}
 		inst := d.GetOrCreateInstance(netinst)
 		d.mu.Lock()
-		ic, exists := inst.configuredInterfaces[ifName]
-		if !exists || ic == nil {
-			ic = &InterfaceConfig{InterfaceName: ifName}
-			inst.configuredInterfaces[ifName] = ic
-		}
-
 		if op == ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE {
-			if strings.Contains(jsPath, ".passive") {
+			ic, exists := inst.configuredInterfaces[ifName]
+			if !exists || ic == nil {
+				d.mu.Unlock()
+				return
+			}
+			if strings.Contains(jsPath, ".summary-address") {
+				pfx := extractSummaryPrefix(cfg)
+				ic.DeleteAfiSummaryAddress(afName, pfx)
+			} else if strings.Contains(jsPath, ".passive") {
 				ic.SetAfiPassive(afName, nil)
+			} else if strings.Contains(jsPath, ".hello-interval") {
+				ic.SetAfiHelloInterval(afName, nil)
+			} else if strings.Contains(jsPath, ".hold-time") {
+				ic.SetAfiHoldTime(afName, nil)
+			} else if strings.Contains(jsPath, ".split-horizon") {
+				ic.SetAfiSplitHorizon(afName, nil)
+			} else if strings.Contains(jsPath, ".next-hop-self") {
+				ic.SetAfiNextHopSelf(afName, nil)
+			} else if strings.Contains(jsPath, ".authentication") {
+				ic.SetAfiAuthentication(afName, nil)
+			} else if strings.Contains(jsPath, ".bfd") {
+				ic.SetAfiBfd(afName, nil)
 			} else if strings.Contains(jsPath, ".admin-state") {
 				ic.SetAfiAdminState(afName, "")
 			} else {
@@ -1285,32 +1894,144 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			}
 			d.mu.Unlock()
 			d.applyInterface(inst, ic)
-			log.Info().Str("netinst", netinst).Str("interface", ifName).Str("af", afName).Msg("Deleted address-family on interface")
+			log.Info().Str("netinst", netinst).Str("interface", ifName).Str("af", afName).Msg("Deleted address-family property on interface")
 			go d.CollectAndPublish(context.Background())
 			return
 		}
 
-		var afCfg InterfaceAddressFamilyConfig
-		if err := json.Unmarshal([]byte(jsonStr), &afCfg); err == nil {
-			if afCfg.Name == "" {
-				afCfg.Name = afName
+		ic, exists := inst.configuredInterfaces[ifName]
+		if !exists || ic == nil {
+			ic = &InterfaceConfig{InterfaceName: ifName}
+			inst.configuredInterfaces[ifName] = ic
+		}
+
+		if strings.Contains(jsPath, ".summary-address") {
+			pfx := extractSummaryPrefix(cfg)
+			var saCfg SummaryAddressConfig
+			_ = json.Unmarshal([]byte(jsonStr), &saCfg)
+			if saCfg.Prefix == "" && pfx != "" {
+				saCfg.Prefix = pfx
 			}
-			if afCfg.AdminState != "" {
-				ic.SetAfiAdminState(afCfg.Name, afCfg.AdminState)
+			if saCfg.Distance == 0 {
+				saCfg.Distance = 5
 			}
-			if afCfg.Passive != nil {
-				ic.SetAfiPassive(afCfg.Name, afCfg.Passive)
+			ic.AddOrUpdateAfiSummaryAddress(afName, saCfg)
+		} else if strings.Contains(jsPath, ".passive") {
+			var p bool
+			if err := json.Unmarshal([]byte(jsonStr), &p); err == nil {
+				ic.SetAfiPassive(afName, &p)
+			} else {
+				var leaf struct {
+					Passive bool `json:"passive"`
+				}
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
+					ic.SetAfiPassive(afName, &leaf.Passive)
+				}
+			}
+		} else if strings.Contains(jsPath, ".hello-interval") {
+			var h uint16
+			if err := json.Unmarshal([]byte(jsonStr), &h); err == nil {
+				ic.SetAfiHelloInterval(afName, &h)
+			} else {
+				var leaf struct {
+					HelloInterval uint16 `json:"hello-interval"`
+				}
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
+					ic.SetAfiHelloInterval(afName, &leaf.HelloInterval)
+				}
+			}
+		} else if strings.Contains(jsPath, ".hold-time") {
+			var h uint16
+			if err := json.Unmarshal([]byte(jsonStr), &h); err == nil {
+				ic.SetAfiHoldTime(afName, &h)
+			} else {
+				var leaf struct {
+					HoldTime uint16 `json:"hold-time"`
+				}
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
+					ic.SetAfiHoldTime(afName, &leaf.HoldTime)
+				}
+			}
+		} else if strings.Contains(jsPath, ".split-horizon") {
+			var sh bool
+			if err := json.Unmarshal([]byte(jsonStr), &sh); err == nil {
+				ic.SetAfiSplitHorizon(afName, &sh)
+			} else {
+				var leaf struct {
+					SplitHorizon bool `json:"split-horizon"`
+				}
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
+					ic.SetAfiSplitHorizon(afName, &leaf.SplitHorizon)
+				}
+			}
+		} else if strings.Contains(jsPath, ".next-hop-self") {
+			var nhs bool
+			if err := json.Unmarshal([]byte(jsonStr), &nhs); err == nil {
+				ic.SetAfiNextHopSelf(afName, &nhs)
+			} else {
+				var leaf struct {
+					NextHopSelf bool `json:"next-hop-self"`
+				}
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
+					ic.SetAfiNextHopSelf(afName, &leaf.NextHopSelf)
+				}
+			}
+		} else if strings.Contains(jsPath, ".admin-state") {
+			var s string
+			if err := json.Unmarshal([]byte(jsonStr), &s); err == nil && s != "" {
+				ic.SetAfiAdminState(afName, s)
+			} else {
+				var leaf struct {
+					AdminState string `json:"admin-state"`
+				}
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil && leaf.AdminState != "" {
+					ic.SetAfiAdminState(afName, leaf.AdminState)
+				}
+			}
+		} else if strings.Contains(jsPath, ".authentication") {
+			var auth AuthConfig
+			if err := json.Unmarshal([]byte(jsonStr), &auth); err == nil {
+				ic.SetAfiAuthentication(afName, &auth)
+			}
+		} else if strings.Contains(jsPath, ".bfd") {
+			var bfd BfdConfig
+			if err := json.Unmarshal([]byte(jsonStr), &bfd); err == nil {
+				ic.SetAfiBfd(afName, &bfd)
 			}
 		} else {
-			if strings.Contains(jsPath, ".passive") {
-				var p bool
-				if err := json.Unmarshal([]byte(jsonStr), &p); err == nil {
-					ic.SetAfiPassive(afName, &p)
+			var afCfg InterfaceAddressFamilyConfig
+			if err := json.Unmarshal([]byte(jsonStr), &afCfg); err == nil {
+				if afCfg.Name == "" {
+					afCfg.Name = afName
 				}
-			} else if strings.Contains(jsPath, ".admin-state") {
-				var s string
-				if err := json.Unmarshal([]byte(jsonStr), &s); err == nil {
-					ic.SetAfiAdminState(afName, s)
+				if afCfg.AdminState != "" {
+					ic.SetAfiAdminState(afCfg.Name, afCfg.AdminState)
+				}
+				if afCfg.Passive != nil {
+					ic.SetAfiPassive(afCfg.Name, afCfg.Passive)
+				}
+				if afCfg.HelloInterval != nil {
+					ic.SetAfiHelloInterval(afCfg.Name, afCfg.HelloInterval)
+				}
+				if afCfg.HoldTime != nil {
+					ic.SetAfiHoldTime(afCfg.Name, afCfg.HoldTime)
+				}
+				if afCfg.SplitHorizon != nil {
+					ic.SetAfiSplitHorizon(afCfg.Name, afCfg.SplitHorizon)
+				}
+				if afCfg.NextHopSelf != nil {
+					ic.SetAfiNextHopSelf(afCfg.Name, afCfg.NextHopSelf)
+				}
+				if afCfg.Authentication != nil {
+					ic.SetAfiAuthentication(afCfg.Name, afCfg.Authentication)
+				}
+				if afCfg.Bfd != nil {
+					ic.SetAfiBfd(afCfg.Name, afCfg.Bfd)
+				}
+				if len(afCfg.SummaryAddress) > 0 {
+					for _, sa := range afCfg.SummaryAddress {
+						ic.AddOrUpdateAfiSummaryAddress(afCfg.Name, sa)
+					}
 				}
 			}
 		}
@@ -1339,9 +2060,11 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 				d.mu.Lock()
 				if ic, exists := inst.configuredInterfaces[ifName]; exists {
 					var updatedSA []SummaryAddressConfig
-					for _, sa := range ic.SummaryAddress {
-						if sa.Prefix != pfx && pfx != "" {
-							updatedSA = append(updatedSA, sa)
+					if pfx != "" {
+						for _, sa := range ic.SummaryAddress {
+							if sa.Prefix != pfx {
+								updatedSA = append(updatedSA, sa)
+							}
 						}
 					}
 					ic.SummaryAddress = updatedSA
@@ -1669,6 +2392,7 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 				d.mu.Lock()
 				inst.SetAfiExportPolicy(afName, "")
 				d.mu.Unlock()
+				d.TriggerRedistSync(netinst)
 			} else if strings.Contains(jsPath, ".import-policy") {
 				d.mu.Lock()
 				inst.SetAfiImportPolicy(afName, "")
@@ -1762,6 +2486,7 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			for _, ic := range allIntfs {
 				d.applyInterface(inst, ic)
 			}
+			d.TriggerRedistSync(netinst)
 		} else {
 			if strings.Contains(jsPath, ".admin-state") {
 				var adminStr string
@@ -1852,9 +2577,6 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 	cNetinst := C.CString(netinst)
 	defer C.free(unsafe.Pointer(cNetinst))
 
-	expPolicy := conf.ExportPolicy
-	impPolicy := conf.ImportPolicy
-
 	inst := d.GetOrCreateInstance(netinst)
 	d.mu.Lock()
 	inst.asn = conf.AutonomousSystem
@@ -1865,8 +2587,16 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 		inst.adminState = "enable"
 	}
 	inst.networks = conf.Network
-	inst.exportPolicy = expPolicy
-	inst.importPolicy = impPolicy
+	if conf.ExportPolicy != "" {
+		inst.exportPolicy = conf.ExportPolicy
+	} else if strings.Contains(jsonStr, "\"export-policy\"") {
+		inst.exportPolicy = ""
+	}
+	if conf.ImportPolicy != "" {
+		inst.importPolicy = conf.ImportPolicy
+	} else if strings.Contains(jsonStr, "\"import-policy\"") {
+		inst.importPolicy = ""
+	}
 	if conf.Variance > 0 {
 		inst.variance = conf.Variance
 	} else if inst.variance == 0 {
@@ -1938,6 +2668,9 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			}
 			if conf.DefaultInterface.Bfd == nil && !strings.Contains(jsonStr, "\"bfd\"") {
 				conf.DefaultInterface.Bfd = inst.defaultIntf.Bfd
+			}
+			if len(conf.DefaultInterface.AddressFamily) == 0 && len(inst.defaultIntf.AddressFamily) > 0 {
+				conf.DefaultInterface.AddressFamily = inst.defaultIntf.AddressFamily
 			}
 		}
 		inst.defaultIntf = conf.DefaultInterface
@@ -2085,7 +2818,7 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 		}
 
 		// Apply redistribution policy
-		d.applyRedistribute(netinst, expPolicy)
+		d.applyRedistribute(netinst, inst.exportPolicy)
 
 		if conf.Variance > 0 {
 			C.srlShimVarianceUpdate(cNetinst, C.uint8_t(conf.Variance))
@@ -2101,5 +2834,482 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 		}
 
 		go d.CollectAndPublish(context.Background())
+	}
+}
+
+type srlRouteTableOutput struct {
+	Instance []struct {
+		Name    string `json:"Name"`
+		IpRoute []struct {
+			Prefix     string `json:"Prefix"`
+			RouteType  string `json:"Route Type"`
+			RouteOwner string `json:"Route Owner"`
+			NextHops   string `json:"Next-Hop(s)"`
+		} `json:"ip route"`
+	} `json:"instance"`
+}
+
+func parseCandidateNextHop(nhStr string) string {
+	nhStr = strings.TrimSpace(nhStr)
+	if nhStr == "" || strings.EqualFold(nhStr, "direct") {
+		return ""
+	}
+	if idx := strings.Index(nhStr, "("); idx != -1 {
+		nhStr = nhStr[:idx]
+	}
+	if idx := strings.Index(nhStr, ","); idx != -1 {
+		nhStr = nhStr[:idx]
+	}
+	ip := net.ParseIP(strings.TrimSpace(nhStr))
+	if ip == nil || ip.IsUnspecified() {
+		return ""
+	}
+	return ip.String()
+}
+
+func matchProtocol(policyProto, routeType, routeOwner string, isV6 bool) bool {
+	pProto := strings.ToLower(strings.TrimSpace(policyProto))
+	rType := strings.ToLower(strings.TrimSpace(routeType))
+	rOwner := strings.ToLower(strings.TrimSpace(routeOwner))
+	if pProto == "" {
+		return true
+	}
+
+	normOwner := strings.TrimSuffix(rOwner, "_mgr")
+	normOwner = strings.TrimSuffix(normOwner, "_route")
+
+	matchesOspf := strings.Contains(rType, "ospf") || strings.Contains(normOwner, "ospf")
+	matchesOspfv2 := strings.Contains(rType, "ospfv2") || strings.Contains(rType, "ospf-v2") || (matchesOspf && !isV6)
+	matchesOspfv3 := strings.Contains(rType, "ospfv3") || strings.Contains(rType, "ospf-v3") || strings.Contains(rType, "ospf3") || (matchesOspf && isV6)
+	matchesBgp := strings.Contains(rType, "bgp") || strings.Contains(normOwner, "bgp")
+	matchesIsis := strings.Contains(rType, "isis") || strings.Contains(rType, "is-is") || strings.Contains(normOwner, "isis") || strings.Contains(normOwner, "is-is")
+	matchesStatic := strings.Contains(rType, "static") || strings.Contains(normOwner, "static")
+	matchesLocal := strings.Contains(rType, "local") || strings.Contains(rType, "connected") || strings.Contains(rType, "host") || strings.Contains(normOwner, "local") || strings.Contains(normOwner, "net_inst")
+
+	switch pProto {
+	case "ospf":
+		return matchesOspf
+	case "ospfv2", "ospf-v2":
+		return matchesOspfv2
+	case "ospfv3", "ospf-v3", "ospf3":
+		return matchesOspfv3
+	case "bgp":
+		return matchesBgp
+	case "isis", "is-is":
+		return matchesIsis
+	case "static":
+		return matchesStatic
+	case "local", "connected":
+		return matchesLocal
+	default:
+		return pProto == rType || pProto == normOwner
+	}
+}
+
+func normalizeRedistProtocol(routeType, routeOwner string, isV6 bool) string {
+	rType := strings.ToLower(strings.TrimSpace(routeType))
+	rOwner := strings.ToLower(strings.TrimSpace(routeOwner))
+	if strings.Contains(rType, "ospf") || strings.Contains(rOwner, "ospf") {
+		return "ospf"
+	}
+	if strings.Contains(rType, "bgp") || strings.Contains(rOwner, "bgp") {
+		return "bgp"
+	}
+	if strings.Contains(rType, "isis") || strings.Contains(rType, "is-is") || strings.Contains(rOwner, "isis") || strings.Contains(rOwner, "is-is") {
+		return "isis"
+	}
+	if strings.Contains(rType, "static") || strings.Contains(rOwner, "static") {
+		return "static"
+	}
+	if strings.Contains(rType, "local") || strings.Contains(rType, "connected") || strings.Contains(rType, "host") || strings.Contains(rOwner, "local") || strings.Contains(rOwner, "net_inst") {
+		return "connected"
+	}
+	if rType != "" {
+		return rType
+	}
+	return "static"
+}
+
+func getCandidateRoutes(netinst string, afi string) ([]CandidateRoute, error) {
+	if netinst == "" {
+		netinst = "default"
+	}
+	afiCli := "ipv4"
+	if strings.Contains(afi, "v6") || strings.Contains(afi, "6") {
+		afiCli = "ipv6"
+	}
+
+	cmdStr := "show network-instance " + netinst + " " + afiCli + " route | as json"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sr_cli", cmdStr)
+	out, err := cmd.Output()
+	if err != nil {
+		log.Warn().Err(err).Str("netinst", netinst).Str("afi", afi).Msg("Failed to execute sr_cli route show")
+		return nil, err
+	}
+
+	var table srlRouteTableOutput
+	if err := json.Unmarshal(out, &table); err != nil {
+		log.Warn().Err(err).Str("netinst", netinst).Str("afi", afi).Msg("Failed to unmarshal route table JSON")
+		return nil, err
+	}
+
+	var candidates []CandidateRoute
+	for _, inst := range table.Instance {
+		if !strings.EqualFold(inst.Name, netinst) {
+			continue
+		}
+		for _, r := range inst.IpRoute {
+			rType := strings.ToLower(strings.TrimSpace(r.RouteType))
+			rOwner := strings.ToLower(strings.TrimSpace(r.RouteOwner))
+			if rType == "eigrp" || rOwner == "srl_eigrpd" {
+				continue
+			}
+			candidates = append(candidates, CandidateRoute{
+				Prefix:     strings.TrimSpace(r.Prefix),
+				RouteType:  rType,
+				RouteOwner: rOwner,
+				NextHop:    parseCandidateNextHop(r.NextHops),
+				AFI:        afi,
+			})
+		}
+	}
+	return candidates, nil
+}
+
+func (d *EigrpDaemon) getPolicyDef(policyName string) (*PolicyDef, error) {
+	if policyName == "" {
+		return nil, nil
+	}
+	d.mu.RLock()
+	if pol, exists := d.policyDefs[policyName]; exists && pol != nil {
+		d.mu.RUnlock()
+		return pol, nil
+	}
+	d.mu.RUnlock()
+
+	cmdStr := "info / routing-policy policy " + policyName + " | as json"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sr_cli", cmdStr)
+	out, err := cmd.Output()
+	if err != nil {
+		log.Warn().Err(err).Str("policy", policyName).Msg("Failed to execute sr_cli info routing-policy")
+		return nil, err
+	}
+
+	var pol PolicyDef
+	if err := json.Unmarshal(out, &pol); err == nil && pol.Name != "" {
+		d.mu.Lock()
+		d.policyDefs[policyName] = &pol
+		d.mu.Unlock()
+		return &pol, nil
+	}
+
+	var wrap struct {
+		Policy []PolicyDef `json:"policy"`
+	}
+	if err := json.Unmarshal(out, &wrap); err == nil {
+		for _, p := range wrap.Policy {
+			if p.Name == policyName {
+				d.mu.Lock()
+				d.policyDefs[policyName] = &p
+				d.mu.Unlock()
+				return &p, nil
+			}
+		}
+	}
+
+	return nil, nil
+}
+
+func evaluateRoutePolicy(route CandidateRoute, pol *PolicyDef) (bool, PolicyMetricConfig) {
+	if pol == nil {
+		return false, PolicyMetricConfig{}
+	}
+	isV6 := strings.Contains(route.Prefix, ":")
+
+	for _, stmt := range pol.Statement {
+		matched := true
+		if stmt.Match.Protocol != "" {
+			if !matchProtocol(stmt.Match.Protocol, route.RouteType, route.RouteOwner, isV6) {
+				matched = false
+			}
+		}
+		if matched {
+			if strings.EqualFold(stmt.Action.PolicyResult, "accept") {
+				m := stmt.Action.Eigrp.Metric
+				if m.Bandwidth == 0 {
+					m.Bandwidth = pol.DefaultAction.Eigrp.Metric.Bandwidth
+				}
+				if m.Delay == 0 {
+					m.Delay = pol.DefaultAction.Eigrp.Metric.Delay
+				}
+				if m.Reliability == 0 {
+					m.Reliability = pol.DefaultAction.Eigrp.Metric.Reliability
+				}
+				if m.Load == 0 {
+					m.Load = pol.DefaultAction.Eigrp.Metric.Load
+				}
+				if m.Mtu == 0 {
+					m.Mtu = pol.DefaultAction.Eigrp.Metric.Mtu
+				}
+				applyMetricDefaults(&m)
+				return true, m
+			}
+			return false, PolicyMetricConfig{}
+		}
+	}
+
+	if strings.EqualFold(pol.DefaultAction.PolicyResult, "accept") {
+		m := pol.DefaultAction.Eigrp.Metric
+		applyMetricDefaults(&m)
+		return true, m
+	}
+
+	return false, PolicyMetricConfig{}
+}
+
+func applyMetricDefaults(m *PolicyMetricConfig) {
+	if m.Bandwidth == 0 {
+		m.Bandwidth = 100000
+	}
+	if m.Delay == 0 {
+		m.Delay = 100
+	}
+	if m.Reliability == 0 {
+		m.Reliability = 255
+	}
+	if m.Load == 0 {
+		m.Load = 1
+	}
+	if m.Mtu == 0 {
+		m.Mtu = 1500
+	}
+}
+
+func (d *EigrpDaemon) TriggerRedistSync(netinst string) {
+	if netinst == "" {
+		netinst = "default"
+	}
+	if d.redistChan != nil {
+		select {
+		case d.redistChan <- netinst:
+		default:
+		}
+	}
+}
+
+func (d *EigrpDaemon) RedistributionWorker(ctx context.Context) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	var debounceTimer *time.Timer
+	var debounceC <-chan time.Time
+	dirty := make(map[string]bool)
+
+	for {
+		select {
+		case <-ctx.Done():
+			if debounceTimer != nil {
+				debounceTimer.Stop()
+			}
+			return
+		case ni := <-d.redistChan:
+			if ni == "" {
+				ni = "default"
+			}
+			dirty[ni] = true
+			if debounceTimer == nil {
+				debounceTimer = time.NewTimer(300 * time.Millisecond)
+				debounceC = debounceTimer.C
+			} else {
+				if !debounceTimer.Stop() {
+					select {
+					case <-debounceTimer.C:
+					default:
+					}
+				}
+				debounceTimer.Reset(300 * time.Millisecond)
+			}
+		case <-debounceC:
+			debounceTimer = nil
+			debounceC = nil
+			instancesToSync := make([]string, 0, len(dirty))
+			for ni := range dirty {
+				instancesToSync = append(instancesToSync, ni)
+			}
+			dirty = make(map[string]bool)
+			for _, ni := range instancesToSync {
+				d.SyncRedistribution(ni)
+			}
+		case <-ticker.C:
+			d.mu.RLock()
+			var activeInstances []string
+			for ni, inst := range d.instances {
+				if inst != nil && inst.adminState != "disable" && inst.asn > 0 {
+					v4Policy := inst.GetAfiExportPolicy("ipv4-unicast")
+					v6Policy := inst.GetAfiExportPolicy("ipv6-unicast")
+					if v4Policy != "" || v6Policy != "" {
+						activeInstances = append(activeInstances, ni)
+					}
+				}
+			}
+			d.mu.RUnlock()
+			for _, ni := range activeInstances {
+				d.SyncRedistribution(ni)
+			}
+		}
+	}
+}
+
+func (d *EigrpDaemon) withdrawAllRedistributed(netinst string) {
+	inst := d.GetInstance(netinst)
+	if inst == nil {
+		return
+	}
+	d.mu.Lock()
+	if len(inst.redistributedRoutes) == 0 {
+		d.mu.Unlock()
+		return
+	}
+	type redistItem struct {
+		prefix string
+		proto  string
+	}
+	var toWithdraw []redistItem
+	for pfx, proto := range inst.redistributedRoutes {
+		toWithdraw = append(toWithdraw, redistItem{prefix: pfx, proto: proto})
+	}
+	inst.redistributedRoutes = make(map[string]string)
+	d.mu.Unlock()
+
+	cNetinst := C.CString(netinst)
+	defer C.free(unsafe.Pointer(cNetinst))
+
+	for _, item := range toWithdraw {
+		cPfx := C.CString(item.prefix)
+		cProto := C.CString(item.proto)
+		C.srlShimRouteRedistributeRemove(cNetinst, cPfx, cProto)
+		C.free(unsafe.Pointer(cPfx))
+		C.free(unsafe.Pointer(cProto))
+		log.Info().Str("netinst", netinst).Str("prefix", item.prefix).Str("proto", item.proto).Msg("Withdrew redistributed route on shutdown/unconfig")
+	}
+}
+
+func (d *EigrpDaemon) SyncRedistribution(netinst string) {
+	if netinst == "" {
+		netinst = "default"
+	}
+	d.mu.RLock()
+	inst, exists := d.instances[netinst]
+	if !exists || inst == nil || inst.adminState == "disable" || inst.asn == 0 {
+		d.mu.RUnlock()
+		d.withdrawAllRedistributed(netinst)
+		return
+	}
+
+	v4Policy := inst.GetAfiExportPolicy("ipv4-unicast")
+	v6Policy := inst.GetAfiExportPolicy("ipv6-unicast")
+	v4Enabled := inst.IsAfiEnabled("ipv4-unicast")
+	v6Enabled := inst.IsAfiEnabled("ipv6-unicast")
+	d.mu.RUnlock()
+
+	if (!v4Enabled || v4Policy == "") && (!v6Enabled || v6Policy == "") {
+		d.withdrawAllRedistributed(netinst)
+		return
+	}
+
+	acceptedRoutes := make(map[string]CandidateRoute)
+	acceptedMetrics := make(map[string]PolicyMetricConfig)
+
+	if v4Enabled && v4Policy != "" {
+		pol, err := d.getPolicyDef(v4Policy)
+		if err == nil && pol != nil {
+			routes, rErr := getCandidateRoutes(netinst, "ipv4-unicast")
+			if rErr == nil {
+				for _, r := range routes {
+					if ok, m := evaluateRoutePolicy(r, pol); ok {
+						acceptedRoutes[r.Prefix] = r
+						acceptedMetrics[r.Prefix] = m
+					}
+				}
+			}
+		}
+	}
+
+	if v6Enabled && v6Policy != "" {
+		pol, err := d.getPolicyDef(v6Policy)
+		if err == nil && pol != nil {
+			routes, rErr := getCandidateRoutes(netinst, "ipv6-unicast")
+			if rErr == nil {
+				for _, r := range routes {
+					if ok, m := evaluateRoutePolicy(r, pol); ok {
+						acceptedRoutes[r.Prefix] = r
+						acceptedMetrics[r.Prefix] = m
+					}
+				}
+			}
+		}
+	}
+
+	cNetinst := C.CString(netinst)
+	defer C.free(unsafe.Pointer(cNetinst))
+
+	type redistItem struct {
+		prefix string
+		proto  string
+	}
+	var toWithdraw []redistItem
+
+	d.mu.Lock()
+	for oldPfx, oldProto := range inst.redistributedRoutes {
+		if _, ok := acceptedRoutes[oldPfx]; !ok {
+			toWithdraw = append(toWithdraw, redistItem{prefix: oldPfx, proto: oldProto})
+			delete(inst.redistributedRoutes, oldPfx)
+		}
+	}
+	d.mu.Unlock()
+
+	// Perform route withdrawals outside d.mu
+	for _, item := range toWithdraw {
+		cPfx := C.CString(item.prefix)
+		cProto := C.CString(item.proto)
+		C.srlShimRouteRedistributeRemove(cNetinst, cPfx, cProto)
+		C.free(unsafe.Pointer(cPfx))
+		C.free(unsafe.Pointer(cProto))
+		log.Info().Str("netinst", netinst).Str("prefix", item.prefix).Str("proto", item.proto).Msg("Withdrew redistributed route")
+	}
+
+	// Add/update accepted routes outside d.mu
+	for pfx, r := range acceptedRoutes {
+		metric := acceptedMetrics[pfx]
+		normProto := normalizeRedistProtocol(r.RouteType, r.RouteOwner, strings.Contains(r.Prefix, ":"))
+		cPfx := C.CString(r.Prefix)
+		cProto := C.CString(normProto)
+		cNh := C.CString(r.NextHop)
+		C.srlShimRouteRedistributeAdd(
+			cNetinst,
+			cPfx,
+			cProto,
+			cNh,
+			C.uint32_t(metric.Bandwidth),
+			C.uint32_t(metric.Delay),
+			C.uint8_t(metric.Reliability),
+			C.uint8_t(metric.Load),
+			C.uint32_t(metric.Mtu),
+		)
+		C.free(unsafe.Pointer(cPfx))
+		C.free(unsafe.Pointer(cProto))
+		C.free(unsafe.Pointer(cNh))
+
+		d.mu.Lock()
+		inst.redistributedRoutes[pfx] = normProto
+		d.mu.Unlock()
+
+		log.Info().Str("netinst", netinst).Str("prefix", pfx).Str("proto", normProto).Interface("metric", metric).Msg("Synchronized redistributed route in EIGRP")
 	}
 }

@@ -222,21 +222,28 @@ set / network-instance default protocols eigrp metrics reliability 0   # K4: Rel
 set / network-instance default protocols eigrp metrics mtu 0           # K5: MTU
 ```
 
-### 5. Routing Policy Export & Import (`export-policy` / `import-policy`)
-Attach standard Nokia SR Linux routing policies to filter or set custom EIGRP metrics on redistributed routes:
-```text
-# 1. Define routing policy with EIGRP metric action
-set / routing-policy policy eigrp-export statement 10 match protocol local
-set / routing-policy policy eigrp-export statement 10 action policy-result accept
-set / routing-policy policy eigrp-export statement 10 action eigrp metric bandwidth 100000
-set / routing-policy policy eigrp-export statement 10 action eigrp metric delay 100
-set / routing-policy policy eigrp-export statement 10 action eigrp metric reliability 255
-set / routing-policy policy eigrp-export statement 10 action eigrp metric load 1
-set / routing-policy policy eigrp-export statement 10 action eigrp metric mtu 1500
+### 5. Address Families & Routing Policy Redistribution (`export-policy` / `import-policy`)
+Attach standard Nokia SR Linux routing policies under `address-family ipv4-unicast` and `address-family ipv6-unicast` to redistribute routes from OSPF (OSPFv2/OSPFv3), IS-IS, BGP, or local/static interfaces into EIGRP.
 
-# 2. Attach policy to EIGRP
-set / network-instance default protocols eigrp export-policy eigrp-export
-set / network-instance default protocols eigrp import-policy eigrp-export
+#### Route Preferences (Administrative Distance)
+In alignment with industry standards:
+- **Internal EIGRP Routes**: Assigned route preference **`90`**.
+- **External EIGRP Routes**: Assigned route preference **`170`** (routes redistributed from OSPF, IS-IS, BGP, or static).
+
+```text
+# 1. Define routing policy with protocol match and EIGRP metric action
+set / routing-policy policy eigrp-export statement 10 match protocol ospfv2
+set / routing-policy policy eigrp-export statement 10 action policy-result accept
+set / routing-policy policy eigrp-export statement 10 action eigrp metric bandwidth 100000 delay 100 reliability 255 load 1 mtu 1500
+
+# 2. Attach policy to EIGRP address-family
+set / network-instance default protocols eigrp address-family ipv4-unicast admin-state enable
+set / network-instance default protocols eigrp address-family ipv4-unicast export-policy eigrp-export
+set / network-instance default protocols eigrp address-family ipv4-unicast import-policy eigrp-export
+
+# Similarly for IPv6:
+set / network-instance default protocols eigrp address-family ipv6-unicast admin-state enable
+set / network-instance default protocols eigrp address-family ipv6-unicast export-policy eigrp-v6-export
 ```
 
 ### 6. Multi-VRF / Multi-Instance Support
@@ -256,11 +263,17 @@ set / network-instance vrf-1 protocols eigrp interface lo0.1 admin-state enable 
 ```
 All routes, FIB injection via NDK, and telemetry streaming are completely isolated per network instance and viewable via `show network-instance <name> protocols eigrp ...`.
 
-### 7. Interface Fine-Tuning (Split-Horizon, Next-Hop-Self, Bandwidth, Delay)
-Interfaces inherit from `default-interface` or can be overridden individually:
+### 7. Interface Fine-Tuning & Per-Address-Family Controls
+Interface settings can be configured per address family (`address-family ipv4-unicast` / `ipv6-unicast`) or inherited from `default-interface`:
 ```text
-set / network-instance default protocols eigrp interface ethernet-1/1.0 split-horizon true
-set / network-instance default protocols eigrp interface ethernet-1/1.0 next-hop-self false
+# Per-AFI interface parameters (timers, split-horizon, next-hop-self, passive, authentication, BFD):
+set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast hello-interval 5
+set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast hold-time 15
+set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast split-horizon true
+set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast next-hop-self false
+set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast passive false
+
+# Link-level interface properties:
 set / network-instance default protocols eigrp interface ethernet-1/1.0 bandwidth 1000000
 set / network-instance default protocols eigrp interface ethernet-1/1.0 delay 100
 ```
@@ -273,9 +286,9 @@ set / network-instance default protocols eigrp maximum-hops 100
 ```
 
 ### 9. Route Summarization
-Configure manual summary prefixes with custom administrative distance directly on interfaces:
+Configure manual summary prefixes with custom administrative distance directly on interfaces under the appropriate address family:
 ```text
-set / network-instance default protocols eigrp interface ethernet-1/1.0 summary-address 10.0.0.0/16 distance 5
+set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast summary-address 10.0.0.0/16 distance 5
 ```
 
 ### 10. Static Neighbors

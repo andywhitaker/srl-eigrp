@@ -15,6 +15,10 @@ func (d *EigrpDaemon) OnRouteAdd(netinst string, prefix string, nexthop string, 
 	if netinst == "" {
 		netinst = "default"
 	}
+	if metric == 0xFFFFFFFF || wideMetric >= 4294967295 || metric >= 33554431 {
+		d.OnRouteDel(netinst, prefix)
+		return
+	}
 	ctx := context.Background()
 	parts := strings.Split(prefix, "/")
 	if len(parts) != 2 {
@@ -152,14 +156,36 @@ func (d *EigrpDaemon) WithdrawAfRoutes(netinst, afName string) {
 			delete(inst.routes, pfx)
 		}
 	}
+	for pfx := range inst.topology {
+		isV6 := strings.Contains(pfx, ":")
+		if (afName == "ipv6-unicast" && isV6) || (afName == "ipv4-unicast" && !isV6) {
+			delete(inst.topology, pfx)
+		}
+	}
+	for pfx := range inst.tempTopology {
+		isV6 := strings.Contains(pfx, ":")
+		if (afName == "ipv6-unicast" && isV6) || (afName == "ipv4-unicast" && !isV6) {
+			delete(inst.tempTopology, pfx)
+		}
+	}
+	for ip := range inst.neighbors {
+		isV6 := strings.Contains(ip, ":")
+		if (afName == "ipv6-unicast" && isV6) || (afName == "ipv4-unicast" && !isV6) {
+			delete(inst.neighbors, ip)
+		}
+	}
+	for ip := range inst.tempNeighbors {
+		isV6 := strings.Contains(ip, ":")
+		if (afName == "ipv6-unicast" && isV6) || (afName == "ipv4-unicast" && !isV6) {
+			delete(inst.tempNeighbors, ip)
+		}
+	}
 	d.mu.Unlock()
 
 	for _, pfx := range toWithdraw {
 		d.withdrawRouteInternal(netinst, pfx)
 	}
-	if len(toWithdraw) > 0 {
-		go d.publishTelemetry(context.Background())
-	}
+	go d.publishTelemetry(context.Background())
 }
 
 func (d *EigrpDaemon) withdrawRouteInternal(netinst string, prefix string) {

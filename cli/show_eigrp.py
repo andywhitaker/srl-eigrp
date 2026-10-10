@@ -125,11 +125,21 @@ def load_state(state=None, netinst="default"):
             data_str = state.server_data_store.get_json(path, recursive=True)
             if data_str:
                 raw = json.loads(data_str)
-                intfs = raw.get("interface", local_data.get("interface", []))
-                nbrs = raw.get("neighbor", local_data.get("neighbor", []))
-                routes = raw.get("route", local_data.get("route", []))
-                topos = raw.get("topology", local_data.get("topology", []))
-                traffics = raw.get("traffic", local_data.get("traffic", []))
+                intfs = raw.get("interface", [])
+                if isinstance(intfs, dict):
+                    intfs = [intfs]
+                nbrs = raw.get("neighbor", [])
+                if isinstance(nbrs, dict):
+                    nbrs = [nbrs]
+                routes = raw.get("route", [])
+                if isinstance(routes, dict):
+                    routes = [routes]
+                topos = raw.get("topology", [])
+                if isinstance(topos, dict):
+                    topos = [topos]
+                traffics = raw.get("traffic", [])
+                if isinstance(traffics, dict):
+                    traffics = [traffics]
                 return {
                     "autonomous-system": raw.get("autonomous-system") or local_data.get("autonomous-system", 0),
                     "router-id": raw.get("router-id") or local_data.get("router-id", "unspecified"),
@@ -578,7 +588,14 @@ class Plugin(CliPlugin):
                     output.print_line("  Reason: No interfaces participating in EIGRP")
                 else:
                     valid_itfs = [i for i in interfaces if isinstance(i, dict)]
-                    all_passive = all(itf.get("passive", False) for itf in valid_itfs) if valid_itfs else False
+                    def is_itf_passive(itf):
+                        afs = itf.get("address-family", [])
+                        if afs:
+                            active_afs = [af for af in afs if af.get("admin-state", "enable") != "disable"]
+                            if active_afs:
+                                return all(af.get("passive", False) for af in active_afs)
+                        return itf.get("passive", False)
+                    all_passive = all(is_itf_passive(itf) for itf in valid_itfs) if valid_itfs else False
                     all_down = all(itf.get("oper-state", "down").lower() != "up" for itf in valid_itfs) if valid_itfs else False
                     if all_passive:
                         output.print_line("  Reason: All participating interfaces are passive (hello exchange suppressed)")
@@ -763,13 +780,64 @@ class Plugin(CliPlugin):
                 else:
                     bfd_str = str(bfd_raw)
                 output.print_line(f"{'BFD State':<26}: {bfd_str}")
-                output.print_line(f"{'Authentication Mode':<26}: {itf.get('auth-mode', 'none')}")
+                auth_val = itf.get('auth-mode', 'none')
+                if not auth_val or auth_val == 'none':
+                    auth_c = itf.get('authentication', {})
+                    if isinstance(auth_c, dict) and auth_c.get('mode'):
+                        auth_val = auth_c.get('mode')
+                output.print_line(f"{'Authentication Mode':<26}: {auth_val}")
                 output.print_line(f"{'Autonomous System':<26}: {asn}")
                 output.print_line(f"{'Router ID':<26}: {rid}")
+                sa_top = itf.get("summary-address", [])
+                if sa_top:
+                    sa_strs = [f"{s.get('prefix')} (dist: {s.get('distance', 5)})" for s in sa_top if s.get('prefix')]
+                    output.print_line(f"{'Summary Addresses':<26}: {', '.join(sa_strs)}")
                 output.print_line(f"{'Active Neighbors':<26}: {len(nbrs_on_if)}")
                 if nbrs_on_if:
                     nbr_ips = [n.get("ip-address", "") for n in nbrs_on_if]
                     output.print_line(f"{'  Neighbor IP(s)':<26}: {', '.join(nbr_ips)}")
+                afs = itf.get("address-family", [])
+                if afs:
+                    output.print_line("-" * 80)
+                    output.print_line("Address Families:")
+                    for af in afs:
+                        af_name = af.get("name", "")
+                        af_oper = af.get("oper-state", "up")
+                        af_pass = "true" if af.get("passive", False) else "false"
+                        af_hello = af.get("hello-interval", 5)
+                        af_hold = af.get("hold-time", 15)
+                        af_sh = "true" if af.get("split-horizon", True) else "false"
+                        af_nhs = "true" if af.get("next-hop-self", False) else "false"
+                        output.print_line(f"  {af_name}:")
+                        output.print_line(f"    {'Admin State':<22}: {af.get('admin-state', 'enable')}")
+                        output.print_line(f"    {'Oper State':<22}: {af_oper}")
+                        if af_oper.lower() != "up" and af.get("oper-down-reason"):
+                            output.print_line(f"    {'Down Reason':<22}: {af.get('oper-down-reason')}")
+                        if af.get("ip-address"):
+                            af_ip = af.get("ip-address")
+                            af_plen = af.get("prefix-length", "")
+                            output.print_line(f"    {'IP Address / Prefix':<22}: {af_ip}/{af_plen}")
+                        output.print_line(f"    {'Passive':<22}: {af_pass}")
+                        output.print_line(f"    {'Hello Interval':<22}: {af_hello}s")
+                        output.print_line(f"    {'Hold Time':<22}: {af_hold}s")
+                        output.print_line(f"    {'Split Horizon':<22}: {af_sh}")
+                        output.print_line(f"    {'Next-Hop-Self':<22}: {af_nhs}")
+                        af_auth = af.get("authentication")
+                        if isinstance(af_auth, dict):
+                            output.print_line(f"    {'Auth Mode':<22}: {af_auth.get('mode', 'none')}")
+                        af_bfd = af.get("bfd")
+                        if isinstance(af_bfd, dict):
+                            output.print_line(f"    {'BFD Admin':<22}: {af_bfd.get('admin-state', 'disable')}")
+                        af_bfd_st = af.get("bfd-state")
+                        if isinstance(af_bfd_st, dict):
+                            st = af_bfd_st.get("session-state", "disabled")
+                            if "remote-address" in af_bfd_st:
+                                st += f" (peer: {af_bfd_st['remote-address']})"
+                            output.print_line(f"    {'BFD State':<22}: {st}")
+                        sa_list = af.get("summary-address", [])
+                        if sa_list:
+                            sa_strs = [f"{s.get('prefix')} (dist: {s.get('distance', 5)})" for s in sa_list if s.get('prefix')]
+                            output.print_line(f"    {'Summary Addresses':<22}: {', '.join(sa_strs)}")
                 output.print_line("-" * 80)
                 output.print_line("Interface Traffic Statistics:")
                 output.print_line(f"  {'Reliable Multicast':<24}: {tf.get('reliable-multicast', 0)}")
@@ -802,12 +870,36 @@ class Plugin(CliPlugin):
                     plen = str(itf.get("prefix-length", 32))
                     oper = itf.get("oper-state", "Up")
                     passive_str = "true" if itf.get("passive", False) else "false"
+                    if passive_str == "false":
+                        for af in itf.get("address-family", []):
+                            if af.get("passive", False):
+                                passive_str = "true"
+                                break
+
                     bfd_raw = itf.get("bfd-state", "disabled")
                     if isinstance(bfd_raw, dict):
                         bfd = str(bfd_raw.get("session-state", "disabled"))
                     else:
                         bfd = str(bfd_raw)
+                    if bfd == "disabled":
+                        for af in itf.get("address-family", []):
+                            af_bfd_st = af.get("bfd-state", {})
+                            if isinstance(af_bfd_st, dict) and af_bfd_st.get("session-state") and af_bfd_st.get("session-state") != "disabled":
+                                bfd = str(af_bfd_st.get("session-state"))
+                                break
+
                     auth = str(itf.get("auth-mode", "none"))
+                    if auth == "none":
+                        auth_c = itf.get("authentication", {})
+                        if isinstance(auth_c, dict) and auth_c.get("mode"):
+                            auth = str(auth_c.get("mode"))
+                    if auth == "none":
+                        for af in itf.get("address-family", []):
+                            af_auth = af.get("authentication", {})
+                            if isinstance(af_auth, dict) and af_auth.get("mode") and af_auth.get("mode") != "none":
+                                auth = str(af_auth.get("mode"))
+                                break
+
                     if has_down:
                         down_rsn = itf.get("oper-down-reason", "") if oper.lower() != "up" else "-"
                         if not down_rsn and oper.lower() != "up":

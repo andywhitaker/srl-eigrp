@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -60,6 +61,8 @@ type InterfaceInfo struct {
 	AdminState     string `json:"admin-state,omitempty"`
 	IPAddress      string `json:"ip-address"`
 	PrefixLen      uint32 `json:"prefix-length"`
+	IP6Address     string `json:"ip6-address,omitempty"`
+	PrefixLen6     uint32 `json:"prefix-length6,omitempty"`
 	OperState      string `json:"oper-state"`
 	OperDownReason string `json:"oper-down-reason,omitempty"`
 	BfdState       string `json:"bfd-state,omitempty"`
@@ -135,6 +138,7 @@ type EigrpInstance struct {
 	restarting             bool
 	bfdSessions            map[string]string
 	staticNeighbors        map[string]*StaticNeighborConfig
+	redistributedRoutes    map[string]string
 
 	routes         map[string]*RouteInfo
 	neighbors      map[string]*NeighborInfo
@@ -248,6 +252,7 @@ func newEigrpInstance(netinst string) *EigrpInstance {
 		tempTopology:           make(map[string]*TopologyPrefixInfo),
 		tempTraffic:            make(map[string]*TrafficInfo),
 		bfdSessions:            make(map[string]string),
+		redistributedRoutes:    make(map[string]string),
 	}
 }
 
@@ -280,6 +285,8 @@ type EigrpDaemon struct {
 	instances    map[string]*EigrpInstance
 	prevTeleKeys map[string]struct{}
 	policies     map[string]*PolicyMetricConfig
+	policyDefs   map[string]*PolicyDef
+	redistChan   chan string
 }
 
 var daemonApp *EigrpDaemon
@@ -334,22 +341,32 @@ func (d *EigrpDaemon) CollectAndPublish(ctx context.Context) {
 		inst.PrepareTelemetryCollection()
 		d.mu.Unlock()
 
-		C.srlShimInterfacesScan(cNetinst)
-
 		d.mu.RLock()
-		configuredIntfs := make([]*InterfaceConfig, 0, len(inst.configuredInterfaces))
-		for _, ic := range inst.configuredInterfaces {
-			configuredIntfs = append(configuredIntfs, ic)
-		}
+		adminDisabled := (inst.adminState == "disable" || inst.asn == 0)
 		d.mu.RUnlock()
-		for _, ic := range configuredIntfs {
-			d.applyInterface(inst, ic)
-		}
 
-		C.srlShimInterfacesReport(cNetinst)
-		C.srlShimNeighborsReport(cNetinst)
-		C.srlShimTopologyReport(cNetinst)
-		C.srlShimTrafficReport(cNetinst)
+		if !adminDisabled {
+			C.srlShimInterfacesScan(cNetinst)
+
+			d.mu.RLock()
+			configuredIntfs := make([]*InterfaceConfig, 0, len(inst.configuredInterfaces))
+			for _, ic := range inst.configuredInterfaces {
+				configuredIntfs = append(configuredIntfs, ic)
+			}
+			d.mu.RUnlock()
+			for _, ic := range configuredIntfs {
+				d.applyInterface(inst, ic)
+			}
+
+			C.srlShimInterfacesReport(cNetinst)
+			C.srlShimNeighborsReport(cNetinst)
+			C.srlShimTopologyReport(cNetinst)
+			C.srlShimTrafficReport(cNetinst)
+		} else {
+			d.mu.Lock()
+			inst.routes = make(map[string]*RouteInfo)
+			d.mu.Unlock()
+		}
 		C.free(unsafe.Pointer(cNetinst))
 
 		d.mu.Lock()
@@ -388,6 +405,27 @@ func (d *EigrpDaemon) OnNeighborReport(netinst, ip, ifname, state string, hold u
 	defer d.mu.Unlock()
 
 	normIf := normalizeIfName(ifname)
+	afiName := "ipv4-unicast"
+	if strings.Contains(ip, ":") {
+		afiName = "ipv6-unicast"
+	}
+	if !inst.IsAfiEnabled(afiName) {
+		return
+	}
+	defPassive := false
+	if inst.defaultIntf != nil {
+		defPassive = inst.defaultIntf.IsAfiPassive(afiName)
+	}
+	isPassive := defPassive
+	if ic, ok := inst.configuredInterfaces[ifname]; ok {
+		isPassive = ic.IsAfiPassive(afiName, defPassive)
+	} else if ic, ok := inst.configuredInterfaces[normIf]; ok {
+		isPassive = ic.IsAfiPassive(afiName, defPassive)
+	}
+	if isPassive {
+		return
+	}
+
 	// Check whether BFD is enabled for this interface or instance
 	bfdEnabled := false
 	if ic, ok := inst.configuredInterfaces[ifname]; ok && ic.Bfd != nil && ic.Bfd.AdminState == "enable" {
@@ -418,12 +456,29 @@ func (d *EigrpDaemon) OnNeighborReport(netinst, ip, ifname, state string, hold u
 
 	// Check interface config for auth mode fallback
 	if authMode == "" || authMode == "none" {
-		if ic, ok := inst.configuredInterfaces[ifname]; ok && ic.Authentication != nil && ic.Authentication.Mode != "" {
-			authMode = ic.Authentication.Mode
-		} else if ic, ok := inst.configuredInterfaces[normIf]; ok && ic.Authentication != nil && ic.Authentication.Mode != "" {
-			authMode = ic.Authentication.Mode
-		} else if inst.defaultIntf != nil && inst.defaultIntf.Authentication != nil && inst.defaultIntf.Authentication.Mode != "" {
-			authMode = inst.defaultIntf.Authentication.Mode
+		afiName := "ipv4-unicast"
+		if strings.Contains(ip, ":") {
+			afiName = "ipv6-unicast"
+		}
+		if ic, ok := inst.configuredInterfaces[ifname]; ok {
+			auth := ic.GetAfiAuthentication(afiName, inst.defaultIntf, inst.authentication)
+			if auth != nil && auth.Mode != "" {
+				authMode = auth.Mode
+			}
+		} else if ic, ok := inst.configuredInterfaces[normIf]; ok {
+			auth := ic.GetAfiAuthentication(afiName, inst.defaultIntf, inst.authentication)
+			if auth != nil && auth.Mode != "" {
+				authMode = auth.Mode
+			}
+		} else if inst.defaultIntf != nil {
+			auth := inst.defaultIntf.GetAfiAuthentication(afiName)
+			if auth != nil && auth.Mode != "" {
+				authMode = auth.Mode
+			} else if inst.authentication != nil && inst.authentication.Mode != "" {
+				authMode = inst.authentication.Mode
+			}
+		} else if inst.authentication != nil && inst.authentication.Mode != "" {
+			authMode = inst.authentication.Mode
 		}
 	}
 
@@ -465,49 +520,83 @@ func (d *EigrpDaemon) OnInterfaceReport(netinst, name, ipAddr string, prefixlen 
 			bfdState = cur
 		}
 	}
+	afi := "ipv4-unicast"
+	if strings.Contains(ipAddr, ":") {
+		afi = "ipv6-unicast"
+	}
+
+	var ic *InterfaceConfig
+	if c, ok := inst.configuredInterfaces[name]; ok {
+		ic = c
+	} else if c, ok := inst.configuredInterfaces[normIf]; ok {
+		ic = c
+	}
+
 	authMode := "none"
-	if ic, ok := inst.configuredInterfaces[name]; ok && ic.Authentication != nil && ic.Authentication.Mode != "" {
-		authMode = ic.Authentication.Mode
-	} else if ic, ok := inst.configuredInterfaces[normIf]; ok && ic.Authentication != nil && ic.Authentication.Mode != "" {
-		authMode = ic.Authentication.Mode
-	} else if inst.defaultIntf != nil && inst.defaultIntf.Authentication != nil && inst.defaultIntf.Authentication.Mode != "" {
-		authMode = inst.defaultIntf.Authentication.Mode
+	auth := ic.GetAfiAuthentication(afi, inst.defaultIntf, inst.authentication)
+	if auth != nil && auth.Mode != "" {
+		authMode = auth.Mode
 	}
 
-	isPassive := false
+	defPassive := false
 	if inst.defaultIntf != nil {
-		isPassive = inst.defaultIntf.Passive
+		defPassive = inst.defaultIntf.IsAfiPassive(afi)
 	}
-	if ic, ok := inst.configuredInterfaces[name]; ok && ic.Passive != nil {
-		isPassive = *ic.Passive
-	} else if ic, ok := inst.configuredInterfaces[normIf]; ok && ic.Passive != nil {
-		isPassive = *ic.Passive
-	}
+	isPassive := ic.IsAfiPassive(afi, defPassive)
 
+	defAdmin := "enable"
+	if inst.defaultIntf != nil && inst.defaultIntf.AdminState != "" {
+		defAdmin = inst.defaultIntf.AdminState
+	}
 	adminState := "enable"
-	if ic, ok := inst.configuredInterfaces[name]; ok && ic.AdminState != "" {
-		adminState = ic.AdminState
-	} else if ic, ok := inst.configuredInterfaces[normIf]; ok && ic.AdminState != "" {
-		adminState = ic.AdminState
-	} else if inst.defaultIntf != nil && inst.defaultIntf.AdminState != "" {
-		adminState = inst.defaultIntf.AdminState
+	if !ic.IsAfiEnabled(afi, defAdmin) {
+		adminState = "disable"
 	}
 
-	info := &InterfaceInfo{
-		Name:          name,
-		InterfaceName: normIf,
-		AdminState:    adminState,
-		IPAddress:     ipAddr,
-		PrefixLen:     prefixlen,
-		OperState:     operState,
-		BfdState:      bfdState,
-		AuthMode:      authMode,
-		Passive:       isPassive,
-	}
+	targetMap := inst.interfaces
 	if inst.collecting {
-		inst.tempInterfaces[name] = info
+		targetMap = inst.tempInterfaces
+	}
+
+	info, exists := targetMap[name]
+	if !exists {
+		info = &InterfaceInfo{
+			Name:          name,
+			InterfaceName: normIf,
+			AdminState:    adminState,
+			OperState:     operState,
+			BfdState:      bfdState,
+			AuthMode:      authMode,
+			Passive:       isPassive,
+		}
+		targetMap[name] = info
 	} else {
-		inst.interfaces[name] = info
+		info.InterfaceName = normIf
+		if operState == "Up" || operState == "up" {
+			info.OperState = operState
+		}
+		if adminState != "" {
+			info.AdminState = adminState
+		}
+		if bfdState != "disabled" {
+			info.BfdState = bfdState
+		}
+		if authMode != "none" {
+			info.AuthMode = authMode
+		}
+		info.Passive = isPassive
+	}
+
+	if strings.Contains(ipAddr, ":") {
+		info.IP6Address = ipAddr
+		info.PrefixLen6 = prefixlen
+		if info.IPAddress == "" {
+			info.IPAddress = ipAddr
+			info.PrefixLen = prefixlen
+		}
+	} else {
+		info.IPAddress = ipAddr
+		info.PrefixLen = prefixlen
 	}
 }
 
@@ -515,6 +604,14 @@ func (d *EigrpDaemon) OnTopologyPrefix(netinst, prefix string, active bool, fd u
 	inst := d.GetOrCreateInstance(netinst)
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	afiName := "ipv4-unicast"
+	if strings.Contains(prefix, ":") {
+		afiName = "ipv6-unicast"
+	}
+	if !inst.IsAfiEnabled(afiName) {
+		inst.currentPfx = nil
+		return
+	}
 	p := &TopologyPrefixInfo{
 		Destination:    prefix,
 		Active:         active,
@@ -840,6 +937,8 @@ func main() {
 		instances:    make(map[string]*EigrpInstance),
 		prevTeleKeys: make(map[string]struct{}),
 		policies:     make(map[string]*PolicyMetricConfig),
+		policyDefs:   make(map[string]*PolicyDef),
+		redistChan:   make(chan string, 32),
 	}
 
 	daemonApp.Register(ctx)
@@ -851,6 +950,7 @@ func main() {
 
 	daemonApp.StartIPCServer(ctx)
 	go daemonApp.TelemetryWorker(ctx)
+	go daemonApp.RedistributionWorker(ctx)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -926,6 +1026,21 @@ func (d *EigrpDaemon) InitNotificationStream(ctx context.Context) error {
 	} else {
 		log.Info().Msg("Successfully registered BFD session subscription with NDK")
 	}
+
+	// Step 4: Add subscription for IP route notifications
+	routeSubReq := &ndk.NotificationRegisterRequest{
+		Op:       ndk.NotificationRegisterRequest_OPERATION_ADD_SUBSCRIPTION,
+		StreamId: d.streamId,
+		SubscriptionTypes: &ndk.NotificationRegisterRequest_Route{
+			Route: &ndk.IpRouteSubscriptionRequest{},
+		},
+	}
+	routeResp, err := d.sdkClient.NotificationRegister(ctx, routeSubReq)
+	if err != nil || routeResp.GetStatus() != ndk.SdkMgrStatus_SDK_MGR_STATUS_SUCCESS {
+		log.Warn().Err(err).Msg("Failed to add route subscription to stream (will rely on periodic sync)")
+	} else {
+		log.Info().Msg("Successfully registered IP route subscription with NDK")
+	}
 	return nil
 }
 
@@ -954,6 +1069,13 @@ func (d *EigrpDaemon) RunNotificationLoop(ctx context.Context) {
 				}
 				if bfd := n.GetBfdSession(); bfd != nil {
 					d.HandleBfdNotification(bfd)
+				}
+				if r := n.GetRoute(); r != nil {
+					ni := "default"
+					if r.GetKey() != nil && r.GetKey().GetNetworkInstanceName() != "" {
+						ni = r.GetKey().GetNetworkInstanceName()
+					}
+					d.TriggerRedistSync(ni)
 				}
 			}
 		}

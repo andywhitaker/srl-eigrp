@@ -42,29 +42,38 @@ func schemaRank(jsPath string) int {
 	if strings.Contains(jsPath, ".default-interface.address-family{") {
 		return 1
 	}
+	if strings.Contains(jsPath, ".address-family{") && !strings.Contains(jsPath, ".interface{") && !strings.Contains(jsPath, ".default-interface{") {
+		return 2
+	}
 	if strings.Contains(jsPath, ".interface{") {
+		if strings.Contains(jsPath, ".address-family{") {
+			if strings.Contains(jsPath, ".summary-address{") {
+				return 6
+			}
+			return 5
+		}
+		if strings.Contains(jsPath, ".summary-address{") {
+			return 4
+		}
 		return 3
 	}
-	if strings.Contains(jsPath, ".address-family{") {
-		return 1
-	}
 	if strings.Contains(jsPath, ".neighbor{") {
-		return 4
+		return 7
 	}
 	if strings.Contains(jsPath, ".route{") && !strings.Contains(jsPath, ".topology{") {
-		return 5
+		return 8
 	}
 	if strings.Contains(jsPath, ".static-neighbor{") {
-		return 6
+		return 9
 	}
 	if strings.Contains(jsPath, ".topology{") {
 		if strings.Contains(jsPath, "}.route{") {
-			return 8
+			return 11
 		}
-		return 7
+		return 10
 	}
 	if strings.Contains(jsPath, ".traffic{") {
-		return 9
+		return 12
 	}
 	return 0
 }
@@ -257,8 +266,11 @@ func publishInterfaceSublists(
 	operState string,
 	defIntf *DefaultInterfaceConfig,
 	ic *InterfaceConfig,
+	instAuth *AuthConfig,
 	instOperState string,
 	instAfs []AddressFamilyConfig,
+	nbrList []*NeighborInfo,
+	intfInfo *InterfaceInfo,
 	currentKeys map[string]struct{},
 	states *[]*ndk.TelemetryInfo,
 ) {
@@ -294,9 +306,25 @@ func publishInterfaceSublists(
 
 		afEnabled := true
 		afPassive := defPassive
+		if defIntf != nil {
+			afPassive = defIntf.IsAfiPassive(afName)
+		}
+		helloInterval := uint16(5)
+		holdTime := uint16(15)
+		splitHorizon := true
+		nextHopSelf := false
 		if ic != nil {
 			afEnabled = ic.IsAfiEnabled(afName, defAdmin)
-			afPassive = ic.IsAfiPassive(afName, defPassive)
+			afPassive = ic.IsAfiPassive(afName, afPassive)
+			helloInterval = ic.GetAfiHelloInterval(afName, defIntf)
+			holdTime = ic.GetAfiHoldTime(afName, defIntf)
+			splitHorizon = ic.GetAfiSplitHorizon(afName, defIntf)
+			nextHopSelf = ic.GetAfiNextHopSelf(afName, defIntf)
+		} else if defIntf != nil {
+			helloInterval = defIntf.GetAfiHelloInterval(afName)
+			holdTime = defIntf.GetAfiHoldTime(afName)
+			splitHorizon = defIntf.GetAfiSplitHorizon(afName)
+			nextHopSelf = defIntf.GetAfiNextHopSelf(afName)
 		}
 
 		adminStateStr := "enable"
@@ -315,10 +343,14 @@ func publishInterfaceSublists(
 		}
 
 		afData := map[string]interface{}{
-			"name":        afName,
-			"admin-state": adminStateStr,
-			"oper-state":  operStateStr,
-			"passive":     afPassive,
+			"name":           afName,
+			"admin-state":    adminStateStr,
+			"oper-state":     operStateStr,
+			"passive":        afPassive,
+			"hello-interval": helloInterval,
+			"hold-time":      holdTime,
+			"split-horizon":  splitHorizon,
+			"next-hop-self":  nextHopSelf,
 		}
 		if operStateStr != "up" {
 			if adminStateStr == "disable" {
@@ -329,6 +361,124 @@ func publishInterfaceSublists(
 				afData["oper-down-reason"] = "interface down or unnumbered"
 			}
 		}
+
+		if afName == "ipv4-unicast" {
+			if intfInfo != nil && intfInfo.IPAddress != "" && !strings.Contains(intfInfo.IPAddress, ":") {
+				afData["ip-address"] = intfInfo.IPAddress
+				afData["prefix-length"] = intfInfo.PrefixLen
+			}
+		} else if afName == "ipv6-unicast" {
+			if intfInfo != nil {
+				if intfInfo.IP6Address != "" {
+					afData["ip-address"] = intfInfo.IP6Address
+					afData["prefix-length"] = intfInfo.PrefixLen6
+				} else if strings.Contains(intfInfo.IPAddress, ":") {
+					afData["ip-address"] = intfInfo.IPAddress
+					afData["prefix-length"] = intfInfo.PrefixLen
+				}
+			}
+		}
+
+		// Authentication
+		var auth *AuthConfig
+		if ic != nil {
+			auth = ic.GetAfiAuthentication(afName, defIntf, instAuth)
+		} else if defIntf != nil {
+			auth = defIntf.GetAfiAuthentication(afName)
+			if auth == nil {
+				auth = instAuth
+			}
+		} else {
+			auth = instAuth
+		}
+		authAdmin := "enable"
+		authOper := "down"
+		authMode := "none"
+		var keychain, authKey string
+		if auth != nil {
+			if auth.AdminState != "" {
+				authAdmin = auth.AdminState
+			}
+			if auth.Mode != "" {
+				authMode = auth.Mode
+			}
+			keychain = auth.Keychain
+			authKey = auth.AuthenticationKey
+		}
+		if authAdmin == "enable" && operStateStr == "up" && authMode != "none" {
+			authOper = "up"
+		}
+		authMap := map[string]interface{}{
+			"admin-state": authAdmin,
+			"oper-state":  authOper,
+			"mode":        authMode,
+		}
+		if keychain != "" {
+			authMap["keychain"] = keychain
+		}
+		if authKey != "" {
+			authMap["authentication-key"] = authKey
+		}
+		afData["authentication"] = authMap
+
+		// BFD
+		var bfd *BfdConfig
+		if ic != nil {
+			bfd = ic.GetAfiBfd(afName, defIntf)
+		} else if defIntf != nil {
+			bfd = defIntf.GetAfiBfd(afName)
+		}
+		bfdAdmin := "disable"
+		bfdTx := uint32(1000000)
+		bfdRx := uint32(1000000)
+		bfdMult := uint8(3)
+		if bfd != nil {
+			if bfd.AdminState != "" {
+				bfdAdmin = bfd.AdminState
+			}
+			if bfd.DesiredMinimumTxInterval != nil && *bfd.DesiredMinimumTxInterval > 0 {
+				bfdTx = *bfd.DesiredMinimumTxInterval
+			}
+			if bfd.RequiredMinimumReceive != nil && *bfd.RequiredMinimumReceive > 0 {
+				bfdRx = *bfd.RequiredMinimumReceive
+			}
+			if bfd.DetectionMultiplier != nil && *bfd.DetectionMultiplier > 0 {
+				bfdMult = *bfd.DetectionMultiplier
+			}
+		}
+		bfdOper := "down"
+		if bfdAdmin == "enable" && operStateStr == "up" {
+			bfdOper = "up"
+		}
+		afData["bfd"] = map[string]interface{}{
+			"admin-state":                 bfdAdmin,
+			"oper-state":                  bfdOper,
+			"desired-minimum-tx-interval": bfdTx,
+			"required-minimum-receive":   bfdRx,
+			"detection-multiplier":        bfdMult,
+		}
+
+		// BFD State
+		var afBfdSessionState, afBfdRemoteAddr string
+		for _, n := range nbrList {
+			if normalizeIfName(n.Interface) == normName {
+				isNbrV6 := strings.Contains(n.IPAddress, ":")
+				if (afName == "ipv6-unicast" && isNbrV6) || (afName == "ipv4-unicast" && !isNbrV6) {
+					if n.BfdState != "" && n.BfdState != "disabled" {
+						afBfdSessionState = n.BfdState
+						afBfdRemoteAddr = n.IPAddress
+						break
+					}
+				}
+			}
+		}
+		if afBfdSessionState != "" {
+			afData["bfd-state"] = map[string]interface{}{
+				"session-state":  afBfdSessionState,
+				"remote-address": afBfdRemoteAddr,
+			}
+		}
+
 		if b, err := json.Marshal(afData); err == nil {
 			*states = append(*states, &ndk.TelemetryInfo{
 				Key:  &ndk.TelemetryKey{JsPath: afIfKey},
@@ -336,8 +486,40 @@ func publishInterfaceSublists(
 			})
 			log.Info().Str("key", afIfKey).Str("data", string(b)).Msg("Adding interface AF to telemetry")
 		}
+
+		// Summary address under address-family
+		if ic != nil {
+			saList := ic.GetAfiSummaryAddresses(afName)
+			for _, sa := range saList {
+				if sa.Prefix == "" {
+					continue
+				}
+				dist := sa.Distance
+				if dist == 0 {
+					dist = 5
+				}
+				saAfKey := fmt.Sprintf(".network_instance{.name==\"%s\"}.protocols.eigrp.interface{.interface-name==\"%s\"}.address-family{.name==\"%s\"}.summary-address{.prefix==\"%s\"}", ni, normName, afName, sa.Prefix)
+				currentKeys[saAfKey] = struct{}{}
+				saOper := "up"
+				if operStateStr == "down" || instOperState == "down" {
+					saOper = "down"
+				}
+				saData := map[string]interface{}{
+					"prefix":     sa.Prefix,
+					"distance":   dist,
+					"oper-state": saOper,
+				}
+				if b, err := json.Marshal(saData); err == nil {
+					*states = append(*states, &ndk.TelemetryInfo{
+						Key:  &ndk.TelemetryKey{JsPath: saAfKey},
+						Data: &ndk.TelemetryData{JsonContent: string(b)},
+					})
+				}
+			}
+		}
 	}
 
+	// Also publish top-level summary-address for backward compatibility
 	if ic != nil && len(ic.SummaryAddress) > 0 {
 		for _, sa := range ic.SummaryAddress {
 			if sa.Prefix == "" {
@@ -417,10 +599,37 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 	for ni, inst := range d.instances {
 		nbrList := make([]*NeighborInfo, 0, len(inst.neighbors))
 		for _, n := range inst.neighbors {
-			nbrList = append(nbrList, n)
+			afiName := "ipv4-unicast"
+			if strings.Contains(n.IPAddress, ":") {
+				afiName = "ipv6-unicast"
+			}
+			if !inst.IsAfiEnabled(afiName) {
+				continue
+			}
+			defPassive := false
+			if inst.defaultIntf != nil {
+				defPassive = inst.defaultIntf.IsAfiPassive(afiName)
+			}
+			isPassive := defPassive
+			normIf := normalizeIfName(n.Interface)
+			if ic, ok := inst.configuredInterfaces[n.Interface]; ok {
+				isPassive = ic.IsAfiPassive(afiName, defPassive)
+			} else if ic, ok := inst.configuredInterfaces[normIf]; ok {
+				isPassive = ic.IsAfiPassive(afiName, defPassive)
+			}
+			if !isPassive {
+				nbrList = append(nbrList, n)
+			}
 		}
 		routeList := make([]*RouteInfo, 0, len(inst.routes))
 		for _, r := range inst.routes {
+			afiName := "ipv4-unicast"
+			if strings.Contains(r.Prefix, ":") {
+				afiName = "ipv6-unicast"
+			}
+			if !inst.IsAfiEnabled(afiName) {
+				continue
+			}
 			routeList = append(routeList, r)
 		}
 		intfList := make([]*InterfaceInfo, 0, len(inst.interfaces))
@@ -429,6 +638,13 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 		}
 		topoList := make([]*TopologyPrefixInfo, 0, len(inst.topology))
 		for _, t := range inst.topology {
+			afiName := "ipv4-unicast"
+			if strings.Contains(t.Destination, ":") {
+				afiName = "ipv6-unicast"
+			}
+			if !inst.IsAfiEnabled(afiName) {
+				continue
+			}
 			topoList = append(topoList, t)
 		}
 		trafficList := make([]*TrafficInfo, 0, len(inst.traffic))
@@ -808,21 +1024,33 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 			currentKeys[defAfKey] = struct{}{}
 			defAfAdmin := defIntfAdmin
 			defAfPass := defIntfPass
+			defAfHello := uint16(5)
+			defAfHold := uint16(15)
+			defAfSplit := true
+			defAfNextHop := false
 			if item.defaultIntf != nil {
 				if !item.defaultIntf.IsAfiEnabled(afName) {
 					defAfAdmin = "disable"
 				}
 				defAfPass = item.defaultIntf.IsAfiPassive(afName)
+				defAfHello = item.defaultIntf.GetAfiHelloInterval(afName)
+				defAfHold = item.defaultIntf.GetAfiHoldTime(afName)
+				defAfSplit = item.defaultIntf.GetAfiSplitHorizon(afName)
+				defAfNextHop = item.defaultIntf.GetAfiNextHopSelf(afName)
 			}
 			defAfOper := "up"
 			if defOper == "down" || defAfAdmin == "disable" {
 				defAfOper = "down"
 			}
 			defAfData := map[string]interface{}{
-				"name":        afName,
-				"admin-state": defAfAdmin,
-				"oper-state":  defAfOper,
-				"passive":     defAfPass,
+				"name":           afName,
+				"admin-state":    defAfAdmin,
+				"oper-state":     defAfOper,
+				"passive":        defAfPass,
+				"hello-interval": defAfHello,
+				"hold-time":      defAfHold,
+				"split-horizon":  defAfSplit,
+				"next-hop-self":  defAfNextHop,
 			}
 			if defAfOper != "up" {
 				if defAfAdmin == "disable" {
@@ -831,6 +1059,78 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 					defAfData["oper-down-reason"] = "protocol instance down"
 				}
 			}
+
+			var afAuth *AuthConfig
+			if item.defaultIntf != nil {
+				afAuth = item.defaultIntf.GetAfiAuthentication(afName)
+			}
+			if afAuth == nil {
+				afAuth = item.authentication
+			}
+			authAdmin := "enable"
+			authOper := "down"
+			authMode := "none"
+			var keychain, authKey string
+			if afAuth != nil {
+				if afAuth.AdminState != "" {
+					authAdmin = afAuth.AdminState
+				}
+				if afAuth.Mode != "" {
+					authMode = afAuth.Mode
+				}
+				keychain = afAuth.Keychain
+				authKey = afAuth.AuthenticationKey
+			}
+			if authAdmin == "enable" && defAfOper == "up" && authMode != "none" {
+				authOper = "up"
+			}
+			authMap := map[string]interface{}{
+				"admin-state": authAdmin,
+				"oper-state":  authOper,
+				"mode":        authMode,
+			}
+			if keychain != "" {
+				authMap["keychain"] = keychain
+			}
+			if authKey != "" {
+				authMap["authentication-key"] = authKey
+			}
+			defAfData["authentication"] = authMap
+
+			var afBfd *BfdConfig
+			if item.defaultIntf != nil {
+				afBfd = item.defaultIntf.GetAfiBfd(afName)
+			}
+			bfdAdmin := "disable"
+			bfdTx := uint32(1000000)
+			bfdRx := uint32(1000000)
+			bfdMult := uint8(3)
+			if afBfd != nil {
+				if afBfd.AdminState != "" {
+					bfdAdmin = afBfd.AdminState
+				}
+				if afBfd.DesiredMinimumTxInterval != nil && *afBfd.DesiredMinimumTxInterval > 0 {
+					bfdTx = *afBfd.DesiredMinimumTxInterval
+				}
+				if afBfd.RequiredMinimumReceive != nil && *afBfd.RequiredMinimumReceive > 0 {
+					bfdRx = *afBfd.RequiredMinimumReceive
+				}
+				if afBfd.DetectionMultiplier != nil && *afBfd.DetectionMultiplier > 0 {
+					bfdMult = *afBfd.DetectionMultiplier
+				}
+			}
+			bfdOper := "down"
+			if bfdAdmin == "enable" && defAfOper == "up" {
+				bfdOper = "up"
+			}
+			defAfData["bfd"] = map[string]interface{}{
+				"admin-state":                 bfdAdmin,
+				"oper-state":                  bfdOper,
+				"desired-minimum-tx-interval": bfdTx,
+				"required-minimum-receive":   bfdRx,
+				"detection-multiplier":        bfdMult,
+			}
+
 			if b, err := json.Marshal(defAfData); err == nil {
 				states = append(states, &ndk.TelemetryInfo{
 					Key:  &ndk.TelemetryKey{JsPath: defAfKey},
@@ -1121,8 +1421,11 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 				i.OperState,
 				item.defaultIntf,
 				ic,
+				item.authentication,
 				item.operState,
 				item.addressFamily,
+				item.nbrList,
+				i,
 				currentKeys,
 				&states,
 			)
@@ -1165,8 +1468,11 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 				"down",
 				item.defaultIntf,
 				ic,
+				item.authentication,
 				item.operState,
 				item.addressFamily,
+				item.nbrList,
+				nil,
 				currentKeys,
 				&states,
 			)

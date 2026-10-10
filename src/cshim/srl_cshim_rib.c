@@ -67,15 +67,14 @@ eigrp_result_t eigrp_rib_route_add(eigrp_instance_t *eigrp, const eigrp_rib_rout
     int is_ext = (route->install.type == EIGRP_RIB_ROUTE_EXTERNAL) ? 1 : 0;
     uint8_t rib_scale = srl_get_rib_scale(netinst);
     if (rib_scale == 0) rib_scale = 128;
-    uint32_t rib_metric;
-    if (route->metric >= EIGRP_64BIT_METRIC_INFINITY) {
-        rib_metric = UINT32_MAX;
-    } else {
-        uint64_t scaled = route->metric / rib_scale;
-        if (scaled == 0 && route->metric > 0) scaled = 1;
-        if (scaled > UINT32_MAX) scaled = UINT32_MAX;
-        rib_metric = (uint32_t)scaled;
+    if (route->metric >= EIGRP_64BIT_METRIC_INFINITY || route->metric >= 4294967295ULL) {
+        srlGoRouteDel((char *)netinst, pfx_str);
+        return EIGRP_RESULT_SUCCESS;
     }
+    uint64_t scaled = route->metric / rib_scale;
+    if (scaled == 0 && route->metric > 0) scaled = 1;
+    if (scaled > UINT32_MAX) scaled = UINT32_MAX;
+    uint32_t rib_metric = (uint32_t)scaled;
     srlGoRouteAdd((char *)netinst, pfx_str, nhs_buf, rib_metric, (uint64_t)route->metric, is_ext);
     return EIGRP_RESULT_SUCCESS;
 }

@@ -273,8 +273,8 @@ enter candidate
 / routing-policy policy eigrp-policy statement 10 action eigrp metric bandwidth 100000 delay 100 reliability 255 load 1 mtu 1500
 / routing-policy policy eigrp-policy default-action policy-result reject
 / routing-policy policy eigrp-policy default-action eigrp metric bandwidth 50000 delay 50 reliability 200 load 2 mtu 1400
-/ network-instance default protocols eigrp export-policy eigrp-policy
-/ network-instance default protocols eigrp import-policy eigrp-policy
+/ network-instance default protocols eigrp address-family ipv4-unicast export-policy eigrp-policy
+/ network-instance default protocols eigrp address-family ipv4-unicast import-policy eigrp-policy
 commit now
 EOF"""
     out = srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", policy_cfg])
@@ -294,9 +294,9 @@ EOF"""
     ])
     assert "bandwidth 50000" in info_defaction, f"default-action metric bandwidth missing: {info_defaction}"
 
-    # Verify standard import-policy and export-policy leaves are present in running config
+    # Verify standard import-policy and export-policy leaves are present under address-family in running config
     info_eigrp = srl_exec("clab-srl-srl-eigrp-srl1", [
-        "sr_cli", "info network-instance default protocols eigrp"
+        "sr_cli", "info network-instance default protocols eigrp address-family ipv4-unicast"
     ])
     assert "export-policy eigrp-policy" in info_eigrp, f"export-policy missing: {info_eigrp}"
     assert "import-policy eigrp-policy" in info_eigrp, f"import-policy missing: {info_eigrp}"
@@ -359,7 +359,8 @@ def test_default_interface_passive_inheritance(srl_exec):
     # 1. Set default-interface passive true
     set_passive = """sr_cli << 'EOF'
 enter candidate
-/ network-instance default protocols eigrp default-interface passive true
+discard stay
+set / network-instance default protocols eigrp default-interface passive true
 commit now
 EOF"""
     out_p = srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", set_passive])
@@ -369,7 +370,7 @@ EOF"""
         # 2. Verify neighbor is dropped (since ethernet-1/1.0 inherits passive true)
         dropped = False
         out_nbr = ""
-        for _ in range(10):
+        for _ in range(15):
             time.sleep(1)
             out_nbr = srl_exec("clab-srl-srl-eigrp-srl1", [
                 "sr_cli", "show network-instance default protocols eigrp neighbor"
@@ -382,15 +383,16 @@ EOF"""
         # 3. Restore default-interface passive false
         unset_passive = """sr_cli << 'EOF'
 enter candidate
-/ network-instance default protocols eigrp default-interface passive false
+discard stay
+set / network-instance default protocols eigrp default-interface passive false
 commit now
 EOF"""
         srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", unset_passive])
 
     # 4. Verify neighbor recovers
     recovered = False
-    for _ in range(15):
-        time.sleep(2)
+    for _ in range(20):
+        time.sleep(1)
         out_rec = srl_exec("clab-srl-srl-eigrp-srl1", [
             "sr_cli", "show network-instance default protocols eigrp neighbor"
         ])
@@ -748,33 +750,35 @@ def test_srl_ipv6_tools_clear_neighbor(srl_exec):
 
 def test_srl_ipv6_passive_interface(srl_exec):
     """Verify making an IPv6 interface passive drops neighbor and removing passive recovers it."""
-    # Set passive true on srl1 ethernet-1/1.0 under address-family ipv6-unicast
-    cfg_passive = """sr_cli << 'EOF'
+    try:
+        # Set passive true on srl1 ethernet-1/1.0 under address-family ipv6-unicast
+        cfg_passive = """sr_cli << 'EOF'
 enter candidate
 / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv6-unicast passive true
 commit now
 EOF"""
-    srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_passive])
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_passive])
 
-    # Verify IPv6 neighbor drops (total-neighbors becomes 1)
-    dropped = False
-    for _ in range(15):
-        time.sleep(1)
-        out_state = srl_exec("clab-srl-srl-eigrp-srl1", [
-            "sr_cli", "info from state network-instance default protocols eigrp"
-        ])
-        if "total-neighbors 1" in out_state:
-            dropped = True
-            break
-    assert dropped, f"IPv6 neighbor did not drop after passive true: {out_state}"
-
-    # Revert passive to false
-    cfg_active = """sr_cli << 'EOF'
+        # Verify IPv6 neighbor drops (total-neighbors becomes 1)
+        dropped = False
+        for _ in range(15):
+            time.sleep(1)
+            out_state = srl_exec("clab-srl-srl-eigrp-srl1", [
+                "sr_cli", "info from state network-instance default protocols eigrp"
+            ])
+            if "total-neighbors 1" in out_state:
+                dropped = True
+                break
+        assert dropped, f"IPv6 neighbor did not drop after passive true: {out_state}"
+    finally:
+        # Revert passive
+        cfg_active = """sr_cli << 'EOF'
 enter candidate
-/ network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv6-unicast passive false
+discard stay
+delete / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv6-unicast
 commit now
 EOF"""
-    srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_active])
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_active])
 
     # Verify IPv6 neighbor recovers (total-neighbors returns to 2)
     recovered = False
@@ -786,7 +790,7 @@ EOF"""
         if "total-neighbors 2" in out_state and "2001:db8::2/128" in out_state:
             recovered = True
             break
-    assert recovered, f"IPv6 neighbor did not recover after passive false: {out_state}"
+    assert recovered, f"IPv6 neighbor did not recover after passive cleanup: {out_state}"
 
 
 def test_srl_ipv6_disable(srl_exec):
@@ -896,125 +900,136 @@ EOF"""
 
 def test_packet_authentication_md5_and_sha256(srl_exec):
     """Verify MD5 and HMAC-SHA-256 packet authentication with key mismatch rejection."""
-    # 1. Configure matching MD5 authentication keychain on SRL1 & SRL2
-    cfg_srl1_md5 = """sr_cli << 'EOF'
+    try:
+        # 1. Configure matching MD5 authentication keychain on SRL1 & SRL2
+        cfg_srl1_md5 = """sr_cli << 'EOF'
 enter candidate
-/ system authentication keychain eigrp-test-md5 admin-state enable type ospf key 1 algorithm md5 authentication-key authsecret123
-/ network-instance default protocols eigrp interface ethernet-1/1.0 authentication mode md5 keychain eigrp-test-md5
+discard stay
+set / system authentication keychain eigrp-test-md5 admin-state enable type ospf key 1 algorithm md5 authentication-key authsecret123
+set / network-instance default protocols eigrp interface ethernet-1/1.0 authentication mode md5 keychain eigrp-test-md5
 commit now
 EOF"""
-    cfg_srl2_md5 = """sr_cli << 'EOF'
+        cfg_srl2_md5 = """sr_cli << 'EOF'
 enter candidate
-/ system authentication keychain eigrp-test-md5 admin-state enable type ospf key 1 algorithm md5 authentication-key authsecret123
-/ network-instance default protocols eigrp interface ethernet-1/1.0 authentication mode md5 keychain eigrp-test-md5
+discard stay
+set / system authentication keychain eigrp-test-md5 admin-state enable type ospf key 1 algorithm md5 authentication-key authsecret123
+set / network-instance default protocols eigrp interface ethernet-1/1.0 authentication mode md5 keychain eigrp-test-md5
 commit now
 EOF"""
-    srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_srl1_md5])
-    srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", cfg_srl2_md5])
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_srl1_md5])
+        srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", cfg_srl2_md5])
 
-    # Verify neighbor is Up with MD5
-    md5_up = False
-    for _ in range(15):
-        time.sleep(1)
-        out = srl_exec("clab-srl-srl-eigrp-srl1", [
+        # Verify neighbor is Up with MD5
+        md5_up = False
+        for _ in range(15):
+            time.sleep(1)
+            out = srl_exec("clab-srl-srl-eigrp-srl1", [
+                "sr_cli", "show network-instance default protocols eigrp neighbor"
+            ])
+            if "10.0.0.2" in out and "Up" in out:
+                md5_up = True
+                break
+        assert md5_up, f"Neighbor failed to establish with MD5 authentication: {out}"
+
+        # Verify state DB shows auth-mode md5
+        out_state = srl_exec("clab-srl-srl-eigrp-srl1", [
+            "sr_cli", "info from state network-instance default protocols eigrp"
+        ])
+        assert "auth-mode md5" in out_state, f"State DB missing auth-mode md5: {out_state}"
+
+        # 2. Update SRL2 to mismatched key and clear neighbor -> verify adjacency does not recover
+        cfg_srl2_mismatch = """sr_cli << 'EOF'
+enter candidate
+discard stay
+set / system authentication keychain eigrp-test-md5 key 1 authentication-key wrongpassword
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", cfg_srl2_mismatch])
+        srl_exec("clab-srl-srl-eigrp-srl1", [
+            "sr_cli", "tools network-instance default protocols eigrp neighbor clear 10.0.0.2"
+        ])
+        time.sleep(3)
+        out_mismatch = srl_exec("clab-srl-srl-eigrp-srl1", [
             "sr_cli", "show network-instance default protocols eigrp neighbor"
         ])
-        if "10.0.0.2" in out and "Up" in out:
-            md5_up = True
-            break
-    assert md5_up, f"Neighbor failed to establish with MD5 authentication: {out}"
+        assert "10.0.0.2" not in out_mismatch or "Up" not in out_mismatch, f"Neighbor should not form with mismatched key: {out_mismatch}"
 
-    # Verify state DB shows auth-mode md5
-    out_state = srl_exec("clab-srl-srl-eigrp-srl1", [
-        "sr_cli", "info from state network-instance default protocols eigrp"
-    ])
-    assert "auth-mode md5" in out_state, f"State DB missing auth-mode md5: {out_state}"
-
-    # 2. Update SRL2 to mismatched key and clear neighbor -> verify adjacency does not recover
-    cfg_srl2_mismatch = """sr_cli << 'EOF'
+        # 3. Configure matching HMAC-SHA-256 keychain on SRL1 & SRL2
+        cfg_srl1_sha = """sr_cli << 'EOF'
 enter candidate
-/ system authentication keychain eigrp-test-md5 key 1 authentication-key wrongpassword
+discard stay
+set / system authentication keychain eigrp-test-sha admin-state enable type isis key 1 algorithm hmac-sha-256 authentication-key shasecret456
+set / network-instance default protocols eigrp interface ethernet-1/1.0 authentication mode hmac-sha-256 keychain eigrp-test-sha
 commit now
 EOF"""
-    srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", cfg_srl2_mismatch])
-    srl_exec("clab-srl-srl-eigrp-srl1", [
-        "sr_cli", "tools network-instance default protocols eigrp neighbor clear 10.0.0.2"
-    ])
-    time.sleep(3)
-    out_mismatch = srl_exec("clab-srl-srl-eigrp-srl1", [
-        "sr_cli", "show network-instance default protocols eigrp neighbor"
-    ])
-    assert "10.0.0.2" not in out_mismatch or "Up" not in out_mismatch, f"Neighbor should not form with mismatched key: {out_mismatch}"
-
-    # 3. Configure matching HMAC-SHA-256 keychain on SRL1 & SRL2
-    cfg_srl1_sha = """sr_cli << 'EOF'
+        cfg_srl2_sha = """sr_cli << 'EOF'
 enter candidate
-/ system authentication keychain eigrp-test-sha admin-state enable type isis key 1 algorithm hmac-sha-256 authentication-key shasecret456
-/ network-instance default protocols eigrp interface ethernet-1/1.0 authentication mode hmac-sha-256 keychain eigrp-test-sha
+discard stay
+set / system authentication keychain eigrp-test-sha admin-state enable type isis key 1 algorithm hmac-sha-256 authentication-key shasecret456
+set / network-instance default protocols eigrp interface ethernet-1/1.0 authentication mode hmac-sha-256 keychain eigrp-test-sha
 commit now
 EOF"""
-    cfg_srl2_sha = """sr_cli << 'EOF'
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_srl1_sha])
+        srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", cfg_srl2_sha])
+
+        sha_up = False
+        for _ in range(15):
+            time.sleep(1)
+            out = srl_exec("clab-srl-srl-eigrp-srl1", [
+                "sr_cli", "show network-instance default protocols eigrp neighbor"
+            ])
+            if "10.0.0.2" in out and "Up" in out:
+                sha_up = True
+                break
+        assert sha_up, f"Neighbor failed to establish with HMAC-SHA-256: {out}"
+
+        # 4. Test direct authentication-key (direct password without keychain) with MD5
+        cfg_srl1_direct = """sr_cli << 'EOF'
 enter candidate
-/ system authentication keychain eigrp-test-sha admin-state enable type isis key 1 algorithm hmac-sha-256 authentication-key shasecret456
-/ network-instance default protocols eigrp interface ethernet-1/1.0 authentication mode hmac-sha-256 keychain eigrp-test-sha
+discard stay
+set / network-instance default protocols eigrp interface ethernet-1/1.0 authentication mode md5 authentication-key directsecret123
 commit now
 EOF"""
-    srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_srl1_sha])
-    srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", cfg_srl2_sha])
+        cfg_srl2_direct = """sr_cli << 'EOF'
+enter candidate
+discard stay
+set / network-instance default protocols eigrp interface ethernet-1/1.0 authentication mode md5 authentication-key directsecret123
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_srl1_direct])
+        srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", cfg_srl2_direct])
 
-    sha_up = False
-    for _ in range(15):
-        time.sleep(1)
-        out = srl_exec("clab-srl-srl-eigrp-srl1", [
-            "sr_cli", "show network-instance default protocols eigrp neighbor"
+        direct_up = False
+        for _ in range(15):
+            time.sleep(1)
+            out = srl_exec("clab-srl-srl-eigrp-srl1", [
+                "sr_cli", "show network-instance default protocols eigrp neighbor"
+            ])
+            if "10.0.0.2" in out and "Up" in out:
+                direct_up = True
+                break
+        assert direct_up, f"Neighbor failed to establish with direct MD5 authentication-key: {out}"
+
+        # Verify state DB shows auth-mode md5 with direct key
+        out_state_dir = srl_exec("clab-srl-srl-eigrp-srl1", [
+            "sr_cli", "info from state network-instance default protocols eigrp"
         ])
-        if "10.0.0.2" in out and "Up" in out:
-            sha_up = True
-            break
-    assert sha_up, f"Neighbor failed to establish with HMAC-SHA-256: {out}"
-
-    # 4. Test direct authentication-key (direct password without keychain) with MD5
-    cfg_srl1_direct = """sr_cli << 'EOF'
+        assert "auth-mode md5" in out_state_dir, f"State DB missing auth-mode md5 with direct key: {out_state_dir}"
+    finally:
+        # 5. Revert to unauthenticated state and clean up test keychains
+        cfg_revert = """sr_cli << 'EOF'
 enter candidate
-/ network-instance default protocols eigrp interface ethernet-1/1.0 authentication mode md5 authentication-key directsecret123
-commit now
-EOF"""
-    cfg_srl2_direct = """sr_cli << 'EOF'
-enter candidate
-/ network-instance default protocols eigrp interface ethernet-1/1.0 authentication mode md5 authentication-key directsecret123
-commit now
-EOF"""
-    srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_srl1_direct])
-    srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", cfg_srl2_direct])
-
-    direct_up = False
-    for _ in range(15):
-        time.sleep(1)
-        out = srl_exec("clab-srl-srl-eigrp-srl1", [
-            "sr_cli", "show network-instance default protocols eigrp neighbor"
-        ])
-        if "10.0.0.2" in out and "Up" in out:
-            direct_up = True
-            break
-    assert direct_up, f"Neighbor failed to establish with direct MD5 authentication-key: {out}"
-
-    # Verify state DB shows auth-mode md5 with direct key
-    out_state_dir = srl_exec("clab-srl-srl-eigrp-srl1", [
-        "sr_cli", "info from state network-instance default protocols eigrp"
-    ])
-    assert "auth-mode md5" in out_state_dir, f"State DB missing auth-mode md5 with direct key: {out_state_dir}"
-
-    # 5. Revert to unauthenticated state
-    cfg_revert = """sr_cli << 'EOF'
-enter candidate
+discard stay
 delete / network-instance default protocols eigrp interface ethernet-1/1.0 authentication
+delete / system authentication keychain eigrp-test-md5
+delete / system authentication keychain eigrp-test-sha
 commit now
 EOF"""
-    srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_revert])
-    srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", cfg_revert])
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_revert])
+        srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", cfg_revert])
 
     unauth_up = False
-    for _ in range(15):
+    for _ in range(20):
         time.sleep(1)
         out = srl_exec("clab-srl-srl-eigrp-srl1", [
             "sr_cli", "show network-instance default protocols eigrp neighbor"
@@ -1125,73 +1140,79 @@ EOF"""
 
 def test_admin_state_disable_state_db(srl_exec):
     """Verify admin-state disable reflects admin-state disable and oper-state down in State DB."""
-    # 1. Disable interface ethernet-1/1.0 administratively
-    cfg_disable = """sr_cli << 'EOF'
+    try:
+        # 1. Disable interface ethernet-1/1.0 administratively
+        cfg_disable = """sr_cli << 'EOF'
 enter candidate
+discard stay
 set / network-instance default protocols eigrp interface ethernet-1/1.0 admin-state disable
 commit now
 EOF"""
-    srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_disable])
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_disable])
 
-    # Wait for telemetry to update
-    disabled_ok = False
-    for _ in range(15):
-        time.sleep(1)
-        out_state = srl_exec("clab-srl-srl-eigrp-srl1", [
-            "sr_cli", "info from state network-instance default protocols eigrp"
-        ])
-        if "interface ethernet-1/1.0" in out_state and "admin-state disable" in out_state:
-            disabled_ok = True
-            break
-    assert disabled_ok, f"State DB did not reflect admin-state disable and oper-state down: {out_state}"
+        # Wait for telemetry to update
+        disabled_ok = False
+        for _ in range(15):
+            time.sleep(1)
+            out_state = srl_exec("clab-srl-srl-eigrp-srl1", [
+                "sr_cli", "info from state network-instance default protocols eigrp"
+            ])
+            if "interface ethernet-1/1.0" in out_state and "admin-state disable" in out_state:
+                disabled_ok = True
+                break
+        assert disabled_ok, f"State DB did not reflect admin-state disable and oper-state down: {out_state}"
 
-    # 2. Re-enable interface ethernet-1/1.0
-    cfg_enable = """sr_cli << 'EOF'
+        # 2. Re-enable interface ethernet-1/1.0
+        cfg_enable = """sr_cli << 'EOF'
 enter candidate
+discard stay
 set / network-instance default protocols eigrp interface ethernet-1/1.0 admin-state enable
 commit now
 EOF"""
-    srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_enable])
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_enable])
 
-    # Wait for neighbor and interface to recover to up
-    recovered_ok = False
-    for _ in range(25):
-        time.sleep(1)
-        out_state = srl_exec("clab-srl-srl-eigrp-srl1", [
-            "sr_cli", "info from state network-instance default protocols eigrp"
-        ])
-        if "interface ethernet-1/1.0" in out_state and "admin-state enable" in out_state and "neighbor 10.0.0.2" in out_state:
-            recovered_ok = True
-            break
-    assert recovered_ok, f"State DB did not recover to admin-state enable and oper-state up: {out_state}"
+        # Wait for neighbor and interface to recover to up
+        recovered_ok = False
+        for _ in range(25):
+            time.sleep(1)
+            out_state = srl_exec("clab-srl-srl-eigrp-srl1", [
+                "sr_cli", "info from state network-instance default protocols eigrp"
+            ])
+            if "interface ethernet-1/1.0" in out_state and "admin-state enable" in out_state and "neighbor 10.0.0.2" in out_state:
+                recovered_ok = True
+                break
+        assert recovered_ok, f"State DB did not recover to admin-state enable and oper-state up: {out_state}"
 
-    # 3. Disable protocol EIGRP instance administratively
-    cfg_proto_disable = """sr_cli << 'EOF'
+        # 3. Disable protocol EIGRP instance administratively
+        cfg_proto_disable = """sr_cli << 'EOF'
 enter candidate
+discard stay
 set / network-instance default protocols eigrp admin-state disable
 commit now
 EOF"""
-    srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_proto_disable])
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_proto_disable])
 
-    # Wait for protocol state to transition to disabled / down and operational tables to clear
-    proto_disabled_ok = False
-    for _ in range(15):
-        time.sleep(1)
-        out_state = srl_exec("clab-srl-srl-eigrp-srl1", [
-            "sr_cli", "info from state network-instance default protocols eigrp"
-        ])
-        if "admin-state disable" in out_state and "oper-state down" in out_state and "neighbor 10.0.0.2" not in out_state:
-            proto_disabled_ok = True
-            break
-    assert proto_disabled_ok, f"State DB did not reflect protocol admin-state disable: {out_state}"
-
-    # 4. Re-enable protocol EIGRP instance
-    cfg_proto_enable = """sr_cli << 'EOF'
+        # Wait for protocol state to transition to disabled / down and operational tables to clear
+        proto_disabled_ok = False
+        for _ in range(15):
+            time.sleep(1)
+            out_state = srl_exec("clab-srl-srl-eigrp-srl1", [
+                "sr_cli", "info from state network-instance default protocols eigrp"
+            ])
+            if "admin-state disable" in out_state and "oper-state down" in out_state and "neighbor 10.0.0.2" not in out_state:
+                proto_disabled_ok = True
+                break
+        assert proto_disabled_ok, f"State DB did not reflect protocol admin-state disable: {out_state}"
+    finally:
+        # 4. Re-enable protocol EIGRP instance and interface
+        cfg_proto_enable = """sr_cli << 'EOF'
 enter candidate
+discard stay
 set / network-instance default protocols eigrp admin-state enable
+set / network-instance default protocols eigrp interface ethernet-1/1.0 admin-state enable
 commit now
 EOF"""
-    srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_proto_enable])
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_proto_enable])
 
     # Wait for neighbor and protocol to recover
     proto_recovered_ok = False
@@ -1208,42 +1229,596 @@ EOF"""
 
 def test_summary_address_state_db(srl_exec):
     """Verify summary-address configuration is reflected as state in the state database."""
-    cfg_sa = """sr_cli << 'EOF'
+    try:
+        cfg_sa = """sr_cli << 'EOF'
 enter candidate
+discard stay
 set / network-instance default protocols eigrp interface ethernet-1/1.0 summary-address 10.128.0.0/16 distance 15
 commit now
 EOF"""
-    srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_sa])
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_sa])
 
-    sa_ok = False
-    for _ in range(15):
-        time.sleep(1)
-        out_state = srl_exec("clab-srl-srl-eigrp-srl1", [
-            "sr_cli", "info from state network-instance default protocols eigrp"
-        ])
-        if "summary-address 10.128.0.0/16" in out_state and "distance 15" in out_state:
-            sa_ok = True
-            break
-    assert sa_ok, f"State DB missing summary-address: {out_state}"
+        sa_ok = False
+        for _ in range(15):
+            time.sleep(1)
+            out_state = srl_exec("clab-srl-srl-eigrp-srl1", [
+                "sr_cli", "info from state network-instance default protocols eigrp"
+            ])
+            if "summary-address 10.128.0.0/16" in out_state and "distance 15" in out_state:
+                sa_ok = True
+                break
+        assert sa_ok, f"State DB missing summary-address: {out_state}"
 
-    # Clean up
-    cfg_clean = """sr_cli << 'EOF'
+        # Clean up
+        cfg_clean = """sr_cli << 'EOF'
 enter candidate
+discard stay
 delete / network-instance default protocols eigrp interface ethernet-1/1.0 summary-address 10.128.0.0/16
 commit now
 EOF"""
-    srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_clean])
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_clean])
 
-    sa_cleaned = False
+        sa_cleaned = False
+        for _ in range(15):
+            time.sleep(1)
+            out_state = srl_exec("clab-srl-srl-eigrp-srl1", [
+                "sr_cli", "info from state network-instance default protocols eigrp"
+            ])
+            if "summary-address" not in out_state:
+                sa_cleaned = True
+                break
+        assert sa_cleaned, f"State DB retained deleted summary-address: {out_state}"
+    finally:
+        cfg_ensure = """sr_cli << 'EOF'
+enter candidate
+discard stay
+delete / network-instance default protocols eigrp interface ethernet-1/1.0 summary-address 10.128.0.0/16
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_ensure])
+
+
+def test_ospfv2_redistribution_into_eigrp(srl_exec):
+    """Verify OSPFv2 redistribution into EIGRP via routing-policy export-policy,
+    validating route preference 170 for external routes and 90 for internal routes,
+    and route withdrawal upon removal."""
+    try:
+        cfg_srl1 = """sr_cli << 'EOF'
+enter candidate
+discard stay
+/ network-instance default protocols ospf instance ospf2 admin-state enable version ospf-v2 router-id 192.0.2.1
+/ network-instance default protocols ospf instance ospf2 area 0.0.0.0 interface ethernet-1/1.0 admin-state enable interface-type point-to-point
+/ routing-policy policy eigrp-policy statement 20 match protocol ospfv2
+/ routing-policy policy eigrp-policy statement 20 action policy-result accept
+/ routing-policy policy eigrp-policy statement 20 action eigrp metric bandwidth 100000 delay 100 reliability 255 load 1 mtu 1500
+commit now
+EOF"""
+        cfg_srl2 = """sr_cli << 'EOF'
+enter candidate
+discard stay
+/ interface lo0 subinterface 10 ipv4 admin-state enable
+/ interface lo0 subinterface 10 ipv4 address 172.20.20.1/32
+/ network-instance default interface lo0.10
+/ network-instance default protocols ospf instance ospf2 admin-state enable version ospf-v2 router-id 192.0.2.2
+/ network-instance default protocols ospf instance ospf2 area 0.0.0.0 interface ethernet-1/1.0 admin-state enable interface-type point-to-point
+/ network-instance default protocols ospf instance ospf2 area 0.0.0.0 interface lo0.10 admin-state enable interface-type point-to-point
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_srl1])
+        srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", cfg_srl2])
+
+        route_learned = False
+        out_routes = ""
+        for _ in range(30):
+            time.sleep(1)
+            out_routes = srl_exec("clab-srl-srl-eigrp-srl2", [
+                "sr_cli", "show network-instance default protocols eigrp routes"
+            ])
+            if "172.20.20.1/32" in out_routes and "External" in out_routes and "170" in out_routes:
+                route_learned = True
+                break
+        assert route_learned, f"OSPFv2 route not redistributed to SRL2 with external preference 170: {out_routes}"
+
+        # Verify internal route retains preference 90 and Internal type
+        assert "192.0.2.1/32" in out_routes and "Internal" in out_routes and "90" in out_routes
+
+    finally:
+        clean_srl1 = """sr_cli << 'EOF'
+enter candidate
+discard stay
+delete / network-instance default protocols ospf instance ospf2
+delete / routing-policy policy eigrp-policy statement 20
+commit now
+EOF"""
+        clean_srl2 = """sr_cli << 'EOF'
+enter candidate
+discard stay
+delete / network-instance default protocols ospf instance ospf2
+delete / network-instance default interface lo0.10
+delete / interface lo0 subinterface 10
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", clean_srl1])
+        srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", clean_srl2])
+
+        withdrawn = False
+        for _ in range(15):
+            time.sleep(1)
+            out_routes = srl_exec("clab-srl-srl-eigrp-srl2", [
+                "sr_cli", "show network-instance default protocols eigrp routes"
+            ])
+            if "172.20.20.1/32" not in out_routes:
+                withdrawn = True
+                break
+        assert withdrawn, f"OSPFv2 redistributed route was not withdrawn: {out_routes}"
+
+
+def test_ospfv3_redistribution_into_eigrp(srl_exec):
+    """Verify OSPFv3 redistribution into EIGRP IPv6 via routing-policy export-policy,
+    validating route preference 170 for external routes and 90 for internal routes,
+    and route withdrawal upon removal."""
+    try:
+        cfg_srl1 = """sr_cli << 'EOF'
+enter candidate
+discard stay
+/ network-instance default protocols ospf instance ospf3 admin-state enable version ospf-v3 router-id 192.0.2.1 address-family ipv6-unicast
+/ network-instance default protocols ospf instance ospf3 area 0.0.0.0 interface ethernet-1/1.0 admin-state enable interface-type point-to-point
+/ routing-policy policy eigrp-policy statement 50 match protocol ospfv3
+/ routing-policy policy eigrp-policy statement 50 action policy-result accept
+/ routing-policy policy eigrp-policy statement 50 action eigrp metric bandwidth 100000 delay 100 reliability 255 load 1 mtu 1500
+/ network-instance default protocols eigrp address-family ipv6-unicast export-policy eigrp-policy
+commit now
+EOF"""
+        cfg_srl2 = """sr_cli << 'EOF'
+enter candidate
+discard stay
+/ interface lo0 subinterface 20 ipv6 admin-state enable
+/ interface lo0 subinterface 20 ipv6 address 2001:db8:77::1/128
+/ network-instance default interface lo0.20
+/ network-instance default protocols ospf instance ospf3 admin-state enable version ospf-v3 router-id 192.0.2.2 address-family ipv6-unicast
+/ network-instance default protocols ospf instance ospf3 area 0.0.0.0 interface ethernet-1/1.0 admin-state enable interface-type point-to-point
+/ network-instance default protocols ospf instance ospf3 area 0.0.0.0 interface lo0.20 admin-state enable interface-type point-to-point
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_srl1])
+        srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", cfg_srl2])
+
+        route_learned = False
+        out_routes = ""
+        for _ in range(30):
+            time.sleep(1)
+            out_routes = srl_exec("clab-srl-srl-eigrp-srl2", [
+                "sr_cli", "show network-instance default protocols eigrp routes"
+            ])
+            if "2001:db8:77::1/128" in out_routes and "External" in out_routes and "170" in out_routes:
+                route_learned = True
+                break
+        assert route_learned, f"OSPFv3 route not redistributed to SRL2 with external preference 170: {out_routes}"
+
+        # Verify internal IPv6 route retains preference 90 and Internal type
+        assert "2001:db8::1/128" in out_routes and "Internal" in out_routes and "90" in out_routes
+
+    finally:
+        clean_srl1 = """sr_cli << 'EOF'
+enter candidate
+discard stay
+delete / network-instance default protocols ospf instance ospf3
+delete / routing-policy policy eigrp-policy statement 50
+delete / network-instance default protocols eigrp address-family ipv6-unicast export-policy
+commit now
+EOF"""
+        clean_srl2 = """sr_cli << 'EOF'
+enter candidate
+discard stay
+delete / network-instance default protocols ospf instance ospf3
+delete / network-instance default interface lo0.20
+delete / interface lo0 subinterface 20
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", clean_srl1])
+        srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", clean_srl2])
+
+        withdrawn = False
+        for _ in range(15):
+            time.sleep(1)
+            out_routes = srl_exec("clab-srl-srl-eigrp-srl2", [
+                "sr_cli", "show network-instance default protocols eigrp routes"
+            ])
+            if "2001:db8:77::1/128" not in out_routes:
+                withdrawn = True
+                break
+        assert withdrawn, f"OSPFv3 redistributed route was not withdrawn: {out_routes}"
+
+
+def test_bgp_redistribution_into_eigrp(srl_exec):
+    """Verify BGP redistribution into EIGRP via routing-policy export-policy,
+    validating route preference 170 for external routes and 90 for internal routes,
+    and route withdrawal upon removal."""
+    try:
+        cfg_srl1 = """sr_cli << 'EOF'
+enter candidate
+discard stay
+/ network-instance default protocols bgp admin-state enable autonomous-system 65001 router-id 192.0.2.1 afi-safi ipv4-unicast admin-state enable
+/ network-instance default protocols bgp group pg1 admin-state enable peer-as 65002
+/ network-instance default protocols bgp neighbor 10.0.0.2 admin-state enable peer-group pg1
+/ network-instance default protocols bgp ebgp-default-policy import-reject-all false export-reject-all false
+/ routing-policy policy eigrp-policy statement 60 match protocol bgp
+/ routing-policy policy eigrp-policy statement 60 action policy-result accept
+/ routing-policy policy eigrp-policy statement 60 action eigrp metric bandwidth 100000 delay 100 reliability 255 load 1 mtu 1500
+commit now
+EOF"""
+        cfg_srl2 = """sr_cli << 'EOF'
+enter candidate
+discard stay
+/ network-instance default static-routes route 172.25.25.0/24 admin-state enable
+/ network-instance default static-routes route 172.25.25.0/24 next-hop-group nhg25
+/ network-instance default next-hop-groups group nhg25 admin-state enable nexthop 1 ip-address 10.0.0.1 admin-state enable
+/ routing-policy policy bgp-export statement 1 match protocol static
+/ routing-policy policy bgp-export statement 1 action policy-result accept
+/ network-instance default protocols bgp admin-state enable autonomous-system 65002 router-id 192.0.2.2 afi-safi ipv4-unicast admin-state enable
+/ network-instance default protocols bgp group pg1 admin-state enable peer-as 65001
+/ network-instance default protocols bgp group pg1 export-policy [ bgp-export ]
+/ network-instance default protocols bgp neighbor 10.0.0.1 admin-state enable peer-group pg1
+/ network-instance default protocols bgp ebgp-default-policy import-reject-all false export-reject-all false
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_srl1])
+        srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", cfg_srl2])
+
+        route_learned = False
+        out_routes = ""
+        for _ in range(35):
+            time.sleep(1)
+            out_routes = srl_exec("clab-srl-srl-eigrp-srl2", [
+                "sr_cli", "show network-instance default protocols eigrp routes"
+            ])
+            if "172.25.25.0/24" in out_routes and "External" in out_routes and "170" in out_routes:
+                route_learned = True
+                break
+        assert route_learned, f"BGP route not redistributed to SRL2 with external preference 170: {out_routes}"
+
+        # Verify internal route retains preference 90 and Internal type
+        assert "192.0.2.1/32" in out_routes and "Internal" in out_routes and "90" in out_routes
+
+    finally:
+        clean_srl1 = """sr_cli << 'EOF'
+enter candidate
+discard stay
+delete / network-instance default protocols bgp
+delete / routing-policy policy eigrp-policy statement 60
+commit now
+EOF"""
+        clean_srl2 = """sr_cli << 'EOF'
+enter candidate
+discard stay
+delete / network-instance default protocols bgp
+delete / routing-policy policy bgp-export
+delete / network-instance default static-routes route 172.25.25.0/24
+delete / network-instance default next-hop-groups group nhg25
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", clean_srl1])
+        srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", clean_srl2])
+
+        withdrawn = False
+        for _ in range(15):
+            time.sleep(1)
+            out_routes = srl_exec("clab-srl-srl-eigrp-srl2", [
+                "sr_cli", "show network-instance default protocols eigrp routes"
+            ])
+            if "172.25.25.0/24" not in out_routes:
+                withdrawn = True
+                break
+        assert withdrawn, f"BGP redistributed route was not withdrawn: {out_routes}"
+
+
+def test_isis_redistribution_into_eigrp(srl_exec):
+    """Verify IS-IS redistribution into EIGRP via routing-policy export-policy,
+    validating route preference 170 for external routes and 90 for internal routes,
+    and route withdrawal upon removal."""
+    try:
+        cfg_srl1 = """sr_cli << 'EOF'
+enter candidate
+discard stay
+/ network-instance default protocols isis instance isis1 admin-state enable net [ 49.0001.0000.0000.0001.00 ]
+/ network-instance default protocols isis instance isis1 interface ethernet-1/1.0 admin-state enable circuit-type point-to-point
+/ routing-policy policy eigrp-policy statement 70 match protocol isis
+/ routing-policy policy eigrp-policy statement 70 action policy-result accept
+/ routing-policy policy eigrp-policy statement 70 action eigrp metric bandwidth 100000 delay 100 reliability 255 load 1 mtu 1500
+commit now
+EOF"""
+        cfg_srl2 = """sr_cli << 'EOF'
+enter candidate
+discard stay
+/ interface lo0 subinterface 30 ipv4 admin-state enable
+/ interface lo0 subinterface 30 ipv4 address 172.30.30.1/32
+/ network-instance default interface lo0.30
+/ network-instance default protocols isis instance isis1 admin-state enable net [ 49.0001.0000.0000.0002.00 ]
+/ network-instance default protocols isis instance isis1 interface ethernet-1/1.0 admin-state enable circuit-type point-to-point
+/ network-instance default protocols isis instance isis1 interface lo0.30 admin-state enable circuit-type point-to-point
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_srl1])
+        srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", cfg_srl2])
+
+        route_learned = False
+        out_routes = ""
+        for _ in range(30):
+            time.sleep(1)
+            out_routes = srl_exec("clab-srl-srl-eigrp-srl2", [
+                "sr_cli", "show network-instance default protocols eigrp routes"
+            ])
+            if "172.30.30.1/32" in out_routes and "External" in out_routes and "170" in out_routes:
+                route_learned = True
+                break
+        assert route_learned, f"IS-IS route not redistributed to SRL2 with external preference 170: {out_routes}"
+
+        # Verify internal route retains preference 90 and Internal type
+        assert "192.0.2.1/32" in out_routes and "Internal" in out_routes and "90" in out_routes
+
+    finally:
+        clean_srl1 = """sr_cli << 'EOF'
+enter candidate
+discard stay
+delete / network-instance default protocols isis instance isis1
+delete / routing-policy policy eigrp-policy statement 70
+commit now
+EOF"""
+        clean_srl2 = """sr_cli << 'EOF'
+enter candidate
+discard stay
+delete / network-instance default protocols isis instance isis1
+delete / network-instance default interface lo0.30
+delete / interface lo0 subinterface 30
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", clean_srl1])
+        srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", clean_srl2])
+
+        withdrawn = False
+        for _ in range(15):
+            time.sleep(1)
+            out_routes = srl_exec("clab-srl-srl-eigrp-srl2", [
+                "sr_cli", "show network-instance default protocols eigrp routes"
+            ])
+            if "172.30.30.1/32" not in out_routes:
+                withdrawn = True
+                break
+        assert withdrawn, f"IS-IS redistributed route was not withdrawn: {out_routes}"
+
+
+def test_per_afi_interface_timers(srl_exec):
+    """Verify independent hello and hold timers for IPv4 and IPv6 under interface address-family."""
+    try:
+        cfg = """sr_cli << 'EOF'
+enter candidate
+discard stay
+set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast hello-interval 3 hold-time 9
+set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv6-unicast hello-interval 7 hold-time 21
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg])
+
+        timers_ok = False
+        for _ in range(15):
+            time.sleep(1)
+            out_state = srl_exec("clab-srl-srl-eigrp-srl1", [
+                "sr_cli", "info from state network-instance default protocols eigrp"
+            ])
+            has_v4_timers = "address-family ipv4-unicast" in out_state and "hello-interval 3" in out_state and "hold-time 9" in out_state
+            has_v6_timers = "address-family ipv6-unicast" in out_state and "hello-interval 7" in out_state and "hold-time 21" in out_state
+            if has_v4_timers and has_v6_timers:
+                timers_ok = True
+                break
+        assert timers_ok, f"State DB did not reflect independent per-AFI timers: {out_state}"
+
+        # Verify on SRL2 that neighbor hold times reflect independent timers
+        out_nbrs = srl_exec("clab-srl-srl-eigrp-srl2", [
+            "sr_cli", "show network-instance default protocols eigrp neighbor"
+        ])
+        assert "10.0.0.1" in out_nbrs and "Up" in out_nbrs
+    finally:
+        revert_cfg = """sr_cli << 'EOF'
+enter candidate
+discard stay
+delete / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast
+delete / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv6-unicast
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", revert_cfg])
+
+
+def test_per_afi_interface_authentication(srl_exec):
+    """Verify authentication configured under IPv4 address-family does not disrupt unauthenticated IPv6 peering."""
+    try:
+        cfg_srl1 = """sr_cli << 'EOF'
+enter candidate
+discard stay
+/ system authentication keychain eigrp-afi-auth admin-state enable type ospf key 1 algorithm md5 authentication-key afisecret123
+/ network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast authentication mode md5 keychain eigrp-afi-auth
+commit now
+EOF"""
+        cfg_srl2 = """sr_cli << 'EOF'
+enter candidate
+discard stay
+/ system authentication keychain eigrp-afi-auth admin-state enable type ospf key 1 algorithm md5 authentication-key afisecret123
+/ network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast authentication mode md5 keychain eigrp-afi-auth
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_srl1])
+        srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", cfg_srl2])
+
+        # Verify IPv4 neighbor is Up with MD5 and IPv6 is Up with none
+        auth_ok = False
+        for _ in range(15):
+            time.sleep(1)
+            out_state = srl_exec("clab-srl-srl-eigrp-srl1", [
+                "sr_cli", "info from state network-instance default protocols eigrp"
+            ])
+            has_v4_auth = "address-family ipv4-unicast" in out_state and "auth-mode md5" in out_state
+            has_v6_none = "address-family ipv6-unicast" in out_state and "auth-mode none" in out_state
+            if has_v4_auth and has_v6_none:
+                auth_ok = True
+                break
+        assert auth_ok, f"Per-AFI authentication failed in state DB: {out_state}"
+
+        # Verify both neighbors remain Up in CLI
+        out_nbr = srl_exec("clab-srl-srl-eigrp-srl1", [
+            "sr_cli", "show network-instance default protocols eigrp neighbor"
+        ])
+        assert "10.0.0.2" in out_nbr and "Up" in out_nbr
+        assert "fe80::" in out_nbr and "Up" in out_nbr
+    finally:
+        clean_srl1 = """sr_cli << 'EOF'
+enter candidate
+discard stay
+delete / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast
+delete / system authentication keychain eigrp-afi-auth
+commit now
+EOF"""
+        clean_srl2 = """sr_cli << 'EOF'
+enter candidate
+discard stay
+delete / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast
+delete / system authentication keychain eigrp-afi-auth
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", clean_srl1])
+        srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", clean_srl2])
+
+
+def test_default_interface_per_afi_passive(srl_exec):
+    """Verify default-interface address-family passive inheritance and interface-level override."""
+    try:
+        # Set default-interface address-family ipv4-unicast passive true
+        cfg_def = """sr_cli << 'EOF'
+enter candidate
+discard stay
+set / network-instance default protocols eigrp default-interface address-family ipv4-unicast passive true
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_def])
+
+        # Verify IPv4 neighbor drops (inherited passive), while IPv6 neighbor stays Up
+        v4_dropped = False
+        for _ in range(15):
+            time.sleep(1)
+            out_nbr = srl_exec("clab-srl-srl-eigrp-srl1", [
+                "sr_cli", "show network-instance default protocols eigrp neighbor"
+            ])
+            if "10.0.0.2" not in out_nbr and "fe80::" in out_nbr:
+                v4_dropped = True
+                break
+        assert v4_dropped, f"IPv4 neighbor did not drop after default-interface passive=true: {out_nbr}"
+
+        # Now override on interface ethernet-1/1.0: address-family ipv4-unicast passive false
+        cfg_override = """sr_cli << 'EOF'
+enter candidate
+discard stay
+set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast passive false
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_override])
+
+        # Verify IPv4 neighbor recovers to Up
+        recovered = False
+        for _ in range(15):
+            time.sleep(1)
+            out_nbr = srl_exec("clab-srl-srl-eigrp-srl1", [
+                "sr_cli", "show network-instance default protocols eigrp neighbor"
+            ])
+            if "10.0.0.2" in out_nbr and "Up" in out_nbr:
+                recovered = True
+                break
+        assert recovered, f"IPv4 neighbor failed to recover after passive=false override: {out_nbr}"
+    finally:
+        clean_def = """sr_cli << 'EOF'
+enter candidate
+discard stay
+delete / network-instance default protocols eigrp default-interface address-family ipv4-unicast
+delete / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", clean_def])
+
+
+def test_per_afi_interface_summary_address(srl_exec):
+    """Verify per-AFI interface summary-address in state DB and CLI."""
+    try:
+        cfg = """sr_cli << 'EOF'
+enter candidate
+discard stay
+set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast summary-address 10.100.0.0/16 distance 15
+set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv6-unicast summary-address 2001:db8:100::/48 distance 15
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg])
+
+        v4_ok = False
+        v6_ok = False
+        for _ in range(15):
+            time.sleep(1)
+            out_v4 = srl_exec("clab-srl-srl-eigrp-srl1", [
+                "sr_cli", "info from state /network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast summary-address *"
+            ])
+            if "10.100.0.0/16" in out_v4 and "distance 15" in out_v4 and "oper-state up" in out_v4:
+                v4_ok = True
+
+            out_v6 = srl_exec("clab-srl-srl-eigrp-srl1", [
+                "sr_cli", "info from state /network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv6-unicast summary-address *"
+            ])
+            if "2001:db8:100::/48" in out_v6 and "distance 15" in out_v6 and "oper-state up" in out_v6:
+                v6_ok = True
+
+            if v4_ok and v6_ok:
+                break
+
+        assert v4_ok, f"IPv4 summary-address state DB failed: {out_v4}"
+        assert v6_ok, f"IPv6 summary-address state DB failed: {out_v6}"
+
+        out_cli = srl_exec("clab-srl-srl-eigrp-srl1", [
+            "sr_cli", "show network-instance default protocols eigrp interfaces ethernet-1/1.0"
+        ])
+        assert "10.100.0.0/16" in out_cli, f"CLI missing IPv4 summary-address: {out_cli}"
+        assert "2001:db8:100::/48" in out_cli, f"CLI missing IPv6 summary-address: {out_cli}"
+    finally:
+        clean_sa = """sr_cli << 'EOF'
+enter candidate
+discard stay
+delete / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast summary-address 10.100.0.0/16
+delete / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv6-unicast summary-address 2001:db8:100::/48
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", clean_sa])
+
+
+def test_per_afi_interface_state_ip(srl_exec):
+    """Verify per-AFI interface state DB includes ip-address and prefix-length."""
+    out_state = ""
     for _ in range(15):
         time.sleep(1)
         out_state = srl_exec("clab-srl-srl-eigrp-srl1", [
-            "sr_cli", "info from state network-instance default protocols eigrp"
+            "sr_cli", "info from state /network-instance default protocols eigrp interface ethernet-1/1.0 address-family *"
         ])
-        if "summary-address" not in out_state:
-            sa_cleaned = True
+        if "ipv4-unicast" in out_state and "10.0.0.1" in out_state and "prefix-length 30" in out_state:
             break
-    assert sa_cleaned, f"State DB retained deleted summary-address: {out_state}"
+
+    assert "ipv4-unicast" in out_state and "10.0.0.1" in out_state and "prefix-length 30" in out_state, (
+        f"Per-AFI IPv4 state DB missing IP/prefixlen: {out_state}"
+    )
+
+    assert "ipv6-unicast" in out_state and ("fe80::" in out_state or "2001:" in out_state) and "prefix-length 64" in out_state, (
+        f"Per-AFI IPv6 state DB missing IP/prefixlen: {out_state}"
+    )
+
+    out_cli = srl_exec("clab-srl-srl-eigrp-srl1", [
+        "sr_cli", "show network-instance default protocols eigrp interfaces ethernet-1/1.0"
+    ])
+    assert "10.0.0.1/30" in out_cli, f"CLI missing per-AFI IPv4 IP address: {out_cli}"
+
+
+
+
 
 
 

@@ -10,14 +10,22 @@ import "C"
 //export srlGoRouteAdd
 func srlGoRouteAdd(netinst *C.char, prefix *C.char, nexthop *C.char, metric C.uint32_t, wideMetric C.uint64_t, isExt C.int) {
 	if daemonApp != nil {
-		daemonApp.OnRouteAdd(C.GoString(netinst), C.GoString(prefix), C.GoString(nexthop), uint32(metric), uint64(wideMetric), isExt != 0)
+		ni := C.GoString(netinst)
+		pfx := C.GoString(prefix)
+		nh := C.GoString(nexthop)
+		m := uint32(metric)
+		wm := uint64(wideMetric)
+		ext := isExt != 0
+		go daemonApp.OnRouteAdd(ni, pfx, nh, m, wm, ext)
 	}
 }
 
 //export srlGoRouteDel
 func srlGoRouteDel(netinst *C.char, prefix *C.char) {
 	if daemonApp != nil {
-		daemonApp.OnRouteDel(C.GoString(netinst), C.GoString(prefix))
+		ni := C.GoString(netinst)
+		pfx := C.GoString(prefix)
+		go daemonApp.OnRouteDel(ni, pfx)
 	}
 }
 

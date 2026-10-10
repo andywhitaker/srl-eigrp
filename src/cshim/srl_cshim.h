@@ -56,6 +56,8 @@ int srlShimKeychainAdd(const char *name, uint32_t key_id, const char *key_string
 int srlShimKeychainDel(const char *name);
 int srlShimInterfaceAuthSet(const char *netinst, const char *ifname, const char *mode, const char *keychain, const char *auth_key);
 int srlShimInterfaceAuthClear(const char *netinst, const char *ifname);
+int srlShimInterfaceAuthSetAfi(const char *netinst, const char *ifname, const char *afi, const char *mode, const char *keychain, const char *auth_key);
+int srlShimInterfaceAuthClearAfi(const char *netinst, const char *ifname, const char *afi);
 int srlShimGracefulRestartUpdate(const char *netinst, bool enabled, uint16_t restart_time, bool helper_mode);
 int srlShimGracefulShutdown(const char *netinst);
 int srlShimRedistributeUpdate(const char *netinst, const char *policy_name, uint32_t bw, uint32_t delay, uint8_t reliability, uint8_t load, uint32_t mtu);
@@ -66,6 +68,10 @@ int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passi
 int srlShimInterfaceDisableV6(const char *netinst, const char *ifname);
 int srlShimInstanceDeleteV6(const char *netinst, uint16_t asn);
 int srlShimRouteWithdrawV6(const char *netinst, const char *prefix_str);
+int srlShimRouteRedistributeAdd(const char *netinst, const char *prefix_str, const char *proto_str,
+                                const char *nexthop_str, uint32_t bw, uint32_t delay,
+                                uint8_t reliability, uint8_t load, uint32_t mtu);
+int srlShimRouteRedistributeRemove(const char *netinst, const char *prefix_str, const char *proto_str);
 int srl_netns_ipv6_socket_open(const char *netinst);
 void srl_resolve_v6_gateway(const char *netinst, eigrp_ifindex_t ifidx, char *nh_str, size_t max_len);
 int srl_decrypt_password(const char *in, char *out, size_t out_len);
