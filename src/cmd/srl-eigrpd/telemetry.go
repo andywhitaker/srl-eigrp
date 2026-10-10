@@ -39,29 +39,32 @@ func extractNetinstFromJsPath(jsPath string) string {
 }
 
 func schemaRank(jsPath string) int {
+	if strings.Contains(jsPath, ".default-interface.address-family{") {
+		return 1
+	}
 	if strings.Contains(jsPath, ".interface{") {
-		return 2
+		return 3
 	}
 	if strings.Contains(jsPath, ".address-family{") {
 		return 1
 	}
 	if strings.Contains(jsPath, ".neighbor{") {
-		return 3
-	}
-	if strings.Contains(jsPath, ".route{") && !strings.Contains(jsPath, ".topology{") {
 		return 4
 	}
-	if strings.Contains(jsPath, ".static-neighbor{") {
+	if strings.Contains(jsPath, ".route{") && !strings.Contains(jsPath, ".topology{") {
 		return 5
+	}
+	if strings.Contains(jsPath, ".static-neighbor{") {
+		return 6
 	}
 	if strings.Contains(jsPath, ".topology{") {
 		if strings.Contains(jsPath, "}.route{") {
-			return 7
+			return 8
 		}
-		return 6
+		return 7
 	}
 	if strings.Contains(jsPath, ".traffic{") {
-		return 8
+		return 9
 	}
 	return 0
 }
@@ -346,9 +349,14 @@ func publishInterfaceSublists(
 			}
 			saKey := fmt.Sprintf(".network_instance{.name==\"%s\"}.protocols.eigrp.interface{.interface-name==\"%s\"}.summary-address{.prefix==\"%s\"}", ni, normName, sa.Prefix)
 			currentKeys[saKey] = struct{}{}
+			saOper := "up"
+			if operStateNorm == "down" || instOperState == "down" {
+				saOper = "down"
+			}
 			saData := map[string]interface{}{
-				"prefix":   sa.Prefix,
-				"distance": dist,
+				"prefix":     sa.Prefix,
+				"distance":   dist,
+				"oper-state": saOper,
 			}
 			if b, err := json.Marshal(saData); err == nil {
 				*states = append(*states, &ndk.TelemetryInfo{
@@ -794,6 +802,43 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 			"detection-multiplier":        bfdDefMult,
 		}
 
+		// Default interface address families
+		for _, afName := range []string{"ipv4-unicast", "ipv6-unicast"} {
+			defAfKey := fmt.Sprintf(".network_instance{.name==\"%s\"}.protocols.eigrp.default-interface.address-family{.name==\"%s\"}", ni, afName)
+			currentKeys[defAfKey] = struct{}{}
+			defAfAdmin := defIntfAdmin
+			defAfPass := defIntfPass
+			if item.defaultIntf != nil {
+				if !item.defaultIntf.IsAfiEnabled(afName) {
+					defAfAdmin = "disable"
+				}
+				defAfPass = item.defaultIntf.IsAfiPassive(afName)
+			}
+			defAfOper := "up"
+			if defOper == "down" || defAfAdmin == "disable" {
+				defAfOper = "down"
+			}
+			defAfData := map[string]interface{}{
+				"name":        afName,
+				"admin-state": defAfAdmin,
+				"oper-state":  defAfOper,
+				"passive":     defAfPass,
+			}
+			if defAfOper != "up" {
+				if defAfAdmin == "disable" {
+					defAfData["oper-down-reason"] = "address-family admin disabled"
+				} else {
+					defAfData["oper-down-reason"] = "protocol instance down"
+				}
+			}
+			if b, err := json.Marshal(defAfData); err == nil {
+				states = append(states, &ndk.TelemetryInfo{
+					Key:  &ndk.TelemetryKey{JsPath: defAfKey},
+					Data: &ndk.TelemetryData{JsonContent: string(b)},
+				})
+			}
+		}
+
 		// Timers data
 		activeTime := uint16(3)
 		if item.timers != nil && item.timers.ActiveTime > 0 {
@@ -972,17 +1017,22 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 			if authMd == "" {
 				authMd = "none"
 			}
+			afName := "ipv4-unicast"
+			if strings.Contains(n.IPAddress, ":") {
+				afName = "ipv6-unicast"
+			}
 			nbrData := map[string]interface{}{
-				"ip-address":    n.IPAddress,
-				"interface":     normalizeIfName(n.Interface),
-				"state":         n.State,
-				"hold-time":     n.HoldTime,
-				"uptime":        fmt.Sprintf("%ds", n.Uptime),
-				"srtt-ms":       n.SRTT,
-				"rto-ms":        n.RTO,
-				"bfd-state":     bfdSt,
-				"restart-state": rstSt,
-				"auth-mode":     authMd,
+				"ip-address":     n.IPAddress,
+				"address-family": afName,
+				"interface":      normalizeIfName(n.Interface),
+				"state":          n.State,
+				"hold-time":      n.HoldTime,
+				"uptime":         fmt.Sprintf("%ds", n.Uptime),
+				"srtt-ms":        n.SRTT,
+				"rto-ms":         n.RTO,
+				"bfd-state":      bfdSt,
+				"restart-state":  rstSt,
+				"auth-mode":      authMd,
 			}
 			if n.State != "Up" && n.State != "up" {
 				nbrData["oper-down-reason"] = "hold-timer expired or peering down"

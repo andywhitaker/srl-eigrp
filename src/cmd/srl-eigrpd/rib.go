@@ -132,6 +132,7 @@ func (d *EigrpDaemon) OnRouteAdd(netinst string, prefix string, nexthop string, 
 	}
 	d.mu.Unlock()
 	log.Info().Str("netinst", netinst).Str("prefix", prefix).Strs("nexthops", validNhStrs).Uint32("pref", pref).Uint64("wide_metric", wideMetric).Msg("Injected EIGRP route into FIB")
+	go d.publishTelemetry(context.Background())
 }
 
 func (d *EigrpDaemon) WithdrawAfRoutes(netinst, afName string) {
@@ -155,6 +156,9 @@ func (d *EigrpDaemon) WithdrawAfRoutes(netinst, afName string) {
 
 	for _, pfx := range toWithdraw {
 		d.withdrawRouteInternal(netinst, pfx)
+	}
+	if len(toWithdraw) > 0 {
+		go d.publishTelemetry(context.Background())
 	}
 }
 
@@ -240,4 +244,5 @@ func (d *EigrpDaemon) OnRouteDel(netinst string, prefix string) {
 	}
 
 	d.withdrawRouteInternal(netinst, prefix)
+	go d.publishTelemetry(context.Background())
 }

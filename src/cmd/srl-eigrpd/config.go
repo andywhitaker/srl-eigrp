@@ -158,6 +158,36 @@ func (ic *InterfaceConfig) SetAfiPassive(afi string, passive *bool) {
 	})
 }
 
+func (dc *DefaultInterfaceConfig) IsAfiEnabled(afi string) bool {
+	if dc == nil {
+		return true
+	}
+	if dc.AdminState == "disable" {
+		return false
+	}
+	for _, af := range dc.AddressFamily {
+		if af.Name == afi {
+			if af.AdminState != "" {
+				return af.AdminState != "disable"
+			}
+			return dc.AdminState != "disable"
+		}
+	}
+	return dc.AdminState != "disable"
+}
+
+func (dc *DefaultInterfaceConfig) IsAfiPassive(afi string) bool {
+	if dc != nil {
+		for _, af := range dc.AddressFamily {
+			if af.Name == afi && af.Passive != nil {
+				return *af.Passive
+			}
+		}
+		return dc.Passive
+	}
+	return false
+}
+
 type TimersConfig struct {
 	ActiveTime uint16 `json:"active-time"`
 }
@@ -328,21 +358,26 @@ func (d *EigrpDaemon) applyInterface(inst *EigrpInstance, ifcfg *InterfaceConfig
 	cIfname := C.CString(ifcfg.InterfaceName)
 	defer C.free(unsafe.Pointer(cIfname))
 
-	defAdmin := "enable"
-	if inst.defaultIntf != nil && inst.defaultIntf.AdminState != "" {
-		defAdmin = inst.defaultIntf.AdminState
-	}
-
-	defPassive := false
+	defAdmin4 := "enable"
+	defAdmin6 := "enable"
+	defPassive4 := false
+	defPassive6 := false
 	if inst.defaultIntf != nil {
-		defPassive = inst.defaultIntf.Passive
+		if !inst.defaultIntf.IsAfiEnabled("ipv4-unicast") {
+			defAdmin4 = "disable"
+		}
+		if !inst.defaultIntf.IsAfiEnabled("ipv6-unicast") {
+			defAdmin6 = "disable"
+		}
+		defPassive4 = inst.defaultIntf.IsAfiPassive("ipv4-unicast")
+		defPassive6 = inst.defaultIntf.IsAfiPassive("ipv6-unicast")
 	}
 
-	adminUp4 := inst.IsAfiEnabled("ipv4-unicast") && ifcfg.IsAfiEnabled("ipv4-unicast", defAdmin)
-	passive4 := ifcfg.IsAfiPassive("ipv4-unicast", defPassive)
+	adminUp4 := inst.IsAfiEnabled("ipv4-unicast") && ifcfg.IsAfiEnabled("ipv4-unicast", defAdmin4)
+	passive4 := ifcfg.IsAfiPassive("ipv4-unicast", defPassive4)
 
-	adminUp6 := inst.IsAfiEnabled("ipv6-unicast") && ifcfg.IsAfiEnabled("ipv6-unicast", defAdmin)
-	passive6 := ifcfg.IsAfiPassive("ipv6-unicast", defPassive)
+	adminUp6 := inst.IsAfiEnabled("ipv6-unicast") && ifcfg.IsAfiEnabled("ipv6-unicast", defAdmin6)
+	passive6 := ifcfg.IsAfiPassive("ipv6-unicast", defPassive6)
 
 	hello := uint16(5)
 	if ifcfg.HelloInterval != nil && *ifcfg.HelloInterval > 0 {
@@ -1429,6 +1464,23 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			// Full interface deletion
 			d.mu.Lock()
 			delete(inst.configuredInterfaces, ifName)
+			delete(inst.configuredInterfaces, normalizeIfName(ifName))
+			for k := range inst.configuredInterfaces {
+				if normalizeIfName(k) == normalizeIfName(ifName) {
+					delete(inst.configuredInterfaces, k)
+				}
+			}
+			normIf := normalizeIfName(ifName)
+			for nbrIP, nbr := range inst.neighbors {
+				if normalizeIfName(nbr.Interface) == normIf {
+					delete(inst.neighbors, nbrIP)
+				}
+			}
+			for i, intf := range inst.interfaces {
+				if normalizeIfName(intf.Name) == normIf || intf.InterfaceName == normIf {
+					delete(inst.interfaces, i)
+				}
+			}
 			d.mu.Unlock()
 			C.srlShimInterfaceDisable(cNetinst, cIfname)
 			C.srlShimInterfaceDisableV6(cNetinst, cIfname)

@@ -2656,6 +2656,14 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
             ei = eigrp_intf_lookup_by_ifindex(runtime, ifidx);
         }
         if (ei) {
+            if (!strstr(actual_ifname, "system") && !strstr(actual_ifname, "lo")) {
+                eigrp_hello_send(ei, EIGRP_HELLO_GRACEFUL_SHUTDOWN, NULL);
+                eigrp_nbr_clear_request_t req;
+                memset(&req, 0, sizeof(req));
+                req.interface_name = actual_ifname;
+                size_t affected = 0;
+                (void)eigrp_nbr_clear(runtime, &req, NULL, NULL, &affected);
+            }
             eigrp_intf_down(ei);
         }
     }
@@ -2819,6 +2827,14 @@ int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passi
             if (!ei6->operative && !passive && admin_up) {
                 eigrp_intf_up(runtime_v6, ei6);
             } else if (!admin_up) {
+                if (!strstr(actual_ifname, "system") && !strstr(actual_ifname, "lo")) {
+                    eigrp_hello_send(ei6, EIGRP_HELLO_GRACEFUL_SHUTDOWN, NULL);
+                    eigrp_nbr_clear_request_t req;
+                    memset(&req, 0, sizeof(req));
+                    req.interface_name = actual_ifname;
+                    size_t affected = 0;
+                    (void)eigrp_nbr_clear(runtime_v6, &req, NULL, NULL, &affected);
+                }
                 eigrp_intf_down(ei6);
             }
         }

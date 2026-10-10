@@ -267,6 +267,11 @@ module srl_nokia-eigrp {
         default 5;
         description "Administrative distance for summary discard route";
       }
+      leaf oper-state {
+        config false;
+        type srl_nokia-comm:oper-state;
+        description "Operational state of the summary address route";
+      }
     }
     container authentication {
       description "Interface packet authentication configuration";
@@ -576,6 +581,11 @@ module srl_nokia-eigrp {
           type srl_nokia-comm:oper-state;
           description "Operational state of the address family";
         }
+        leaf oper-down-reason {
+          config false;
+          type string;
+          description "Reason why the address family is operationally down";
+        }
         leaf export-policy {
           type leafref {
             path "/srl-rpol:routing-policy/srl-rpol:policy/srl-rpol:name";
@@ -647,6 +657,7 @@ module srl_nokia-eigrp {
         srl_nokia-ext:unordered-state-list "true";
         description "Active EIGRP neighbors";
         leaf ip-address { type srl_nokia-comm:ip-address; }
+        leaf address-family { type string; description "Address family of the neighbor (ipv4-unicast or ipv6-unicast)"; }
         leaf interface { type string; }
         leaf state { type string; }
         leaf hold-time { type uint16; }
@@ -675,8 +686,8 @@ module srl_nokia-eigrp {
         key "ip-address";
         description "Statically configured EIGRP neighbors";
         leaf ip-address {
-          type srl_nokia-comm:ipv4-address;
-          description "IPv4 address of the static neighbor";
+          type srl_nokia-comm:ip-address;
+          description "IP address of the static neighbor";
         }
         leaf interface {
           type srl_nokia-comm:subinterface-all;
