@@ -64,14 +64,14 @@ class Plugin(ToolsPlugin):
         if not eigrp:
             eigrp = proto.add_command(
                 Syntax("eigrp", help="EIGRP operational commands"),
-                update_location=True
+                update_location=False
             )
 
         nbr = eigrp.get_command_or_none("neighbor")
         if not nbr:
             nbr = eigrp.add_command(
                 Syntax("neighbor", help="Neighbor operations"),
-                update_location=True
+                update_location=False
             )
 
         if not nbr.has_command("clear"):
@@ -103,7 +103,7 @@ class Plugin(ToolsPlugin):
         if not gr:
             gr = eigrp.add_command(
                 Syntax("graceful-restart", help="Graceful restart operations"),
-                update_location=True
+                update_location=False
             )
         if not gr.has_command("planned-restart"):
             gr.add_command(
