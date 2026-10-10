@@ -134,21 +134,31 @@ func (d *EigrpDaemon) OnRouteAdd(netinst string, prefix string, nexthop string, 
 	log.Info().Str("netinst", netinst).Str("prefix", prefix).Strs("nexthops", validNhStrs).Uint32("pref", pref).Uint64("wide_metric", wideMetric).Msg("Injected EIGRP route into FIB")
 }
 
-func (d *EigrpDaemon) OnRouteDel(netinst string, prefix string) {
+func (d *EigrpDaemon) WithdrawAfRoutes(netinst, afName string) {
 	if netinst == "" {
 		netinst = "default"
 	}
-
 	inst := d.GetInstance(netinst)
-	if inst != nil {
-		d.mu.RLock()
-		isPreserved := inst.restarting && inst.gracefulRestart != nil && inst.gracefulRestart.AdminState == "enable"
-		d.mu.RUnlock()
-		if isPreserved {
-			log.Info().Str("netinst", netinst).Str("prefix", prefix).Msg("Graceful restart active: preserving FIB forwarding route during restart")
-			return
+	if inst == nil {
+		return
+	}
+	d.mu.Lock()
+	var toWithdraw []string
+	for pfx := range inst.routes {
+		isV6 := strings.Contains(pfx, ":")
+		if (afName == "ipv6-unicast" && isV6) || (afName == "ipv4-unicast" && !isV6) {
+			toWithdraw = append(toWithdraw, pfx)
+			delete(inst.routes, pfx)
 		}
 	}
+	d.mu.Unlock()
+
+	for _, pfx := range toWithdraw {
+		d.withdrawRouteInternal(netinst, pfx)
+	}
+}
+
+func (d *EigrpDaemon) withdrawRouteInternal(netinst string, prefix string) {
 	ctx := context.Background()
 	parts := strings.Split(prefix, "/")
 	if len(parts) != 2 {
@@ -188,7 +198,6 @@ func (d *EigrpDaemon) OnRouteDel(netinst string, prefix string) {
 	}
 	if _, err := d.routeClient.RouteDelete(ctx, delReq); err != nil {
 		log.Error().Err(err).Str("netinst", netinst).Str("prefix", prefix).Msg("RouteDelete failed")
-		return
 	}
 	nhgDelReq := &ndk.NextHopGroupDeleteRequest{
 		GroupKeys: []*ndk.NextHopGroupKey{
@@ -202,6 +211,25 @@ func (d *EigrpDaemon) OnRouteDel(netinst string, prefix string) {
 		log.Debug().Err(err).Str("netinst", netinst).Str("nhg", nhgName).Msg("NextHopGroupDelete failed")
 	}
 
+	log.Info().Str("netinst", netinst).Str("prefix", prefix).Msg("Withdrew EIGRP route from FIB")
+}
+
+func (d *EigrpDaemon) OnRouteDel(netinst string, prefix string) {
+	if netinst == "" {
+		netinst = "default"
+	}
+
+	inst := d.GetInstance(netinst)
+	if inst != nil {
+		d.mu.RLock()
+		isPreserved := inst.restarting && inst.gracefulRestart != nil && inst.gracefulRestart.AdminState == "enable"
+		d.mu.RUnlock()
+		if isPreserved {
+			log.Info().Str("netinst", netinst).Str("prefix", prefix).Msg("Graceful restart active: preserving FIB forwarding route during restart")
+			return
+		}
+	}
+
 	if inst == nil {
 		inst = d.GetInstance(netinst)
 	}
@@ -210,5 +238,6 @@ func (d *EigrpDaemon) OnRouteDel(netinst string, prefix string) {
 		delete(inst.routes, prefix)
 		d.mu.Unlock()
 	}
-	log.Info().Str("netinst", netinst).Str("prefix", prefix).Msg("Withdrew EIGRP route from FIB")
+
+	d.withdrawRouteInternal(netinst, prefix)
 }

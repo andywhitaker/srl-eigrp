@@ -27,6 +27,45 @@ func normalizeIfName(ifname string) string {
 	return ifname
 }
 
+func extractNetinstFromJsPath(jsPath string) string {
+	const prefix = `.network_instance{.name=="`
+	if strings.HasPrefix(jsPath, prefix) {
+		rest := jsPath[len(prefix):]
+		if idx := strings.Index(rest, `"`); idx >= 0 {
+			return rest[:idx]
+		}
+	}
+	return ""
+}
+
+func schemaRank(jsPath string) int {
+	if strings.Contains(jsPath, ".interface{") {
+		return 2
+	}
+	if strings.Contains(jsPath, ".address-family{") {
+		return 1
+	}
+	if strings.Contains(jsPath, ".neighbor{") {
+		return 3
+	}
+	if strings.Contains(jsPath, ".route{") && !strings.Contains(jsPath, ".topology{") {
+		return 4
+	}
+	if strings.Contains(jsPath, ".static-neighbor{") {
+		return 5
+	}
+	if strings.Contains(jsPath, ".topology{") {
+		if strings.Contains(jsPath, "}.route{") {
+			return 7
+		}
+		return 6
+	}
+	if strings.Contains(jsPath, ".traffic{") {
+		return 8
+	}
+	return 0
+}
+
 func buildInterfaceData(
 	normName string,
 	ipAddr string,
@@ -195,6 +234,109 @@ func buildInterfaceData(
 	return data
 }
 
+func publishInterfaceSublists(
+	ni string,
+	normName string,
+	operState string,
+	defIntf *DefaultInterfaceConfig,
+	ic *InterfaceConfig,
+	instOperState string,
+	instAfs []AddressFamilyConfig,
+	currentKeys map[string]struct{},
+	states *[]*ndk.TelemetryInfo,
+) {
+	defAdmin := "enable"
+	if defIntf != nil && defIntf.AdminState != "" {
+		defAdmin = defIntf.AdminState
+	}
+	defPassive := false
+	if defIntf != nil {
+		defPassive = defIntf.Passive
+	}
+
+	operStateNorm := strings.ToLower(operState)
+
+	for _, afName := range []string{"ipv4-unicast", "ipv6-unicast"} {
+		afIfKey := fmt.Sprintf(".network_instance{.name==\"%s\"}.protocols.eigrp.interface{.interface-name==\"%s\"}.address-family{.name==\"%s\"}", ni, normName, afName)
+		currentKeys[afIfKey] = struct{}{}
+
+		topAfAdmin := "enable"
+		if len(instAfs) > 0 {
+			topAfAdmin = "disable"
+			for _, af := range instAfs {
+				if af.Name == afName {
+					if af.AdminState != "" {
+						topAfAdmin = af.AdminState
+					} else {
+						topAfAdmin = "enable"
+					}
+					break
+				}
+			}
+		}
+
+		afEnabled := true
+		afPassive := defPassive
+		if ic != nil {
+			afEnabled = ic.IsAfiEnabled(afName, defAdmin)
+			afPassive = ic.IsAfiPassive(afName, defPassive)
+		}
+
+		adminStateStr := "enable"
+		if !afEnabled {
+			adminStateStr = "disable"
+		}
+
+		effectiveOper := "down"
+		if instOperState != "down" && topAfAdmin != "disable" && (operStateNorm == "up" || operStateNorm == "") {
+			effectiveOper = "up"
+		}
+
+		operStateStr := "down"
+		if effectiveOper == "up" && afEnabled {
+			operStateStr = "up"
+		}
+
+		afData := map[string]interface{}{
+			"name":        afName,
+			"admin-state": adminStateStr,
+			"oper-state":  operStateStr,
+			"passive":     afPassive,
+		}
+		if b, err := json.Marshal(afData); err == nil {
+			*states = append(*states, &ndk.TelemetryInfo{
+				Key:  &ndk.TelemetryKey{JsPath: afIfKey},
+				Data: &ndk.TelemetryData{JsonContent: string(b)},
+			})
+			log.Info().Str("key", afIfKey).Str("data", string(b)).Msg("Adding interface AF to telemetry")
+		}
+	}
+
+	if ic != nil && len(ic.SummaryAddress) > 0 {
+		for _, sa := range ic.SummaryAddress {
+			if sa.Prefix == "" {
+				continue
+			}
+			dist := sa.Distance
+			if dist == 0 {
+				dist = 5
+			}
+			saKey := fmt.Sprintf(".network_instance{.name==\"%s\"}.protocols.eigrp.interface{.interface-name==\"%s\"}.summary-address{.prefix==\"%s\"}", ni, normName, sa.Prefix)
+			currentKeys[saKey] = struct{}{}
+			saData := map[string]interface{}{
+				"prefix":   sa.Prefix,
+				"distance": dist,
+			}
+			if b, err := json.Marshal(saData); err == nil {
+				*states = append(*states, &ndk.TelemetryInfo{
+					Key:  &ndk.TelemetryKey{JsPath: saKey},
+					Data: &ndk.TelemetryData{JsonContent: string(b)},
+				})
+			}
+		}
+	}
+}
+
 func (d *EigrpDaemon) TelemetryWorker(ctx context.Context) {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
@@ -232,9 +374,6 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 		authentication         *AuthConfig
 		defaultIntf            *DefaultInterfaceConfig
 		configuredInterfaces   map[string]*InterfaceConfig
-		configuredInterfacesV6 map[string]*InterfaceConfig
-		hasV6                  bool
-		ipv6Unicast            *IPv6UnicastConfig
 		addressFamily          []AddressFamilyConfig
 		staticNeighbors        map[string]*StaticNeighborConfig
 		nbrList                []*NeighborInfo
@@ -307,13 +446,6 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 				cfgIntfs[k] = &c
 			}
 		}
-		cfgIntfsV6 := make(map[string]*InterfaceConfig, len(inst.configuredInterfacesV6))
-		for k, v := range inst.configuredInterfacesV6 {
-			if v != nil {
-				c := *v
-				cfgIntfsV6[k] = &c
-			}
-		}
 
 		var defIntfCopy *DefaultInterfaceConfig
 		if inst.defaultIntf != nil {
@@ -362,11 +494,6 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 			c := *inst.authentication
 			authCopy = &c
 		}
-		var v6Copy *IPv6UnicastConfig
-		if inst.ipv6Unicast != nil {
-			c := *inst.ipv6Unicast
-			v6Copy = &c
-		}
 		afList := make([]AddressFamilyConfig, len(inst.addressFamily))
 		copy(afList, inst.addressFamily)
 
@@ -379,36 +506,33 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 		}
 
 		allInstData = append(allInstData, instData{
-			ni:                     ni,
-			asn:                    inst.asn,
-			routerId:               inst.routerId,
-			adminState:             adminState,
-			operState:              operState,
-			networks:               networks,
-			variance:               variance,
-			maximumPaths:           maxPaths,
-			maximumHops:            maxHops,
-			ribScale:               ribScale,
-			wideMetrics:            inst.wideMetrics,
-			exportPolicy:           inst.exportPolicy,
-			importPolicy:           inst.importPolicy,
-			gracefulRestart:        grCopy,
-			timers:                 timersCopy,
-			metrics:                metricsCopy,
-			metricWeights:          metricWeightsCopy,
-			authentication:         authCopy,
-			defaultIntf:            defIntfCopy,
-			configuredInterfaces:   cfgIntfs,
-			configuredInterfacesV6: cfgIntfsV6,
-			hasV6:                  inst.hasV6,
-			ipv6Unicast:            v6Copy,
-			addressFamily:          afList,
-			staticNeighbors:        staticNbrs,
-			nbrList:                nbrList,
-			routeList:              routeList,
-			intfList:               intfList,
-			topoList:               topoList,
-			trafficList:            trafficList,
+			ni:                   ni,
+			asn:                  inst.asn,
+			routerId:             inst.routerId,
+			adminState:           adminState,
+			operState:            operState,
+			networks:             networks,
+			variance:             variance,
+			maximumPaths:         maxPaths,
+			maximumHops:          maxHops,
+			ribScale:             ribScale,
+			wideMetrics:          inst.wideMetrics,
+			exportPolicy:         inst.exportPolicy,
+			importPolicy:         inst.importPolicy,
+			gracefulRestart:      grCopy,
+			timers:               timersCopy,
+			metrics:              metricsCopy,
+			metricWeights:        metricWeightsCopy,
+			authentication:       authCopy,
+			defaultIntf:          defIntfCopy,
+			configuredInterfaces: cfgIntfs,
+			addressFamily:        afList,
+			staticNeighbors:      staticNbrs,
+			nbrList:              nbrList,
+			routeList:            routeList,
+			intfList:             intfList,
+			topoList:             topoList,
+			trafficList:          trafficList,
 		})
 	}
 	d.mu.RUnlock()
@@ -705,28 +829,11 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 			}
 			topData["authentication"] = authMap
 		}
-		if item.hasV6 || item.ipv6Unicast != nil {
-			v6Admin := "enable"
-			if item.ipv6Unicast != nil && item.ipv6Unicast.AdminState != "" {
-				v6Admin = item.ipv6Unicast.AdminState
-			}
-			v6Oper := "up"
-			if item.operState == "down" || v6Admin == "disable" {
-				v6Oper = "down"
-			}
-			v6Data := map[string]interface{}{
-				"admin-state": v6Admin,
-				"oper-state":  v6Oper,
-			}
-			if item.ipv6Unicast != nil {
-				if item.ipv6Unicast.ExportPolicy != "" {
-					v6Data["export-policy"] = item.ipv6Unicast.ExportPolicy
-				}
-				if item.ipv6Unicast.ImportPolicy != "" {
-					v6Data["import-policy"] = item.ipv6Unicast.ImportPolicy
-				}
-			}
-			topData["ipv6-unicast"] = v6Data
+		if item.exportPolicy != "" {
+			topData["export-policy"] = item.exportPolicy
+		}
+		if item.importPolicy != "" {
+			topData["import-policy"] = item.importPolicy
 		}
 		if b, err := json.Marshal(topData); err == nil {
 			states = append(states, &ndk.TelemetryInfo{
@@ -868,31 +975,20 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 					Key:  &ndk.TelemetryKey{JsPath: intfKey},
 					Data: &ndk.TelemetryData{JsonContent: string(b)},
 				})
+				log.Info().Str("key", intfKey).Str("data", string(b)).Msg("Adding interface to telemetry")
 			}
 
-			if ic != nil {
-				for _, sa := range ic.SummaryAddress {
-					if sa.Prefix == "" {
-						continue
-					}
-					dist := sa.Distance
-					if dist == 0 {
-						dist = 5
-					}
-					saKey := fmt.Sprintf(".network_instance{.name==\"%s\"}.protocols.eigrp.interface{.interface-name==\"%s\"}.summary-address{.prefix==\"%s\"}", ni, normName, sa.Prefix)
-					currentKeys[saKey] = struct{}{}
-					saData := map[string]interface{}{
-						"prefix":   sa.Prefix,
-						"distance": dist,
-					}
-					if b, err := json.Marshal(saData); err == nil {
-						states = append(states, &ndk.TelemetryInfo{
-							Key:  &ndk.TelemetryKey{JsPath: saKey},
-							Data: &ndk.TelemetryData{JsonContent: string(b)},
-						})
-					}
-				}
-			}
+			publishInterfaceSublists(
+				ni,
+				normName,
+				i.OperState,
+				item.defaultIntf,
+				ic,
+				item.operState,
+				item.addressFamily,
+				currentKeys,
+				&states,
+			)
 		}
 
 		// Configured interfaces not currently reported by C engine (e.g. admin disabled)
@@ -926,168 +1022,60 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 				})
 			}
 
-			if ic != nil {
-				for _, sa := range ic.SummaryAddress {
-					if sa.Prefix == "" {
-						continue
-					}
-					dist := sa.Distance
-					if dist == 0 {
-						dist = 5
-					}
-					saKey := fmt.Sprintf(".network_instance{.name==\"%s\"}.protocols.eigrp.interface{.interface-name==\"%s\"}.summary-address{.prefix==\"%s\"}", ni, normName, sa.Prefix)
-					currentKeys[saKey] = struct{}{}
-					saData := map[string]interface{}{
-						"prefix":   sa.Prefix,
-						"distance": dist,
-					}
-					if b, err := json.Marshal(saData); err == nil {
-						states = append(states, &ndk.TelemetryInfo{
-							Key:  &ndk.TelemetryKey{JsPath: saKey},
-							Data: &ndk.TelemetryData{JsonContent: string(b)},
-						})
-					}
-				}
-			}
-		}
-
-		// IPv6 unicast interfaces
-		for rawIfName, ic := range item.configuredInterfacesV6 {
-			normName := normalizeIfName(rawIfName)
-			v6IfKey := fmt.Sprintf(".network_instance{.name==\"%s\"}.protocols.eigrp.ipv6-unicast.interface{.interface-name==\"%s\"}", ni, normName)
-			currentKeys[v6IfKey] = struct{}{}
-
-			v6Oper := item.operState
-			if topData["ipv6-unicast"] != nil {
-				if td, ok := topData["ipv6-unicast"].(map[string]interface{}); ok {
-					if osStr, ok := td["oper-state"].(string); ok {
-						v6Oper = osStr
-					}
-				}
-			}
-
-			intfData := buildInterfaceData(
+			publishInterfaceSublists(
+				ni,
 				normName,
-				"",
-				0,
-				v6Oper,
-				false,
-				"",
-				"",
-				ic,
+				"down",
 				item.defaultIntf,
-				item.authentication,
-				v6Oper,
+				ic,
+				item.operState,
+				item.addressFamily,
+				currentKeys,
+				&states,
 			)
-
-			if b, err := json.Marshal(intfData); err == nil {
-				states = append(states, &ndk.TelemetryInfo{
-					Key:  &ndk.TelemetryKey{JsPath: v6IfKey},
-					Data: &ndk.TelemetryData{JsonContent: string(b)},
-				})
-			}
-
-			if ic != nil {
-				for _, sa := range ic.SummaryAddress {
-					if sa.Prefix == "" {
-						continue
-					}
-					dist := sa.Distance
-					if dist == 0 {
-						dist = 5
-					}
-					saKey := fmt.Sprintf(".network_instance{.name==\"%s\"}.protocols.eigrp.ipv6-unicast.interface{.interface-name==\"%s\"}.summary-address{.prefix==\"%s\"}", ni, normName, sa.Prefix)
-					currentKeys[saKey] = struct{}{}
-					saData := map[string]interface{}{
-						"prefix":   sa.Prefix,
-						"distance": dist,
-					}
-					if b, err := json.Marshal(saData); err == nil {
-						states = append(states, &ndk.TelemetryInfo{
-							Key:  &ndk.TelemetryKey{JsPath: saKey},
-							Data: &ndk.TelemetryData{JsonContent: string(b)},
-						})
-					}
-				}
-			}
 		}
 
 		// Address family
-		for _, af := range item.addressFamily {
-			afKey := fmt.Sprintf(".network_instance{.name==\"%s\"}.protocols.eigrp.address-family{.name==\"%s\"}", ni, af.Name)
-			currentKeys[afKey] = struct{}{}
-			afAdmin := af.AdminState
-			if afAdmin == "" {
-				afAdmin = "enable"
+		for _, afName := range []string{"ipv4-unicast", "ipv6-unicast"} {
+			afAdmin := "enable"
+			var expPol, impPol string
+			foundAf := false
+			for _, af := range item.addressFamily {
+				if af.Name == afName {
+					foundAf = true
+					if af.AdminState != "" {
+						afAdmin = af.AdminState
+					}
+					expPol = af.ExportPolicy
+					impPol = af.ImportPolicy
+					break
+				}
 			}
+			if len(item.addressFamily) > 0 && !foundAf {
+				continue
+			}
+			afKey := fmt.Sprintf(".network_instance{.name==\"%s\"}.protocols.eigrp.address-family{.name==\"%s\"}", ni, afName)
+			currentKeys[afKey] = struct{}{}
 			afOper := "up"
 			if item.operState == "down" || afAdmin == "disable" {
 				afOper = "down"
 			}
 			afData := map[string]interface{}{
-				"name":        af.Name,
+				"name":        afName,
 				"admin-state": afAdmin,
 				"oper-state":  afOper,
 			}
-			if af.ExportPolicy != "" {
-				afData["export-policy"] = af.ExportPolicy
+			if expPol != "" {
+				afData["export-policy"] = expPol
 			}
-			if af.ImportPolicy != "" {
-				afData["import-policy"] = af.ImportPolicy
+			if impPol != "" {
+				afData["import-policy"] = impPol
 			}
 			if b, err := json.Marshal(afData); err == nil {
 				states = append(states, &ndk.TelemetryInfo{
 					Key:  &ndk.TelemetryKey{JsPath: afKey},
 					Data: &ndk.TelemetryData{JsonContent: string(b)},
 				})
-			}
-
-			for _, ifcfg := range af.Interface {
-				normName := normalizeIfName(ifcfg.InterfaceName)
-				afIfKey := fmt.Sprintf(".network_instance{.name==\"%s\"}.protocols.eigrp.address-family{.name==\"%s\"}", ni, af.Name) + fmt.Sprintf(".interface{.interface-name==\"%s\"}", normName)
-				currentKeys[afIfKey] = struct{}{}
-				cfgCopy := ifcfg
-				ifData := buildInterfaceData(
-					normName,
-					"",
-					0,
-					afOper,
-					false,
-					"",
-					"",
-					&cfgCopy,
-					item.defaultIntf,
-					item.authentication,
-					afOper,
-				)
-				if b, err := json.Marshal(ifData); err == nil {
-					states = append(states, &ndk.TelemetryInfo{
-						Key:  &ndk.TelemetryKey{JsPath: afIfKey},
-						Data: &ndk.TelemetryData{JsonContent: string(b)},
-					})
-				}
-
-				for _, sa := range cfgCopy.SummaryAddress {
-					if sa.Prefix == "" {
-						continue
-					}
-					dist := sa.Distance
-					if dist == 0 {
-						dist = 5
-					}
-					saKey := fmt.Sprintf(".network_instance{.name==\"%s\"}.protocols.eigrp.address-family{.name==\"%s\"}.interface{.interface-name==\"%s\"}.summary-address{.prefix==\"%s\"}", ni, af.Name, normName, sa.Prefix)
-					currentKeys[saKey] = struct{}{}
-					saData := map[string]interface{}{
-						"prefix":   sa.Prefix,
-						"distance": dist,
-					}
-					if b, err := json.Marshal(saData); err == nil {
-						states = append(states, &ndk.TelemetryInfo{
-							Key:  &ndk.TelemetryKey{JsPath: saKey},
-							Data: &ndk.TelemetryData{JsonContent: string(b)},
-						})
-					}
-				}
 			}
 		}
 
@@ -1172,8 +1160,20 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 		}
 	}
 
-	// Sort all telemetry states strictly by JsPath to match YANG schema / IDB traversal order
+	// Sort all telemetry states strictly by network-instance and YANG schema definition order
 	sort.Slice(states, func(a, b int) bool {
+		niA := extractNetinstFromJsPath(states[a].Key.JsPath)
+		niB := extractNetinstFromJsPath(states[b].Key.JsPath)
+		if niA != niB {
+			return niA < niB
+		}
+
+		rankA := schemaRank(states[a].Key.JsPath)
+		rankB := schemaRank(states[b].Key.JsPath)
+		if rankA != rankB {
+			return rankA < rankB
+		}
+
 		return states[a].Key.JsPath < states[b].Key.JsPath
 	})
 
@@ -1185,6 +1185,8 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 			log.Warn().Err(err).Msg("TelemetryAddOrUpdate RPC error")
 		} else if resp.GetStatus() != ndk.SdkMgrStatus_SDK_MGR_STATUS_SUCCESS {
 			log.Warn().Str("error", resp.GetErrorStr()).Msg("TelemetryAddOrUpdate rejected")
+		} else {
+			log.Info().Int("count", len(states)).Msg("TelemetryAddOrUpdate succeeded")
 		}
 	}
 }

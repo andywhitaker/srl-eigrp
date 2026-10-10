@@ -115,7 +115,6 @@ type EigrpInstance struct {
 	operState              string
 	networks               []string
 	configuredInterfaces   map[string]*InterfaceConfig
-	configuredInterfacesV6 map[string]*InterfaceConfig
 	defaultIntf            *DefaultInterfaceConfig
 	exportPolicy           string
 	importPolicy           string
@@ -130,7 +129,6 @@ type EigrpInstance struct {
 	metricWeights          *MetricsConfig
 	timers                 *TimersConfig
 	authentication         *AuthConfig
-	ipv6Unicast            *IPv6UnicastConfig
 	addressFamily          []AddressFamilyConfig
 	restarting             bool
 	bfdSessions            map[string]string
@@ -150,6 +148,82 @@ type EigrpInstance struct {
 	collecting     bool
 }
 
+func (inst *EigrpInstance) IsAfiEnabled(afi string) bool {
+	if inst.adminState == "disable" || inst.asn == 0 {
+		return false
+	}
+	if len(inst.addressFamily) > 0 {
+		for _, af := range inst.addressFamily {
+			if af.Name == afi {
+				if af.AdminState != "" {
+					return af.AdminState != "disable"
+				}
+				return true
+			}
+		}
+		return false
+	}
+	// Default enabled for both ipv4-unicast and ipv6-unicast if no address-family explicitly configured
+	return true
+}
+
+func (inst *EigrpInstance) SetAfiAdminState(afi string, state string) {
+	for i, af := range inst.addressFamily {
+		if af.Name == afi {
+			inst.addressFamily[i].AdminState = state
+			return
+		}
+	}
+	inst.addressFamily = append(inst.addressFamily, AddressFamilyConfig{
+		Name:       afi,
+		AdminState: state,
+	})
+}
+
+func (inst *EigrpInstance) GetAfiExportPolicy(afi string) string {
+	for _, af := range inst.addressFamily {
+		if af.Name == afi && af.ExportPolicy != "" {
+			return af.ExportPolicy
+		}
+	}
+	return inst.exportPolicy
+}
+
+func (inst *EigrpInstance) SetAfiExportPolicy(afi string, policy string) {
+	for i, af := range inst.addressFamily {
+		if af.Name == afi {
+			inst.addressFamily[i].ExportPolicy = policy
+			return
+		}
+	}
+	inst.addressFamily = append(inst.addressFamily, AddressFamilyConfig{
+		Name:         afi,
+		ExportPolicy: policy,
+	})
+}
+
+func (inst *EigrpInstance) GetAfiImportPolicy(afi string) string {
+	for _, af := range inst.addressFamily {
+		if af.Name == afi && af.ImportPolicy != "" {
+			return af.ImportPolicy
+		}
+	}
+	return inst.importPolicy
+}
+
+func (inst *EigrpInstance) SetAfiImportPolicy(afi string, policy string) {
+	for i, af := range inst.addressFamily {
+		if af.Name == afi {
+			inst.addressFamily[i].ImportPolicy = policy
+			return
+		}
+	}
+	inst.addressFamily = append(inst.addressFamily, AddressFamilyConfig{
+		Name:         afi,
+		ImportPolicy: policy,
+	})
+}
+
 func newEigrpInstance(netinst string) *EigrpInstance {
 	return &EigrpInstance{
 		netinst:                netinst,
@@ -161,7 +235,6 @@ func newEigrpInstance(netinst string) *EigrpInstance {
 		ribScale:               128,
 		wideMetrics:            true,
 		configuredInterfaces:   make(map[string]*InterfaceConfig),
-		configuredInterfacesV6: make(map[string]*InterfaceConfig),
 		staticNeighbors:        make(map[string]*StaticNeighborConfig),
 		routes:                 make(map[string]*RouteInfo),
 		neighbors:              make(map[string]*NeighborInfo),
@@ -260,6 +333,17 @@ func (d *EigrpDaemon) CollectAndPublish(ctx context.Context) {
 		d.mu.Unlock()
 
 		C.srlShimInterfacesScan(cNetinst)
+
+		d.mu.RLock()
+		configuredIntfs := make([]*InterfaceConfig, 0, len(inst.configuredInterfaces))
+		for _, ic := range inst.configuredInterfaces {
+			configuredIntfs = append(configuredIntfs, ic)
+		}
+		d.mu.RUnlock()
+		for _, ic := range configuredIntfs {
+			d.applyInterface(inst, ic)
+		}
+
 		C.srlShimInterfacesReport(cNetinst)
 		C.srlShimNeighborsReport(cNetinst)
 		C.srlShimTopologyReport(cNetinst)
@@ -395,10 +479,6 @@ func (d *EigrpDaemon) OnInterfaceReport(netinst, name, ipAddr string, prefixlen 
 	if ic, ok := inst.configuredInterfaces[name]; ok && ic.Passive != nil {
 		isPassive = *ic.Passive
 	} else if ic, ok := inst.configuredInterfaces[normIf]; ok && ic.Passive != nil {
-		isPassive = *ic.Passive
-	} else if ic, ok := inst.configuredInterfacesV6[name]; ok && ic.Passive != nil {
-		isPassive = *ic.Passive
-	} else if ic, ok := inst.configuredInterfacesV6[normIf]; ok && ic.Passive != nil {
 		isPassive = *ic.Passive
 	}
 

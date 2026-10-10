@@ -27,6 +27,7 @@ type BfdConfig struct {
 }
 
 type AuthConfig struct {
+	AdminState        string `json:"admin-state,omitempty"`
 	Mode              string `json:"mode,omitempty"`
 	Keychain          string `json:"keychain,omitempty"`
 	AuthenticationKey string `json:"authentication-key,omitempty"`
@@ -62,32 +63,99 @@ type StaticNeighborConfig struct {
 	Interface string `json:"interface"`
 }
 
+type InterfaceAddressFamilyConfig struct {
+	Name       string `json:"name"`
+	AdminState string `json:"admin-state,omitempty"`
+	OperState  string `json:"oper-state,omitempty"`
+	Passive    *bool  `json:"passive,omitempty"`
+}
+
 type InterfaceConfig struct {
-	InterfaceName  string                 `json:"interface-name"`
-	AdminState     string                 `json:"admin-state,omitempty"`
-	Passive        *bool                  `json:"passive,omitempty"`
-	HelloInterval  *uint16                `json:"hello-interval,omitempty"`
-	HoldTime       *uint16                `json:"hold-time,omitempty"`
-	SplitHorizon   *bool                  `json:"split-horizon,omitempty"`
-	NextHopSelf    *bool                  `json:"next-hop-self,omitempty"`
-	Bandwidth      *uint32                `json:"bandwidth,omitempty"`
-	Delay          *uint32                `json:"delay,omitempty"`
-	SummaryAddress []SummaryAddressConfig `json:"summary-address,omitempty"`
-	Authentication *AuthConfig            `json:"authentication,omitempty"`
-	Bfd            *BfdConfig             `json:"bfd,omitempty"`
+	InterfaceName  string                         `json:"interface-name"`
+	AdminState     string                         `json:"admin-state,omitempty"`
+	Passive        *bool                          `json:"passive,omitempty"`
+	HelloInterval  *uint16                        `json:"hello-interval,omitempty"`
+	HoldTime       *uint16                        `json:"hold-time,omitempty"`
+	SplitHorizon   *bool                          `json:"split-horizon,omitempty"`
+	NextHopSelf    *bool                          `json:"next-hop-self,omitempty"`
+	Bandwidth      *uint32                        `json:"bandwidth,omitempty"`
+	Delay          *uint32                        `json:"delay,omitempty"`
+	SummaryAddress []SummaryAddressConfig         `json:"summary-address,omitempty"`
+	Authentication *AuthConfig                    `json:"authentication,omitempty"`
+	Bfd            *BfdConfig                     `json:"bfd,omitempty"`
+	AddressFamily  []InterfaceAddressFamilyConfig `json:"address-family,omitempty"`
 }
 
 type DefaultInterfaceConfig struct {
-	AdminState     string      `json:"admin-state"`
-	Passive        bool        `json:"passive"`
-	HelloInterval  uint16      `json:"hello-interval"`
-	HoldTime       uint16      `json:"hold-time"`
-	SplitHorizon   *bool       `json:"split-horizon,omitempty"`
-	NextHopSelf    *bool       `json:"next-hop-self,omitempty"`
-	Bandwidth      *uint32     `json:"bandwidth,omitempty"`
-	Delay          *uint32     `json:"delay,omitempty"`
-	Authentication *AuthConfig `json:"authentication,omitempty"`
-	Bfd            *BfdConfig  `json:"bfd,omitempty"`
+	AdminState     string                         `json:"admin-state"`
+	Passive        bool                           `json:"passive"`
+	HelloInterval  uint16                         `json:"hello-interval"`
+	HoldTime       uint16                         `json:"hold-time"`
+	SplitHorizon   *bool                          `json:"split-horizon,omitempty"`
+	NextHopSelf    *bool                          `json:"next-hop-self,omitempty"`
+	Bandwidth      *uint32                        `json:"bandwidth,omitempty"`
+	Delay          *uint32                        `json:"delay,omitempty"`
+	Authentication *AuthConfig                    `json:"authentication,omitempty"`
+	Bfd            *BfdConfig                     `json:"bfd,omitempty"`
+	AddressFamily  []InterfaceAddressFamilyConfig `json:"address-family,omitempty"`
+}
+
+func (ic *InterfaceConfig) IsAfiEnabled(afi string, defAdmin string) bool {
+	if ic == nil {
+		return defAdmin != "disable"
+	}
+	if ic.AdminState == "disable" {
+		return false
+	}
+	for _, af := range ic.AddressFamily {
+		if af.Name == afi {
+			if af.AdminState != "" {
+				return af.AdminState != "disable"
+			}
+			return defAdmin != "disable"
+		}
+	}
+	return defAdmin != "disable"
+}
+
+func (ic *InterfaceConfig) IsAfiPassive(afi string, defPassive bool) bool {
+	if ic != nil {
+		for _, af := range ic.AddressFamily {
+			if af.Name == afi && af.Passive != nil {
+				return *af.Passive
+			}
+		}
+		if ic.Passive != nil {
+			return *ic.Passive
+		}
+	}
+	return defPassive
+}
+
+func (ic *InterfaceConfig) SetAfiAdminState(afi string, state string) {
+	for i, af := range ic.AddressFamily {
+		if af.Name == afi {
+			ic.AddressFamily[i].AdminState = state
+			return
+		}
+	}
+	ic.AddressFamily = append(ic.AddressFamily, InterfaceAddressFamilyConfig{
+		Name:       afi,
+		AdminState: state,
+	})
+}
+
+func (ic *InterfaceConfig) SetAfiPassive(afi string, passive *bool) {
+	for i, af := range ic.AddressFamily {
+		if af.Name == afi {
+			ic.AddressFamily[i].Passive = passive
+			return
+		}
+	}
+	ic.AddressFamily = append(ic.AddressFamily, InterfaceAddressFamilyConfig{
+		Name:    afi,
+		Passive: passive,
+	})
 }
 
 type TimersConfig struct {
@@ -118,18 +186,10 @@ type PolicyMetricConfig struct {
 }
 
 type AddressFamilyConfig struct {
-	Name         string            `json:"name"`
-	AdminState   string            `json:"admin-state,omitempty"`
-	ExportPolicy string            `json:"export-policy,omitempty"`
-	ImportPolicy string            `json:"import-policy,omitempty"`
-	Interface    []InterfaceConfig `json:"interface,omitempty"`
-}
-
-type IPv6UnicastConfig struct {
-	AdminState   string            `json:"admin-state,omitempty"`
-	ExportPolicy string            `json:"export-policy,omitempty"`
-	ImportPolicy string            `json:"import-policy,omitempty"`
-	Interface    []InterfaceConfig `json:"interface,omitempty"`
+	Name         string `json:"name"`
+	AdminState   string `json:"admin-state,omitempty"`
+	ExportPolicy string `json:"export-policy,omitempty"`
+	ImportPolicy string `json:"import-policy,omitempty"`
 }
 
 type EigrpConfig struct {
@@ -150,7 +210,6 @@ type EigrpConfig struct {
 	MetricWeights    *MetricsConfig          `json:"metric-weights,omitempty"`
 	DefaultInterface *DefaultInterfaceConfig `json:"default-interface,omitempty"`
 	Interface        []InterfaceConfig       `json:"interface,omitempty"`
-	IPv6Unicast      *IPv6UnicastConfig      `json:"ipv6-unicast,omitempty"`
 	AddressFamily    []AddressFamilyConfig   `json:"address-family,omitempty"`
 	Network          []string                `json:"network,omitempty"`
 	StaticNeighbor   []StaticNeighborConfig  `json:"static-neighbor,omitempty"`
@@ -160,7 +219,29 @@ var (
 	netinstRegex = regexp.MustCompile(`\.network[-_]instance\{(?:\.name==)?["']?([^}"']+)["']?\}`)
 	intfRegex    = regexp.MustCompile(`\.interface\{(?:\.interface-name==|\.name==)?["']?([^}"']+)["']?\}`)
 	policyRegex  = regexp.MustCompile(`\.policy\{(?:\.name==)?["']?([^}"']+)["']?\}`)
+	afRegex      = regexp.MustCompile(`\.address[-_]family\{(?:\.name==)?["']?([^}"']+)["']?\}`)
 )
+
+func extractAfName(cfg *ndk.ConfigNotification) string {
+	if cfg != nil && cfg.GetKey() != nil {
+		for _, s := range []string{cfg.GetKey().GetJsPathWithKeys(), cfg.GetKey().GetJsPath()} {
+			if s == "" {
+				continue
+			}
+			matches := afRegex.FindStringSubmatch(s)
+			if len(matches) > 1 && matches[1] != "" {
+				return matches[1]
+			}
+		}
+		keys := cfg.GetKey().GetKeys()
+		for _, k := range keys {
+			if k == "ipv4-unicast" || k == "ipv6-unicast" {
+				return k
+			}
+		}
+	}
+	return ""
+}
 
 func extractNetinst(cfg *ndk.ConfigNotification) string {
 	if cfg != nil && cfg.GetKey() != nil {
@@ -247,19 +328,21 @@ func (d *EigrpDaemon) applyInterface(inst *EigrpInstance, ifcfg *InterfaceConfig
 	cIfname := C.CString(ifcfg.InterfaceName)
 	defer C.free(unsafe.Pointer(cIfname))
 
-	adminUp := true
-	if ifcfg.AdminState == "disable" {
-		adminUp = false
-	} else if ifcfg.AdminState == "" && inst.defaultIntf != nil && inst.defaultIntf.AdminState == "disable" {
-		adminUp = false
+	defAdmin := "enable"
+	if inst.defaultIntf != nil && inst.defaultIntf.AdminState != "" {
+		defAdmin = inst.defaultIntf.AdminState
 	}
 
-	passive := false
-	if ifcfg.Passive != nil {
-		passive = *ifcfg.Passive
-	} else if inst.defaultIntf != nil {
-		passive = inst.defaultIntf.Passive
+	defPassive := false
+	if inst.defaultIntf != nil {
+		defPassive = inst.defaultIntf.Passive
 	}
+
+	adminUp4 := inst.IsAfiEnabled("ipv4-unicast") && ifcfg.IsAfiEnabled("ipv4-unicast", defAdmin)
+	passive4 := ifcfg.IsAfiPassive("ipv4-unicast", defPassive)
+
+	adminUp6 := inst.IsAfiEnabled("ipv6-unicast") && ifcfg.IsAfiEnabled("ipv6-unicast", defAdmin)
+	passive6 := ifcfg.IsAfiPassive("ipv6-unicast", defPassive)
 
 	hello := uint16(5)
 	if ifcfg.HelloInterval != nil && *ifcfg.HelloInterval > 0 {
@@ -303,22 +386,31 @@ func (d *EigrpDaemon) applyInterface(inst *EigrpInstance, ifcfg *InterfaceConfig
 		delay = *inst.defaultIntf.Delay
 	}
 
-	C.srlShimInterfaceEnable(cNetinst, cIfname, C.bool(passive), C.uint16_t(hello), C.uint16_t(hold), C.bool(adminUp), C.bool(splitHorizon), C.bool(nextHopSelf), C.uint32_t(bandwidth), C.uint32_t(delay))
+	C.srlShimInterfaceEnable(cNetinst, cIfname, C.bool(passive4), C.uint16_t(hello), C.uint16_t(hold), C.bool(adminUp4), C.bool(splitHorizon), C.bool(nextHopSelf), C.uint32_t(bandwidth), C.uint32_t(delay))
+	C.srlShimInterfaceEnableV6(cNetinst, cIfname, C.bool(passive6), C.uint16_t(hello), C.uint16_t(hold), C.bool(adminUp6), C.bool(splitHorizon), C.bool(nextHopSelf), C.uint32_t(bandwidth), C.uint32_t(delay))
 
 	authMode := ""
+	authAdmin := ""
 	keychain := ""
 	authKey := ""
 	if ifcfg.Authentication != nil {
+		authAdmin = ifcfg.Authentication.AdminState
 		authMode = ifcfg.Authentication.Mode
 		keychain = ifcfg.Authentication.Keychain
 		authKey = ifcfg.Authentication.AuthenticationKey
 	} else if inst.defaultIntf != nil && inst.defaultIntf.Authentication != nil {
+		authAdmin = inst.defaultIntf.Authentication.AdminState
 		authMode = inst.defaultIntf.Authentication.Mode
 		keychain = inst.defaultIntf.Authentication.Keychain
 		authKey = inst.defaultIntf.Authentication.AuthenticationKey
+	} else if inst.authentication != nil {
+		authAdmin = inst.authentication.AdminState
+		authMode = inst.authentication.Mode
+		keychain = inst.authentication.Keychain
+		authKey = inst.authentication.AuthenticationKey
 	}
 
-	if authMode != "" {
+	if authAdmin != "disable" && authMode != "" && authMode != "none" {
 		cMode := C.CString(authMode)
 		cKc := C.CString(keychain)
 		cKey := C.CString(authKey)
@@ -368,130 +460,7 @@ func (d *EigrpDaemon) applyInterface(inst *EigrpInstance, ifcfg *InterfaceConfig
 }
 
 func (d *EigrpDaemon) applyInterfaceV6(inst *EigrpInstance, ifcfg *InterfaceConfig) {
-	cNetinst := C.CString(inst.netinst)
-	defer C.free(unsafe.Pointer(cNetinst))
-
-	cIfname := C.CString(ifcfg.InterfaceName)
-	defer C.free(unsafe.Pointer(cIfname))
-
-	adminUp := true
-	if !inst.hasV6 || ifcfg.AdminState == "disable" {
-		adminUp = false
-	} else if ifcfg.AdminState == "" && inst.defaultIntf != nil && inst.defaultIntf.AdminState == "disable" {
-		adminUp = false
-	}
-
-	passive := false
-	if ifcfg.Passive != nil {
-		passive = *ifcfg.Passive
-	} else if inst.defaultIntf != nil {
-		passive = inst.defaultIntf.Passive
-	}
-
-	hello := uint16(5)
-	if ifcfg.HelloInterval != nil && *ifcfg.HelloInterval > 0 {
-		hello = *ifcfg.HelloInterval
-	} else if inst.defaultIntf != nil && inst.defaultIntf.HelloInterval > 0 {
-		hello = inst.defaultIntf.HelloInterval
-	}
-
-	hold := uint16(15)
-	if ifcfg.HoldTime != nil && *ifcfg.HoldTime > 0 {
-		hold = *ifcfg.HoldTime
-	} else if inst.defaultIntf != nil && inst.defaultIntf.HoldTime > 0 {
-		hold = inst.defaultIntf.HoldTime
-	}
-
-	splitHorizon := true
-	if ifcfg.SplitHorizon != nil {
-		splitHorizon = *ifcfg.SplitHorizon
-	} else if inst.defaultIntf != nil && inst.defaultIntf.SplitHorizon != nil {
-		splitHorizon = *inst.defaultIntf.SplitHorizon
-	}
-
-	nextHopSelf := false
-	if ifcfg.NextHopSelf != nil {
-		nextHopSelf = *ifcfg.NextHopSelf
-	} else if inst.defaultIntf != nil && inst.defaultIntf.NextHopSelf != nil {
-		nextHopSelf = *inst.defaultIntf.NextHopSelf
-	}
-
-	bandwidth := uint32(0)
-	if ifcfg.Bandwidth != nil && *ifcfg.Bandwidth > 0 {
-		bandwidth = *ifcfg.Bandwidth
-	} else if inst.defaultIntf != nil && inst.defaultIntf.Bandwidth != nil {
-		bandwidth = *inst.defaultIntf.Bandwidth
-	}
-
-	delay := uint32(0)
-	if ifcfg.Delay != nil && *ifcfg.Delay > 0 {
-		delay = *ifcfg.Delay
-	} else if inst.defaultIntf != nil && inst.defaultIntf.Delay != nil {
-		delay = *inst.defaultIntf.Delay
-	}
-
-	C.srlShimInterfaceEnableV6(cNetinst, cIfname, C.bool(passive), C.uint16_t(hello), C.uint16_t(hold), C.bool(adminUp), C.bool(splitHorizon), C.bool(nextHopSelf), C.uint32_t(bandwidth), C.uint32_t(delay))
-
-	authMode := ""
-	keychain := ""
-	authKey := ""
-	if ifcfg.Authentication != nil {
-		authMode = ifcfg.Authentication.Mode
-		keychain = ifcfg.Authentication.Keychain
-		authKey = ifcfg.Authentication.AuthenticationKey
-	} else if inst.defaultIntf != nil && inst.defaultIntf.Authentication != nil {
-		authMode = inst.defaultIntf.Authentication.Mode
-		keychain = inst.defaultIntf.Authentication.Keychain
-		authKey = inst.defaultIntf.Authentication.AuthenticationKey
-	}
-
-	if authMode != "" {
-		cMode := C.CString(authMode)
-		cKc := C.CString(keychain)
-		cKey := C.CString(authKey)
-		C.srlShimInterfaceAuthSet(cNetinst, cIfname, cMode, cKc, cKey)
-		C.free(unsafe.Pointer(cMode))
-		C.free(unsafe.Pointer(cKc))
-		C.free(unsafe.Pointer(cKey))
-	} else {
-		C.srlShimInterfaceAuthClear(cNetinst, cIfname)
-	}
-
-	bfdAdmin := "disable"
-	var bfdTx, bfdRx uint32 = 1000000, 1000000
-	var bfdMult uint8 = 3
-	if ifcfg.Bfd != nil {
-		if ifcfg.Bfd.AdminState != "" {
-			bfdAdmin = ifcfg.Bfd.AdminState
-		}
-		if ifcfg.Bfd.DesiredMinimumTxInterval != nil && *ifcfg.Bfd.DesiredMinimumTxInterval > 0 {
-			bfdTx = *ifcfg.Bfd.DesiredMinimumTxInterval
-		}
-		if ifcfg.Bfd.RequiredMinimumReceive != nil && *ifcfg.Bfd.RequiredMinimumReceive > 0 {
-			bfdRx = *ifcfg.Bfd.RequiredMinimumReceive
-		}
-		if ifcfg.Bfd.DetectionMultiplier != nil && *ifcfg.Bfd.DetectionMultiplier > 0 {
-			bfdMult = *ifcfg.Bfd.DetectionMultiplier
-		}
-	} else if inst.defaultIntf != nil && inst.defaultIntf.Bfd != nil {
-		if inst.defaultIntf.Bfd.AdminState != "" {
-			bfdAdmin = inst.defaultIntf.Bfd.AdminState
-		}
-		if inst.defaultIntf.Bfd.DesiredMinimumTxInterval != nil && *inst.defaultIntf.Bfd.DesiredMinimumTxInterval > 0 {
-			bfdTx = *inst.defaultIntf.Bfd.DesiredMinimumTxInterval
-		}
-		if inst.defaultIntf.Bfd.RequiredMinimumReceive != nil && *inst.defaultIntf.Bfd.RequiredMinimumReceive > 0 {
-			bfdRx = *inst.defaultIntf.Bfd.RequiredMinimumReceive
-		}
-		if inst.defaultIntf.Bfd.DetectionMultiplier != nil && *inst.defaultIntf.Bfd.DetectionMultiplier > 0 {
-			bfdMult = *inst.defaultIntf.Bfd.DetectionMultiplier
-		}
-	}
-	for nbrIP, nbr := range inst.neighbors {
-		if normalizeIfName(nbr.Interface) == normalizeIfName(ifcfg.InterfaceName) {
-			_ = d.BfdSessionAddOrUpdate(inst.netinst, nbrIP, ifcfg.InterfaceName, bfdAdmin, bfdTx, bfdRx, bfdMult)
-		}
-	}
+	d.applyInterface(inst, ifcfg)
 }
 
 func (d *EigrpDaemon) applyTimers(netinst string, t *TimersConfig) {
@@ -818,14 +787,16 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 
 		if adminStr == "disable" {
 			C.srlShimInstanceDelete(cNetinst)
-			if inst.hasV6 {
-				C.srlShimInstanceDeleteV6(cNetinst, C.uint16_t(inst.asn))
-			}
+			C.srlShimInstanceDeleteV6(cNetinst, C.uint16_t(inst.asn))
+			d.WithdrawAfRoutes(netinst, "ipv4-unicast")
+			d.WithdrawAfRoutes(netinst, "ipv6-unicast")
 			log.Info().Str("netinst", netinst).Msg("EIGRP instance disabled via admin-state sub-path")
 		} else if inst.asn > 0 {
 			cRouterId := C.CString(inst.routerId)
-			C.srlShimInstanceCreate(cNetinst, C.uint16_t(inst.asn), cRouterId)
-			if inst.hasV6 {
+			if inst.IsAfiEnabled("ipv4-unicast") {
+				C.srlShimInstanceCreate(cNetinst, C.uint16_t(inst.asn), cRouterId)
+			}
+			if inst.IsAfiEnabled("ipv6-unicast") {
 				C.srlShimInstanceCreateV6(cNetinst, C.uint16_t(inst.asn), cRouterId)
 			}
 			C.free(unsafe.Pointer(cRouterId))
@@ -834,16 +805,9 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			for _, ic := range inst.configuredInterfaces {
 				allIntfs = append(allIntfs, ic)
 			}
-			allIntfsV6 := make([]*InterfaceConfig, 0, len(inst.configuredInterfacesV6))
-			for _, ic := range inst.configuredInterfacesV6 {
-				allIntfsV6 = append(allIntfsV6, ic)
-			}
 			d.mu.RUnlock()
 			for _, ic := range allIntfs {
 				d.applyInterface(inst, ic)
-			}
-			for _, ic := range allIntfsV6 {
-				d.applyInterfaceV6(inst, ic)
 			}
 			log.Info().Str("netinst", netinst).Msg("EIGRP instance enabled via admin-state sub-path")
 		}
@@ -1142,129 +1106,74 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 		return
 	}
 
-	// 8a. Handle sub-path IPv6 interface notification
-	if (strings.Contains(jsPath, ".protocols.eigrp.ipv6-unicast") || strings.Contains(jsPath, ".protocols.eigrp.address-family")) && strings.Contains(jsPath, ".interface") && !strings.Contains(jsPath, ".default-interface") {
+	// 8a. Handle sub-path interface address-family notification
+	if strings.Contains(jsPath, ".protocols.eigrp.interface") && strings.Contains(jsPath, ".address-family") && !strings.Contains(jsPath, ".default-interface") {
 		ifName := extractIntfName(cfg)
-		if ifName == "" {
+		afName := extractAfName(cfg)
+		if ifName == "" || afName == "" {
 			return
 		}
-		cNetinst := C.CString(netinst)
-		defer C.free(unsafe.Pointer(cNetinst))
-		cIfname := C.CString(ifName)
-		defer C.free(unsafe.Pointer(cIfname))
-
 		inst := d.GetOrCreateInstance(netinst)
+		d.mu.Lock()
+		ic, exists := inst.configuredInterfaces[ifName]
+		if !exists || ic == nil {
+			ic = &InterfaceConfig{InterfaceName: ifName}
+			inst.configuredInterfaces[ifName] = ic
+		}
+
 		if op == ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE {
-			if strings.Contains(jsPath, ".summary-address") {
-				pfx := extractSummaryPrefix(cfg)
-				d.mu.Lock()
-				if ic, exists := inst.configuredInterfacesV6[ifName]; exists {
-					var updatedSA []SummaryAddressConfig
-					for _, sa := range ic.SummaryAddress {
-						if sa.Prefix != pfx && pfx != "" {
-							updatedSA = append(updatedSA, sa)
-						}
+			if strings.Contains(jsPath, ".passive") {
+				ic.SetAfiPassive(afName, nil)
+			} else if strings.Contains(jsPath, ".admin-state") {
+				ic.SetAfiAdminState(afName, "")
+			} else {
+				var updatedAF []InterfaceAddressFamilyConfig
+				for _, af := range ic.AddressFamily {
+					if af.Name != afName {
+						updatedAF = append(updatedAF, af)
 					}
-					ic.SummaryAddress = updatedSA
 				}
-				d.mu.Unlock()
-				log.Info().Str("netinst", netinst).Str("interface", ifName).Str("prefix", pfx).Msg("Deleted IPv6 summary-address on interface")
-				go d.CollectAndPublish(context.Background())
-				return
+				ic.AddressFamily = updatedAF
 			}
-			if strings.Contains(jsPath, ".authentication") {
-				d.mu.Lock()
-				if ic, exists := inst.configuredInterfacesV6[ifName]; exists {
-					ic.Authentication = nil
-				}
-				d.mu.Unlock()
-				C.srlShimInterfaceAuthClear(cNetinst, cIfname)
-				log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Cleared IPv6 EIGRP authentication on interface")
-				go d.CollectAndPublish(context.Background())
-				return
-			}
-			if strings.Contains(jsPath, ".bfd") {
-				d.mu.Lock()
-				if ic, exists := inst.configuredInterfacesV6[ifName]; exists {
-					ic.Bfd = nil
-				}
-				d.mu.Unlock()
-				log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Cleared IPv6 EIGRP bfd on interface")
-				go d.CollectAndPublish(context.Background())
-				return
-			}
-			d.mu.Lock()
-			delete(inst.configuredInterfacesV6, ifName)
 			d.mu.Unlock()
-			C.srlShimInterfaceDisableV6(cNetinst, cIfname)
-			log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Disabled IPv6 EIGRP on deleted interface")
+			d.applyInterface(inst, ic)
+			log.Info().Str("netinst", netinst).Str("interface", ifName).Str("af", afName).Msg("Deleted address-family on interface")
 			go d.CollectAndPublish(context.Background())
 			return
 		}
 
-		if strings.Contains(jsPath, ".summary-address") {
-			pfx := extractSummaryPrefix(cfg)
-			d.mu.Lock()
-			ic := inst.configuredInterfacesV6[ifName]
-			if ic == nil {
-				ic = &InterfaceConfig{InterfaceName: ifName}
-				inst.configuredInterfacesV6[ifName] = ic
+		var afCfg InterfaceAddressFamilyConfig
+		if err := json.Unmarshal([]byte(jsonStr), &afCfg); err == nil {
+			if afCfg.Name == "" {
+				afCfg.Name = afName
 			}
-			var saCfg SummaryAddressConfig
-			_ = json.Unmarshal([]byte(jsonStr), &saCfg)
-			if saCfg.Prefix == "" && pfx != "" {
-				saCfg.Prefix = pfx
+			if afCfg.AdminState != "" {
+				ic.SetAfiAdminState(afCfg.Name, afCfg.AdminState)
 			}
-			if saCfg.Distance == 0 {
-				saCfg.Distance = 5
+			if afCfg.Passive != nil {
+				ic.SetAfiPassive(afCfg.Name, afCfg.Passive)
 			}
-			found := false
-			for i, existing := range ic.SummaryAddress {
-				if existing.Prefix == saCfg.Prefix {
-					ic.SummaryAddress[i] = saCfg
-					found = true
-					break
+		} else {
+			if strings.Contains(jsPath, ".passive") {
+				var p bool
+				if err := json.Unmarshal([]byte(jsonStr), &p); err == nil {
+					ic.SetAfiPassive(afName, &p)
+				}
+			} else if strings.Contains(jsPath, ".admin-state") {
+				var s string
+				if err := json.Unmarshal([]byte(jsonStr), &s); err == nil {
+					ic.SetAfiAdminState(afName, s)
 				}
 			}
-			if !found && saCfg.Prefix != "" {
-				ic.SummaryAddress = append(ic.SummaryAddress, saCfg)
-			}
-			d.mu.Unlock()
-			log.Info().Str("netinst", netinst).Str("interface", ifName).Interface("summary_address", saCfg).Msg("Configured IPv6 summary-address on interface")
-			go d.CollectAndPublish(context.Background())
-			return
 		}
-
-		var intfCfg InterfaceConfig
-		if err := json.Unmarshal([]byte(jsonStr), &intfCfg); err == nil {
-			intfCfg.InterfaceName = ifName
-			d.mu.Lock()
-			if existing, exists := inst.configuredInterfacesV6[ifName]; exists && existing != nil {
-				if len(intfCfg.SummaryAddress) == 0 && !strings.Contains(jsonStr, "\"summary-address\"") {
-					intfCfg.SummaryAddress = existing.SummaryAddress
-				}
-			}
-			inst.configuredInterfacesV6[ifName] = &intfCfg
-			hasV6 := inst.hasV6
-			d.mu.Unlock()
-			if !hasV6 {
-				log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Saved IPv6 interface config while IPv6 is disabled")
-				go d.CollectAndPublish(context.Background())
-				return
-			}
-			if inst.asn > 0 {
-				cRouterId := C.CString(inst.routerId)
-				C.srlShimInstanceCreateV6(cNetinst, C.uint16_t(inst.asn), cRouterId)
-				C.free(unsafe.Pointer(cRouterId))
-			}
-			d.applyInterfaceV6(inst, &intfCfg)
-			log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Configured IPv6 EIGRP on interface")
-			go d.CollectAndPublish(context.Background())
-		}
+		d.mu.Unlock()
+		d.applyInterface(inst, ic)
+		log.Info().Str("netinst", netinst).Str("interface", ifName).Str("af", afName).Interface("config", ic.AddressFamily).Msg("Configured address-family on interface")
+		go d.CollectAndPublish(context.Background())
 		return
 	}
 
-	// 8b. Handle sub-path IPv4 interface notification
+	// 8b. Handle sub-path interface notification
 	if strings.Contains(jsPath, ".protocols.eigrp.interface") && !strings.Contains(jsPath, ".default-interface") {
 		ifName := extractIntfName(cfg)
 		if ifName == "" {
@@ -1290,7 +1199,7 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 					ic.SummaryAddress = updatedSA
 				}
 				d.mu.Unlock()
-				log.Info().Str("netinst", netinst).Str("interface", ifName).Str("prefix", pfx).Msg("Deleted IPv4 summary-address on interface")
+				log.Info().Str("netinst", netinst).Str("interface", ifName).Str("prefix", pfx).Msg("Deleted summary-address on interface")
 				go d.CollectAndPublish(context.Background())
 				return
 			}
@@ -1301,7 +1210,7 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 				}
 				d.mu.Unlock()
 				C.srlShimInterfaceAuthClear(cNetinst, cIfname)
-				log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Cleared IPv4 EIGRP authentication on interface")
+				log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Cleared EIGRP authentication on interface")
 				go d.CollectAndPublish(context.Background())
 				return
 			}
@@ -1311,7 +1220,7 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 					ic.Bfd = nil
 				}
 				d.mu.Unlock()
-				log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Cleared IPv4 EIGRP bfd on interface")
+				log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Cleared EIGRP bfd on interface")
 				go d.CollectAndPublish(context.Background())
 				return
 			}
@@ -1319,7 +1228,8 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			delete(inst.configuredInterfaces, ifName)
 			d.mu.Unlock()
 			C.srlShimInterfaceDisable(cNetinst, cIfname)
-			log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Disabled IPv4 EIGRP on deleted interface")
+			C.srlShimInterfaceDisableV6(cNetinst, cIfname)
+			log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Disabled EIGRP on deleted interface")
 			go d.CollectAndPublish(context.Background())
 			return
 		}
@@ -1352,7 +1262,7 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 				ic.SummaryAddress = append(ic.SummaryAddress, saCfg)
 			}
 			d.mu.Unlock()
-			log.Info().Str("netinst", netinst).Str("interface", ifName).Interface("summary_address", saCfg).Msg("Configured IPv4 summary-address on interface")
+			log.Info().Str("netinst", netinst).Str("interface", ifName).Interface("summary_address", saCfg).Msg("Configured summary-address on interface")
 			go d.CollectAndPublish(context.Background())
 			return
 		}
@@ -1365,141 +1275,158 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 				if len(intfCfg.SummaryAddress) == 0 && !strings.Contains(jsonStr, "\"summary-address\"") {
 					intfCfg.SummaryAddress = existing.SummaryAddress
 				}
+				if len(intfCfg.AddressFamily) == 0 && !strings.Contains(jsonStr, "\"address-family\"") {
+					intfCfg.AddressFamily = existing.AddressFamily
+				}
 			}
 			inst.configuredInterfaces[ifName] = &intfCfg
 			d.mu.Unlock()
 			d.applyInterface(inst, &intfCfg)
-			log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Configured IPv4 EIGRP on interface")
+			log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Configured EIGRP on interface")
 			go d.CollectAndPublish(context.Background())
 		}
 		return
 	}
 
-	// 8c. Handle sub-path ipv6-unicast container notification
-	if strings.Contains(jsPath, ".protocols.eigrp.ipv6-unicast") && !strings.Contains(jsPath, ".interface") {
-		inst := d.GetOrCreateInstance(netinst)
-		cNetinst := C.CString(netinst)
-		defer C.free(unsafe.Pointer(cNetinst))
-
-		if op == ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE {
-			d.mu.Lock()
-			inst.hasV6 = false
-			inst.ipv6Unicast = nil
-			inst.configuredInterfacesV6 = make(map[string]*InterfaceConfig)
-			d.mu.Unlock()
-			C.srlShimInstanceDeleteV6(cNetinst, C.uint16_t(inst.asn))
-			log.Info().Str("netinst", netinst).Msg("Deleted IPv6 EIGRP instance")
-			go d.CollectAndPublish(context.Background())
-			return
-		}
-
-		var v6Cfg IPv6UnicastConfig
-		if err := json.Unmarshal([]byte(jsonStr), &v6Cfg); err == nil {
-			if v6Cfg.AdminState == "disable" {
-				d.mu.Lock()
-				inst.hasV6 = false
-				inst.ipv6Unicast = &v6Cfg
-				for _, ifcfg := range v6Cfg.Interface {
-					if ifcfg.InterfaceName != "" {
-						cfgCopy := ifcfg
-						inst.configuredInterfacesV6[ifcfg.InterfaceName] = &cfgCopy
-					}
-				}
-				d.mu.Unlock()
-				C.srlShimInstanceDeleteV6(cNetinst, C.uint16_t(inst.asn))
-				log.Info().Str("netinst", netinst).Msg("Disabled IPv6 EIGRP instance via sub-path")
-				go d.CollectAndPublish(context.Background())
-				return
-			}
-			d.mu.Lock()
-			inst.hasV6 = true
-			inst.ipv6Unicast = &v6Cfg
-			d.mu.Unlock()
-			if inst.asn > 0 {
-				cRouterId := C.CString(inst.routerId)
-				C.srlShimInstanceCreateV6(cNetinst, C.uint16_t(inst.asn), cRouterId)
-				C.free(unsafe.Pointer(cRouterId))
-			}
-			for _, ifcfg := range v6Cfg.Interface {
-				if ifcfg.InterfaceName == "" {
-					continue
-				}
-				cfgCopy := ifcfg
-				d.mu.Lock()
-				inst.configuredInterfacesV6[ifcfg.InterfaceName] = &cfgCopy
-				d.mu.Unlock()
-				d.applyInterfaceV6(inst, &cfgCopy)
-			}
-			d.mu.RLock()
-			allIntfsV6 := make([]*InterfaceConfig, 0, len(inst.configuredInterfacesV6))
-			for _, ic := range inst.configuredInterfacesV6 {
-				allIntfsV6 = append(allIntfsV6, ic)
-			}
-			d.mu.RUnlock()
-			for _, ic := range allIntfsV6 {
-				d.applyInterfaceV6(inst, ic)
-			}
-		}
-		go d.CollectAndPublish(context.Background())
-		return
-	}
-
-	// 8d. Handle sub-path address-family notification
+	// 8c. Handle sub-path protocol-level address-family notification
 	if strings.Contains(jsPath, ".protocols.eigrp.address-family") && !strings.Contains(jsPath, ".interface") {
 		inst := d.GetOrCreateInstance(netinst)
 		cNetinst := C.CString(netinst)
 		defer C.free(unsafe.Pointer(cNetinst))
 
+		afName := extractAfName(cfg)
+		log.Info().Str("netinst", netinst).Str("af", afName).Str("op", op.String()).Str("json", jsonStr).Msg("Handling protocol address-family notification")
+
 		if op == ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE {
-			C.srlShimInstanceDeleteV6(cNetinst, C.uint16_t(inst.asn))
-			d.mu.Lock()
-			inst.configuredInterfacesV6 = make(map[string]*InterfaceConfig)
-			d.mu.Unlock()
-			log.Info().Str("netinst", netinst).Msg("Deleted IPv6 EIGRP address-family instance")
+			if strings.Contains(jsPath, ".export-policy") {
+				d.mu.Lock()
+				inst.SetAfiExportPolicy(afName, "")
+				d.mu.Unlock()
+			} else if strings.Contains(jsPath, ".import-policy") {
+				d.mu.Lock()
+				inst.SetAfiImportPolicy(afName, "")
+				d.mu.Unlock()
+			} else if strings.Contains(jsPath, ".admin-state") {
+				d.mu.Lock()
+				inst.SetAfiAdminState(afName, "enable")
+				d.mu.Unlock()
+				if inst.asn > 0 {
+					cRouterId := C.CString(inst.routerId)
+					if afName == "ipv6-unicast" {
+						C.srlShimInstanceCreateV6(cNetinst, C.uint16_t(inst.asn), cRouterId)
+					} else if afName == "ipv4-unicast" {
+						C.srlShimInstanceCreate(cNetinst, C.uint16_t(inst.asn), cRouterId)
+					}
+					C.free(unsafe.Pointer(cRouterId))
+				}
+			} else {
+				d.mu.Lock()
+				var newAf []AddressFamilyConfig
+				for _, af := range inst.addressFamily {
+					if af.Name != afName {
+						newAf = append(newAf, af)
+					}
+				}
+				inst.addressFamily = newAf
+				d.mu.Unlock()
+
+				if afName == "ipv6-unicast" {
+					C.srlShimInstanceDeleteV6(cNetinst, C.uint16_t(inst.asn))
+					d.WithdrawAfRoutes(netinst, "ipv6-unicast")
+				} else if afName == "ipv4-unicast" {
+					C.srlShimInstanceDelete(cNetinst)
+					d.WithdrawAfRoutes(netinst, "ipv4-unicast")
+				}
+			}
+			d.mu.RLock()
+			allIntfs := make([]*InterfaceConfig, 0, len(inst.configuredInterfaces))
+			for _, ic := range inst.configuredInterfaces {
+				allIntfs = append(allIntfs, ic)
+			}
+			d.mu.RUnlock()
+			for _, ic := range allIntfs {
+				d.applyInterface(inst, ic)
+			}
 			go d.CollectAndPublish(context.Background())
 			return
 		}
 
 		var afCfg AddressFamilyConfig
 		if err := json.Unmarshal([]byte(jsonStr), &afCfg); err == nil {
-			if strings.HasPrefix(strings.ToLower(afCfg.Name), "ipv6") {
-				if afCfg.AdminState == "disable" {
+			if afCfg.Name == "" {
+				afCfg.Name = afName
+			}
+			d.mu.Lock()
+			if afCfg.AdminState != "" {
+				inst.SetAfiAdminState(afCfg.Name, afCfg.AdminState)
+			}
+			if afCfg.ExportPolicy != "" {
+				inst.SetAfiExportPolicy(afCfg.Name, afCfg.ExportPolicy)
+			}
+			if afCfg.ImportPolicy != "" {
+				inst.SetAfiImportPolicy(afCfg.Name, afCfg.ImportPolicy)
+			}
+			d.mu.Unlock()
+
+			if afCfg.AdminState == "disable" {
+				if afCfg.Name == "ipv6-unicast" {
 					C.srlShimInstanceDeleteV6(cNetinst, C.uint16_t(inst.asn))
-					d.mu.Lock()
-					inst.hasV6 = false
-					for _, ifcfg := range afCfg.Interface {
-						if ifcfg.InterfaceName != "" {
-							cfgCopy := ifcfg
-							inst.configuredInterfacesV6[ifcfg.InterfaceName] = &cfgCopy
-						}
-					}
-					d.mu.Unlock()
-					log.Info().Str("netinst", netinst).Msg("Disabled IPv6 EIGRP address-family instance via sub-path")
-					go d.CollectAndPublish(context.Background())
-					return
+					d.WithdrawAfRoutes(netinst, "ipv6-unicast")
+				} else if afCfg.Name == "ipv4-unicast" {
+					C.srlShimInstanceDelete(cNetinst)
+					d.WithdrawAfRoutes(netinst, "ipv4-unicast")
 				}
-				if inst.asn > 0 {
-					cRouterId := C.CString(inst.routerId)
+			} else if afCfg.AdminState == "enable" && inst.asn > 0 {
+				cRouterId := C.CString(inst.routerId)
+				if afCfg.Name == "ipv6-unicast" {
 					C.srlShimInstanceCreateV6(cNetinst, C.uint16_t(inst.asn), cRouterId)
-					C.free(unsafe.Pointer(cRouterId))
-					for _, ifcfg := range afCfg.Interface {
-						if ifcfg.InterfaceName == "" {
-							continue
+				} else if afCfg.Name == "ipv4-unicast" {
+					C.srlShimInstanceCreate(cNetinst, C.uint16_t(inst.asn), cRouterId)
+				}
+				C.free(unsafe.Pointer(cRouterId))
+			}
+
+			d.mu.RLock()
+			allIntfs := make([]*InterfaceConfig, 0, len(inst.configuredInterfaces))
+			for _, ic := range inst.configuredInterfaces {
+				allIntfs = append(allIntfs, ic)
+			}
+			d.mu.RUnlock()
+			for _, ic := range allIntfs {
+				d.applyInterface(inst, ic)
+			}
+		} else {
+			if strings.Contains(jsPath, ".admin-state") {
+				var adminStr string
+				if err := json.Unmarshal([]byte(jsonStr), &adminStr); err == nil {
+					d.mu.Lock()
+					inst.SetAfiAdminState(afName, adminStr)
+					d.mu.Unlock()
+					if adminStr == "disable" {
+						if afName == "ipv6-unicast" {
+							C.srlShimInstanceDeleteV6(cNetinst, C.uint16_t(inst.asn))
+							d.WithdrawAfRoutes(netinst, "ipv6-unicast")
+						} else if afName == "ipv4-unicast" {
+							C.srlShimInstanceDelete(cNetinst)
+							d.WithdrawAfRoutes(netinst, "ipv4-unicast")
 						}
-						cfgCopy := ifcfg
-						d.mu.Lock()
-						inst.configuredInterfacesV6[ifcfg.InterfaceName] = &cfgCopy
-						d.mu.Unlock()
-						d.applyInterfaceV6(inst, &cfgCopy)
+					} else if adminStr == "enable" && inst.asn > 0 {
+						cRouterId := C.CString(inst.routerId)
+						if afName == "ipv6-unicast" {
+							C.srlShimInstanceCreateV6(cNetinst, C.uint16_t(inst.asn), cRouterId)
+						} else if afName == "ipv4-unicast" {
+							C.srlShimInstanceCreate(cNetinst, C.uint16_t(inst.asn), cRouterId)
+						}
+						C.free(unsafe.Pointer(cRouterId))
 					}
 					d.mu.RLock()
-					allIntfsV6 := make([]*InterfaceConfig, 0, len(inst.configuredInterfacesV6))
-					for _, ic := range inst.configuredInterfacesV6 {
-						allIntfsV6 = append(allIntfsV6, ic)
+					allIntfs := make([]*InterfaceConfig, 0, len(inst.configuredInterfaces))
+					for _, ic := range inst.configuredInterfaces {
+						allIntfs = append(allIntfs, ic)
 					}
 					d.mu.RUnlock()
-					for _, ic := range allIntfsV6 {
-						d.applyInterfaceV6(inst, ic)
+					for _, ic := range allIntfs {
+						d.applyInterface(inst, ic)
 					}
 				}
 			}
@@ -1600,9 +1527,6 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 	if conf.MetricWeights != nil {
 		inst.metricWeights = conf.MetricWeights
 	}
-	if conf.IPv6Unicast != nil {
-		inst.ipv6Unicast = conf.IPv6Unicast
-	}
 	if len(conf.AddressFamily) > 0 {
 		inst.addressFamily = conf.AddressFamily
 	}
@@ -1674,24 +1598,6 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 				inst.configuredInterfaces[ifcfg.InterfaceName] = &cfgCopy
 			}
 		}
-		if conf.IPv6Unicast != nil {
-			for _, ifcfg := range conf.IPv6Unicast.Interface {
-				if ifcfg.InterfaceName != "" {
-					cfgCopy := ifcfg
-					inst.configuredInterfacesV6[ifcfg.InterfaceName] = &cfgCopy
-				}
-			}
-		}
-		for _, af := range conf.AddressFamily {
-			if strings.HasPrefix(strings.ToLower(af.Name), "ipv6") {
-				for _, ifcfg := range af.Interface {
-					if ifcfg.InterfaceName != "" {
-						cfgCopy := ifcfg
-						inst.configuredInterfacesV6[ifcfg.InterfaceName] = &cfgCopy
-					}
-				}
-			}
-		}
 		for _, sn := range conf.StaticNeighbor {
 			if sn.IPAddress != "" {
 				cfgCopy := sn
@@ -1700,9 +1606,7 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 		}
 		d.mu.Unlock()
 		C.srlShimInstanceDelete(cNetinst)
-		if inst.hasV6 {
-			C.srlShimInstanceDeleteV6(cNetinst, C.uint16_t(inst.asn))
-		}
+		C.srlShimInstanceDeleteV6(cNetinst, C.uint16_t(inst.asn))
 		log.Info().Str("netinst", netinst).Msg("EIGRP instance disabled")
 		go d.CollectAndPublish(context.Background())
 		return
@@ -1710,13 +1614,32 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 
 	if conf.AutonomousSystem > 0 {
 		cRouterId := C.CString(conf.RouterId)
-		res := C.srlShimInstanceCreate(cNetinst, C.uint16_t(conf.AutonomousSystem), cRouterId)
-		C.free(unsafe.Pointer(cRouterId))
-
-		if res != 0 {
-			log.Error().Str("netinst", netinst).Uint16("asn", conf.AutonomousSystem).Msg("Failed to create EIGRP instance")
-			return
+		if inst.IsAfiEnabled("ipv4-unicast") {
+			res := C.srlShimInstanceCreate(cNetinst, C.uint16_t(conf.AutonomousSystem), cRouterId)
+			if res != 0 {
+				log.Error().Str("netinst", netinst).Uint16("asn", conf.AutonomousSystem).Msg("Failed to create IPv4 EIGRP instance")
+			} else {
+				log.Info().Str("netinst", netinst).Uint16("asn", conf.AutonomousSystem).Msg("Created IPv4 EIGRP instance")
+			}
+		} else {
+			C.srlShimInstanceDelete(cNetinst)
+			d.WithdrawAfRoutes(netinst, "ipv4-unicast")
+			log.Info().Str("netinst", netinst).Msg("Disabled IPv4 EIGRP instance")
 		}
+
+		if inst.IsAfiEnabled("ipv6-unicast") {
+			v6Res := C.srlShimInstanceCreateV6(cNetinst, C.uint16_t(conf.AutonomousSystem), cRouterId)
+			if v6Res != 0 {
+				log.Error().Str("netinst", netinst).Uint16("asn", conf.AutonomousSystem).Msg("Failed to create IPv6 EIGRP instance")
+			} else {
+				log.Info().Str("netinst", netinst).Uint16("asn", conf.AutonomousSystem).Msg("Created IPv6 EIGRP instance")
+			}
+		} else {
+			C.srlShimInstanceDeleteV6(cNetinst, C.uint16_t(conf.AutonomousSystem))
+			d.WithdrawAfRoutes(netinst, "ipv6-unicast")
+			log.Info().Str("netinst", netinst).Msg("Disabled IPv6 EIGRP instance")
+		}
+		C.free(unsafe.Pointer(cRouterId))
 
 		// Apply rib-scale
 		C.srl_set_rib_scale(cNetinst, C.uint8_t(inst.ribScale))
@@ -1736,90 +1659,6 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 		// Apply graceful restart
 		d.applyGracefulRestart(netinst, inst.gracefulRestart)
 
-		hasV6 := false
-		if conf.IPv6Unicast != nil && conf.IPv6Unicast.AdminState != "disable" {
-			hasV6 = true
-		}
-		for _, af := range conf.AddressFamily {
-			if strings.HasPrefix(strings.ToLower(af.Name), "ipv6") && af.AdminState != "disable" {
-				hasV6 = true
-			}
-		}
-
-		inst.hasV6 = hasV6
-		if hasV6 {
-			cRouterId := C.CString(conf.RouterId)
-			v6Res := C.srlShimInstanceCreateV6(cNetinst, C.uint16_t(conf.AutonomousSystem), cRouterId)
-			C.free(unsafe.Pointer(cRouterId))
-			if v6Res != 0 {
-				log.Error().Str("netinst", netinst).Uint16("asn", conf.AutonomousSystem).Msg("Failed to create IPv6 EIGRP instance")
-			} else {
-				log.Info().Str("netinst", netinst).Uint16("asn", conf.AutonomousSystem).Msg("Created IPv6 EIGRP instance")
-			}
-
-			if conf.IPv6Unicast != nil {
-				for _, ifcfg := range conf.IPv6Unicast.Interface {
-					if ifcfg.InterfaceName == "" {
-						continue
-					}
-					cfgCopy := ifcfg
-					d.mu.Lock()
-					inst.configuredInterfacesV6[ifcfg.InterfaceName] = &cfgCopy
-					d.mu.Unlock()
-					d.applyInterfaceV6(inst, &cfgCopy)
-				}
-			}
-			for _, af := range conf.AddressFamily {
-				if strings.HasPrefix(strings.ToLower(af.Name), "ipv6") {
-					for _, ifcfg := range af.Interface {
-						if ifcfg.InterfaceName == "" {
-							continue
-						}
-						cfgCopy := ifcfg
-						d.mu.Lock()
-						inst.configuredInterfacesV6[ifcfg.InterfaceName] = &cfgCopy
-						d.mu.Unlock()
-						d.applyInterfaceV6(inst, &cfgCopy)
-					}
-				}
-			}
-			d.mu.RLock()
-			allIntfsV6 := make([]*InterfaceConfig, 0, len(inst.configuredInterfacesV6))
-			for _, ic := range inst.configuredInterfacesV6 {
-				allIntfsV6 = append(allIntfsV6, ic)
-			}
-			d.mu.RUnlock()
-			for _, ic := range allIntfsV6 {
-				d.applyInterfaceV6(inst, ic)
-			}
-		} else {
-			d.mu.Lock()
-			inst.hasV6 = false
-			if conf.IPv6Unicast != nil {
-				for _, ifcfg := range conf.IPv6Unicast.Interface {
-					if ifcfg.InterfaceName == "" {
-						continue
-					}
-					cfgCopy := ifcfg
-					inst.configuredInterfacesV6[ifcfg.InterfaceName] = &cfgCopy
-				}
-			}
-			for _, af := range conf.AddressFamily {
-				if strings.HasPrefix(strings.ToLower(af.Name), "ipv6") {
-					for _, ifcfg := range af.Interface {
-						if ifcfg.InterfaceName == "" {
-							continue
-						}
-						cfgCopy := ifcfg
-						inst.configuredInterfacesV6[ifcfg.InterfaceName] = &cfgCopy
-					}
-				}
-			}
-			d.mu.Unlock()
-			C.srlShimInstanceDeleteV6(cNetinst, C.uint16_t(conf.AutonomousSystem))
-			log.Info().Str("netinst", netinst).Msg("Disabled or unconfigured IPv6 EIGRP instance")
-		}
-
 		if len(conf.StaticNeighbor) > 0 {
 			d.mu.Lock()
 			for _, sn := range conf.StaticNeighbor {
@@ -1838,6 +1677,14 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			}
 			cfgCopy := ifcfg
 			d.mu.Lock()
+			if existing, ok := inst.configuredInterfaces[ifcfg.InterfaceName]; ok && existing != nil {
+				if len(cfgCopy.AddressFamily) == 0 && len(existing.AddressFamily) > 0 {
+					cfgCopy.AddressFamily = existing.AddressFamily
+				}
+				if len(cfgCopy.SummaryAddress) == 0 && len(existing.SummaryAddress) > 0 {
+					cfgCopy.SummaryAddress = existing.SummaryAddress
+				}
+			}
 			inst.configuredInterfaces[ifcfg.InterfaceName] = &cfgCopy
 			d.mu.Unlock()
 			d.applyInterface(inst, &cfgCopy)

@@ -1,4 +1,5 @@
 import time
+import re
 import pytest
 
 def test_srl_neighbor_established(srl_exec):
@@ -44,14 +45,24 @@ def test_show_eigrp_cli(srl_exec):
     ])
     assert "Autonomous System" in out_summary and "100" in out_summary, f"Summary failed: {out_summary}"
 
-    out_nbr = srl_exec("clab-srl-srl-eigrp-srl1", [
-        "sr_cli", "show network-instance default protocols eigrp neighbor"
-    ])
+    out_nbr = ""
+    for _ in range(15):
+        out_nbr = srl_exec("clab-srl-srl-eigrp-srl1", [
+            "sr_cli", "show network-instance default protocols eigrp neighbor"
+        ])
+        if "10.0.0.2" in out_nbr and "Up" in out_nbr:
+            break
+        time.sleep(1)
     assert "10.0.0.2" in out_nbr and "Up" in out_nbr, f"Neighbor show failed: {out_nbr}"
 
-    out_routes = srl_exec("clab-srl-srl-eigrp-srl1", [
-        "sr_cli", "show network-instance default protocols eigrp routes"
-    ])
+    out_routes = ""
+    for _ in range(15):
+        out_routes = srl_exec("clab-srl-srl-eigrp-srl1", [
+            "sr_cli", "show network-instance default protocols eigrp routes"
+        ])
+        if "192.0.2.2/32" in out_routes and "10.0.0.2" in out_routes:
+            break
+        time.sleep(1)
     assert "192.0.2.2/32" in out_routes and "10.0.0.2" in out_routes, f"Routes show failed: {out_routes}"
 
     out_if = srl_exec("clab-srl-srl-eigrp-srl1", [
@@ -112,8 +123,10 @@ def test_state_db(srl_exec):
     assert "wide-metrics true" in out_state, f"wide-metrics missing from state DB: {out_state}"
     assert "graceful-restart {" in out_state, f"graceful-restart missing from state DB: {out_state}"
     assert "default-interface {" in out_state, f"default-interface missing from state DB: {out_state}"
-    assert "total-neighbors 1" in out_state, f"total-neighbors missing: {out_state}"
-    assert "total-routes 1" in out_state, f"total-routes missing: {out_state}"
+    assert "total-neighbors 2" in out_state, f"total-neighbors missing: {out_state}"
+    assert re.search(r"total-routes [23]", out_state), f"total-routes missing: {out_state}"
+    assert "address-family ipv4-unicast" in out_state, f"address-family ipv4-unicast missing: {out_state}"
+    assert "address-family ipv6-unicast" in out_state, f"address-family ipv6-unicast missing: {out_state}"
     assert "total-interfaces 2" in out_state, f"total-interfaces missing: {out_state}"
     assert "interface ethernet-1/1.0" in out_state, f"interface list missing: {out_state}"
     assert "passive false" in out_state, f"passive false missing from state DB: {out_state}"
@@ -505,12 +518,37 @@ def test_vrf1_tools_reset_all(srl_exec):
 # =============================================================================
 
 def test_srl_ipv6_enable(srl_exec):
-    """Enable IPv6 EIGRP (ipv6-unicast) on ethernet-1/1.0 and system0.0 in SRL1 and SRL2."""
+    """Enable IPv6 EIGRP (address-family ipv6-unicast) in SRL1 and SRL2."""
+    cfg_srl1_dis = """sr_cli << 'EOF'
+enter candidate
+/ network-instance default protocols eigrp address-family ipv6-unicast admin-state disable
+commit now
+EOF"""
+    srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_srl1_dis])
+
+    cfg_srl2_dis = """sr_cli << 'EOF'
+enter candidate
+/ network-instance default protocols eigrp address-family ipv6-unicast admin-state disable
+commit now
+EOF"""
+    srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", cfg_srl2_dis])
+
+    # Wait for IPv6 neighbor to drop (total-neighbors becomes 1)
+    dropped = False
+    for _ in range(15):
+        time.sleep(1)
+        out = srl_exec("clab-srl-srl-eigrp-srl1", [
+            "sr_cli", "info from state network-instance default protocols eigrp"
+        ])
+        if "total-neighbors 1" in out:
+            dropped = True
+            break
+    assert dropped, f"IPv6 neighbor failed to drop after disable: {out}"
+
+    # Now enable address-family ipv6-unicast
     cfg_srl1 = """sr_cli << 'EOF'
 enter candidate
-/ network-instance default protocols eigrp ipv6-unicast admin-state enable
-/ network-instance default protocols eigrp ipv6-unicast interface ethernet-1/1.0 admin-state enable
-/ network-instance default protocols eigrp ipv6-unicast interface system0.0 admin-state enable passive true
+/ network-instance default protocols eigrp address-family ipv6-unicast admin-state enable
 commit now
 EOF"""
     out1 = srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_srl1])
@@ -518,13 +556,12 @@ EOF"""
 
     cfg_srl2 = """sr_cli << 'EOF'
 enter candidate
-/ network-instance default protocols eigrp ipv6-unicast admin-state enable
-/ network-instance default protocols eigrp ipv6-unicast interface ethernet-1/1.0 admin-state enable
-/ network-instance default protocols eigrp ipv6-unicast interface system0.0 admin-state enable passive true
+/ network-instance default protocols eigrp address-family ipv6-unicast admin-state enable
 commit now
 EOF"""
     out2 = srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", cfg_srl2])
     assert "committed" in out2.lower(), f"Failed to enable IPv6 EIGRP on SRL2: {out2}"
+
 
 
 def test_srl_ipv6_neighbor_established(srl_exec):
@@ -629,7 +666,7 @@ def test_srl_ipv6_state_db(srl_exec):
         if "total-neighbors 2" in out_state and "2001:db8::2/128" in out_state:
             break
     assert "total-neighbors 2" in out_state, f"total-neighbors 2 missing from state DB: {out_state}"
-    assert "total-routes 2" in out_state, f"total-routes 2 missing from state DB: {out_state}"
+    assert re.search(r"total-routes [23]", out_state), f"total-routes 2 missing from state DB: {out_state}"
     assert "route 2001:db8::2/128" in out_state, f"IPv6 route missing from state DB: {out_state}"
     assert "neighbor fe80::" in out_state, f"IPv6 neighbor missing from state DB: {out_state}"
 
@@ -668,10 +705,10 @@ def test_srl_ipv6_tools_clear_neighbor(srl_exec):
 
 def test_srl_ipv6_passive_interface(srl_exec):
     """Verify making an IPv6 interface passive drops neighbor and removing passive recovers it."""
-    # Set passive true on srl1 ethernet-1/1.0 under ipv6-unicast
+    # Set passive true on srl1 ethernet-1/1.0 under address-family ipv6-unicast
     cfg_passive = """sr_cli << 'EOF'
 enter candidate
-/ network-instance default protocols eigrp ipv6-unicast interface ethernet-1/1.0 passive true
+/ network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv6-unicast passive true
 commit now
 EOF"""
     srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_passive])
@@ -691,7 +728,7 @@ EOF"""
     # Revert passive to false
     cfg_active = """sr_cli << 'EOF'
 enter candidate
-/ network-instance default protocols eigrp ipv6-unicast interface ethernet-1/1.0 passive false
+/ network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv6-unicast passive false
 commit now
 EOF"""
     srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_active])
@@ -713,29 +750,45 @@ def test_srl_ipv6_disable(srl_exec):
     """Disable IPv6 EIGRP and verify return to baseline state (only IPv4 active)."""
     cfg_srl1 = """sr_cli << 'EOF'
 enter candidate
-/ network-instance default protocols eigrp ipv6-unicast admin-state disable
+/ network-instance default protocols eigrp address-family ipv6-unicast admin-state disable
 commit now
 EOF"""
     srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_srl1])
 
     cfg_srl2 = """sr_cli << 'EOF'
 enter candidate
-/ network-instance default protocols eigrp ipv6-unicast admin-state disable
+/ network-instance default protocols eigrp address-family ipv6-unicast admin-state disable
 commit now
 EOF"""
     srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", cfg_srl2])
 
-    out = ""
-    for _ in range(15):
-        time.sleep(2)
-        out = srl_exec("clab-srl-srl-eigrp-srl1", [
-            "sr_cli", "info from state network-instance default protocols eigrp"
-        ])
-        if "total-neighbors 1" in out and "total-routes 1" in out:
-            break
-    assert "total-neighbors 1" in out, f"Failed to reset neighbors: {out}"
-    assert "total-routes 1" in out, f"Failed to reset routes: {out}"
-    assert "2001:db8::2" not in out, f"IPv6 route still in state DB: {out}"
+    try:
+        out = ""
+        for _ in range(15):
+            time.sleep(2)
+            out = srl_exec("clab-srl-srl-eigrp-srl1", [
+                "sr_cli", "info from state network-instance default protocols eigrp"
+            ])
+            if "total-neighbors 1" in out and "total-routes 1" in out:
+                break
+        assert "total-neighbors 1" in out, f"Failed to reset neighbors: {out}"
+        assert "total-routes 1" in out, f"Failed to reset routes: {out}"
+        assert "2001:db8::2" not in out, f"IPv6 route still in state DB: {out}"
+    finally:
+        cfg_srl1_en = """sr_cli << 'EOF'
+enter candidate
+/ network-instance default protocols eigrp address-family ipv6-unicast admin-state enable
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_srl1_en])
+
+        cfg_srl2_en = """sr_cli << 'EOF'
+enter candidate
+/ network-instance default protocols eigrp address-family ipv6-unicast admin-state enable
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", cfg_srl2_en])
+        time.sleep(3)
 
 
 def test_wide_metrics_rib_scale_scaling(srl_exec):

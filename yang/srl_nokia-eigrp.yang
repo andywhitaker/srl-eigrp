@@ -53,7 +53,37 @@ module srl_nokia-eigrp {
     }
   }
 
+  grouping eigrp-interface-address-family-config {
+    list address-family {
+      key "name";
+      description "Address family configuration for this interface";
+      leaf name {
+        type enumeration {
+          enum ipv4-unicast;
+          enum ipv6-unicast;
+        }
+        description "Address family name";
+      }
+      leaf admin-state {
+        type srl_nokia-comm:admin-state;
+        default "enable";
+        description "Administrative state of the address family on this interface";
+      }
+      leaf oper-state {
+        config false;
+        type srl_nokia-comm:oper-state;
+        description "Operational state of the address family on this interface";
+      }
+      leaf passive {
+        type boolean;
+        default false;
+        description "Suppress sending/receiving EIGRP hellos for this address family";
+      }
+    }
+  }
+
   grouping eigrp-default-interface-config {
+    uses eigrp-interface-address-family-config;
     leaf admin-state {
       type srl_nokia-comm:admin-state;
       default "enable";
@@ -103,11 +133,23 @@ module srl_nokia-eigrp {
     }
     container authentication {
       description "Authentication configuration applied by default to interfaces";
+      leaf admin-state {
+        type srl_nokia-comm:admin-state;
+        default "enable";
+        description "Administrative state of authentication by default";
+      }
+      leaf oper-state {
+        config false;
+        type srl_nokia-comm:oper-state;
+        description "Operational state of authentication";
+      }
       leaf mode {
         type enumeration {
+          enum none;
           enum md5;
           enum hmac-sha-256;
         }
+        default "none";
         description "Authentication mode for EIGRP packets";
       }
       leaf keychain {
@@ -160,6 +202,7 @@ module srl_nokia-eigrp {
   }
 
   grouping eigrp-interface-config {
+    uses eigrp-interface-address-family-config;
     leaf admin-state {
       type srl_nokia-comm:admin-state;
       description "Administrative state of the EIGRP interface";
@@ -216,11 +259,23 @@ module srl_nokia-eigrp {
     }
     container authentication {
       description "Interface packet authentication configuration";
+      leaf admin-state {
+        type srl_nokia-comm:admin-state;
+        default "enable";
+        description "Administrative state of authentication";
+      }
+      leaf oper-state {
+        config false;
+        type srl_nokia-comm:oper-state;
+        description "Operational state of authentication";
+      }
       leaf mode {
         type enumeration {
+          enum none;
           enum md5;
           enum hmac-sha-256;
         }
+        default "none";
         description "Authentication mode for EIGRP packets";
       }
       leaf keychain {
@@ -456,6 +511,73 @@ module srl_nokia-eigrp {
           description "DUAL SIA timer";
         }
       }
+      container authentication {
+        description "Instance-wide packet authentication configuration";
+        leaf admin-state {
+          type srl_nokia-comm:admin-state;
+          default "enable";
+          description "Administrative state of authentication";
+        }
+        leaf oper-state {
+          config false;
+          type srl_nokia-comm:oper-state;
+          description "Operational state of authentication";
+        }
+        leaf mode {
+          type enumeration {
+            enum none;
+            enum md5;
+            enum hmac-sha-256;
+          }
+          default "none";
+          description "Authentication mode for EIGRP packets";
+        }
+        leaf keychain {
+          type leafref {
+            path "/srl_nokia-system:system/srl_nokia-keychains:authentication/srl_nokia-keychains:keychain/srl_nokia-keychains:name";
+          }
+          description "Reference to system authentication keychain (/system/authentication/keychain)";
+        }
+        leaf authentication-key {
+          type string;
+          description "Direct plaintext authentication key or password";
+        }
+      }
+
+      list address-family {
+        key "name";
+        description "List of address families participating in EIGRP";
+        leaf name {
+          type enumeration {
+            enum ipv4-unicast;
+            enum ipv6-unicast;
+          }
+          description "Address family name";
+        }
+        leaf admin-state {
+          type srl_nokia-comm:admin-state;
+          default "enable";
+          description "Administrative state of the address family";
+        }
+        leaf oper-state {
+          config false;
+          type srl_nokia-comm:oper-state;
+          description "Operational state of the address family";
+        }
+        leaf export-policy {
+          type leafref {
+            path "/srl-rpol:routing-policy/srl-rpol:policy/srl-rpol:name";
+          }
+          description "Export policy for EIGRP route redistribution in this address family";
+        }
+        leaf import-policy {
+          type leafref {
+            path "/srl-rpol:routing-policy/srl-rpol:policy/srl-rpol:name";
+          }
+          description "Import policy for filtering EIGRP routes in this address family";
+        }
+      }
+
       list interface {
         key "interface-name";
         description "List of interfaces participating in EIGRP";
@@ -479,119 +601,6 @@ module srl_nokia-eigrp {
         status deprecated;
         type srl_nokia-comm:ipv4-prefix;
         description "Deprecated: Use interface instead. IPv4 networks participating in EIGRP";
-      }
-      list static-neighbor {
-        key "ip-address";
-        description "Statically configured EIGRP neighbors";
-        leaf ip-address {
-          type srl_nokia-comm:ipv4-address;
-          description "IPv4 address of the static neighbor";
-        }
-        leaf interface {
-          type srl_nokia-comm:subinterface-all;
-          description "Interface connected to the static neighbor";
-        }
-        leaf oper-state {
-          config false;
-          type srl_nokia-comm:oper-state;
-          description "Operational state of the static neighbor";
-        }
-      }
-      container authentication {
-        description "Instance-wide packet authentication configuration";
-        leaf mode {
-          type enumeration {
-            enum md5;
-            enum hmac-sha-256;
-          }
-          description "Authentication mode for EIGRP packets";
-        }
-        leaf keychain {
-          type leafref {
-            path "/srl_nokia-system:system/srl_nokia-keychains:authentication/srl_nokia-keychains:keychain/srl_nokia-keychains:name";
-          }
-          description "Reference to system authentication keychain (/system/authentication/keychain)";
-        }
-        leaf authentication-key {
-          type string;
-          description "Direct plaintext authentication key or password";
-        }
-      }
-
-      container ipv6-unicast {
-        presence "Enable IPv6 unicast address family for EIGRP";
-        description "IPv6 unicast address family configuration";
-        leaf admin-state {
-          type srl_nokia-comm:admin-state;
-          default "enable";
-          description "Administrative state of IPv6 address family";
-        }
-        leaf oper-state {
-          config false;
-          type srl_nokia-comm:oper-state;
-          description "Operational state of IPv6 address family";
-        }
-        leaf export-policy {
-          type leafref {
-            path "/srl-rpol:routing-policy/srl-rpol:policy/srl-rpol:name";
-          }
-          description "Export policy for IPv6 EIGRP route redistribution";
-        }
-        leaf import-policy {
-          type leafref {
-            path "/srl-rpol:routing-policy/srl-rpol:policy/srl-rpol:name";
-          }
-          description "Import policy for filtering IPv6 EIGRP routes";
-        }
-        list interface {
-          key "interface-name";
-          description "List of IPv6 interfaces participating in EIGRP";
-          leaf interface-name {
-            type srl_nokia-comm:subinterface-all;
-            description "Router logical subinterface name";
-          }
-          uses eigrp-interface-config;
-        }
-      }
-
-      list address-family {
-        key "name";
-        description "List of address families participating in EIGRP";
-        leaf name {
-          type string;
-          description "Address family name (e.g. ipv6, ipv6-unicast, ipv4, ipv4-unicast)";
-        }
-        leaf admin-state {
-          type srl_nokia-comm:admin-state;
-          default "enable";
-          description "Administrative state of the address family";
-        }
-        leaf oper-state {
-          config false;
-          type srl_nokia-comm:oper-state;
-          description "Operational state of the address family";
-        }
-        leaf export-policy {
-          type leafref {
-            path "/srl-rpol:routing-policy/srl-rpol:policy/srl-rpol:name";
-          }
-          description "Export policy for EIGRP route redistribution";
-        }
-        leaf import-policy {
-          type leafref {
-            path "/srl-rpol:routing-policy/srl-rpol:policy/srl-rpol:name";
-          }
-          description "Import policy for filtering EIGRP routes";
-        }
-        list interface {
-          key "interface-name";
-          description "List of interfaces participating in this address family";
-          leaf interface-name {
-            type srl_nokia-comm:subinterface-all;
-            description "Router logical subinterface name";
-          }
-          uses eigrp-interface-config;
-        }
       }
 
       // Operational state leaves and lists directly under eigrp:
@@ -643,6 +652,23 @@ module srl_nokia-eigrp {
         leaf rib-scale { type uint8; description "RIB scale factor used to derive metric"; }
         leaf external { type boolean; }
         leaf preference { type uint8; }
+      }
+      list static-neighbor {
+        key "ip-address";
+        description "Statically configured EIGRP neighbors";
+        leaf ip-address {
+          type srl_nokia-comm:ipv4-address;
+          description "IPv4 address of the static neighbor";
+        }
+        leaf interface {
+          type srl_nokia-comm:subinterface-all;
+          description "Interface connected to the static neighbor";
+        }
+        leaf oper-state {
+          config false;
+          type srl_nokia-comm:oper-state;
+          description "Operational state of the static neighbor";
+        }
       }
       list topology {
         key "destination";

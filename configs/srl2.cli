@@ -40,6 +40,8 @@ delete / acl acl-filter cpm type ipv6 entry 88
 / network-instance default protocols eigrp admin-state enable
 / network-instance default protocols eigrp autonomous-system 100
 / network-instance default protocols eigrp router-id 192.0.2.2
+/ network-instance default protocols eigrp address-family ipv4-unicast admin-state enable
+/ network-instance default protocols eigrp address-family ipv6-unicast admin-state enable
 / network-instance default protocols eigrp default-interface admin-state enable
 / network-instance default protocols eigrp interface ethernet-1/1.0 admin-state enable
 / network-instance default protocols eigrp interface system0.0 admin-state enable passive true
@@ -51,6 +53,7 @@ delete / acl acl-filter cpm type ipv6 entry 88
 / network-instance vrf-1 protocols eigrp admin-state enable
 / network-instance vrf-1 protocols eigrp autonomous-system 200
 / network-instance vrf-1 protocols eigrp router-id 192.0.2.22
+/ network-instance vrf-1 protocols eigrp address-family ipv4-unicast admin-state enable
 / network-instance vrf-1 protocols eigrp default-interface admin-state enable
 / network-instance vrf-1 protocols eigrp interface ethernet-1/1.1 admin-state enable
 / network-instance vrf-1 protocols eigrp interface lo0.1 admin-state enable passive true

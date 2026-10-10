@@ -600,3 +600,92 @@ class Plugin(CliPlugin):
             output.print_line("-" * 80)
             output.print_line(f"Total Interfaces Monitored: {len(traffic)}")
             output.print_line("=" * 80)
+
+
+###########################################################################
+# State Query & Context Hook for EIGRP
+# Ensures exact-path queries in candidate/running/state mode resolve
+# correctly through SR Linux's NDK telemetry delivery nodes.
+###########################################################################
+try:
+    from srlinux.mgmt.cli.plugins.info import InfoPrinter, DataStore
+    _orig_info_get_data = InfoPrinter.get_data
+
+    def _eigrp_info_get_data(self):
+        req_path = self.path
+        path_str = str(req_path)
+        if self.data_store == DataStore.State and "protocols/eigrp" in path_str:
+            parts = []
+            in_eigrp = False
+            has_exact = False
+            for el in req_path.iterate_node_elements():
+                if in_eigrp and el.keys:
+                    if any(v != "*" for v in el.keys.values()):
+                        has_exact = True
+                    wild_keys = {k: "*" for k in el.keys}
+                    kstr = "".join(f"[{k}={v}]" for k, v in wild_keys.items())
+                    parts.append(f"{el.name}{kstr}")
+                else:
+                    kstr = "".join(f"[{k}={v}]" for k, v in el.keys.items()) if el.keys else ""
+                    parts.append(f"{el.name}{kstr}")
+                if el.name == "eigrp":
+                    in_eigrp = True
+            if has_exact:
+                wildcard_path = build_path("/" + "/".join(parts))
+                saved_path = self.path
+                self.path = wildcard_path
+                try:
+                    return _orig_info_get_data(self)
+                finally:
+                    self.path = saved_path
+        return _orig_info_get_data(self)
+
+    InfoPrinter.get_data = _eigrp_info_get_data
+except Exception:
+    pass
+
+try:
+    from srlinux.mgmt.cli.plugins.any_schema import NodeExistenceChecker
+    from srlinux.mgmt.cli.cli_mode import CliMode
+    _orig_node_exists = NodeExistenceChecker._exists
+
+    def _eigrp_node_exists(self, path):
+        if _orig_node_exists(self, path):
+            return True
+        path_str = str(path)
+        if "protocols/eigrp" in path_str and getattr(self._state, "mode", None) == CliMode.State:
+            parts = []
+            in_eigrp = False
+            has_exact = False
+            for el in path.iterate_node_elements():
+                if in_eigrp and el.keys:
+                    if any(v != "*" for v in el.keys.values()):
+                        has_exact = True
+                    wild_keys = {k: "*" for k in el.keys}
+                    kstr = "".join(f"[{k}={v}]" for k, v in wild_keys.items())
+                    parts.append(f"{el.name}{kstr}")
+                else:
+                    kstr = "".join(f"[{k}={v}]" for k, v in el.keys.items()) if el.keys else ""
+                    parts.append(f"{el.name}{kstr}")
+                if el.name == "eigrp":
+                    in_eigrp = True
+            if has_exact:
+                wildcard_path = build_path("/" + "/".join(parts))
+                all_server_paths = self._state.server_data_store.get_configuration(
+                    wildcard_path,
+                    recursive=False,
+                    include_field_defaults=True,
+                    include_container_parents=True,
+                    limit=100
+                )
+                for server_path in all_server_paths:
+                    if server_path.is_field and server_path.parent:
+                        server_path = server_path.parent
+                    if path == server_path:
+                        return True
+        return False
+
+    NodeExistenceChecker._exists = _eigrp_node_exists
+except Exception:
+    pass
+
