@@ -186,85 +186,145 @@ def _match_prefix(route_pfx_str, target_pfx):
     return route_pfx_str.startswith(target_pfx)
 
 
-def _patch_route_table_formatter():
+def register_route_type_override(route_owner, display_name, has_routes_checker=None):
+    """
+    Registers a custom routing process with the SR Linux CLI Route Display Pipeline.
+    
+    This function provides an open, cooperative registration mechanism so any
+    NDK routing daemon (e.g. srl_eigrpd, srl_babel, srl_openfabric) can register its
+    route_owner string to have its routes displayed with its native protocol name (e.g. 'eigrp')
+    instead of generic 'ndk1' across all standard SR Linux route show commands (table,
+    detail, summary, and JSON/YAML streams), without modifying any files in /opt/srlinux/.
+    
+    Other plugins can call this function directly, import it, or invoke:
+      DataChildrenOfType.register_route_type_override(route_owner, display_name, has_routes_checker)
+    """
     try:
         from srlinux.data.data import DataChildrenOfType
-        if not getattr(DataChildrenOfType, "_srl_eigrp_hooked", False):
-            orig_create = DataChildrenOfType.create
 
-            def hooked_create(self, *args, **kwargs):
-                schema_name = getattr(getattr(self, "schema", None), "name", None)
-                if schema_name == "ip route":
-                    try:
-                        keys = self._get_keys(*args, **kwargs)
-                        if keys.get("route_owner") == "srl_eigrpd" and keys.get("route_type") == "ndk1":
-                            keys["route_type"] = "eigrp"
-                            current_item = self._get_sanitized_or_none(keys)
-                            if current_item:
-                                return current_item
-                            self._check_modifications_are_allowed()
-                            return self._create(False, keys)
-                    except Exception:
-                        pass
-                elif schema_name == "routesummary":
-                    try:
-                        keys = self._get_keys(*args, **kwargs)
-                        if keys.get("route_type") == "ndk1":
-                            netinst_name = getattr(getattr(self, "parent", None), "name", "default")
-                            st = load_state(netinst=netinst_name)
-                            if st and (st.get("routes") or st.get("route")):
-                                keys["route_type"] = "eigrp"
-                                current_item = self._get_sanitized_or_none(keys)
-                                if current_item:
-                                    return current_item
-                                self._check_modifications_are_allowed()
-                                return self._create(False, keys)
-                    except Exception:
-                        pass
-                return orig_create(self, *args, **kwargs)
+        if not hasattr(DataChildrenOfType, "_srl_route_type_overrides"):
+            DataChildrenOfType._srl_route_type_overrides = {}
+        if not hasattr(DataChildrenOfType, "_srl_route_summary_checkers"):
+            DataChildrenOfType._srl_route_summary_checkers = {}
 
-            DataChildrenOfType.create = hooked_create
-            DataChildrenOfType._srl_eigrp_hooked = True
+        DataChildrenOfType._srl_route_type_overrides[route_owner] = display_name
+        if has_routes_checker:
+            DataChildrenOfType._srl_route_summary_checkers[display_name] = has_routes_checker
+
+        _install_generic_route_wrappers()
+    except Exception:
+        pass
+
+
+def _install_generic_route_wrappers():
+    """
+    Installs the generic, multi-tenant middleware wrappers on SR Linux's shared
+    in-memory row construction and formatting classes.
+    
+    Once installed by the first routing plugin, any subsequent plugins simply
+    register into the shared registry without creating duplicate or conflicting wrappers.
+    """
+    try:
+        from srlinux.data.data import DataChildrenOfType
+
+        if getattr(DataChildrenOfType, "_srl_generic_route_hooked", False):
+            return
+
+        orig_create = DataChildrenOfType.create
+
+        def generic_hooked_create(self, *args, **kwargs):
+            schema_name = getattr(getattr(self, "schema", None), "name", None)
+            overrides = getattr(DataChildrenOfType, "_srl_route_type_overrides", {})
+
+            if schema_name == "ip route" and overrides:
+                try:
+                    keys = self._get_keys(*args, **kwargs)
+                    owner = keys.get("route_owner")
+                    if owner in overrides and keys.get("route_type") == "ndk1":
+                        keys["route_type"] = overrides[owner]
+                        current_item = self._get_sanitized_or_none(keys)
+                        if current_item:
+                            return current_item
+                        self._check_modifications_are_allowed()
+                        return self._create(False, keys)
+                except Exception:
+                    pass
+            elif schema_name == "routesummary" and overrides:
+                try:
+                    keys = self._get_keys(*args, **kwargs)
+                    if keys.get("route_type") == "ndk1":
+                        netinst_name = getattr(getattr(self, "parent", None), "name", "default")
+                        checkers = getattr(DataChildrenOfType, "_srl_route_summary_checkers", {})
+                        for disp_name, checker in checkers.items():
+                            try:
+                                if checker(netinst_name):
+                                    keys["route_type"] = disp_name
+                                    current_item = self._get_sanitized_or_none(keys)
+                                    if current_item:
+                                        return current_item
+                                    self._check_modifications_are_allowed()
+                                    return self._create(False, keys)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+            return orig_create(self, *args, **kwargs)
+
+        DataChildrenOfType.create = generic_hooked_create
+        DataChildrenOfType._srl_generic_route_hooked = True
+        DataChildrenOfType.register_route_type_override = staticmethod(register_route_type_override)
     except Exception:
         pass
 
     try:
         from srlinux.data.column_formatter import _Formatter
-        if not getattr(_Formatter, "_srl_eigrp_hooked", False):
+        if not getattr(_Formatter, "_srl_generic_route_hooked", False):
             orig_add = _Formatter.add
 
-            def hooked_add(self, column):
+            def generic_hooked_add(self, column):
+                from srlinux.data.data import DataChildrenOfType
+                overrides = getattr(DataChildrenOfType, "_srl_route_type_overrides", {})
+
                 if getattr(column, "schema", None) and getattr(column.schema, "name", None) == "ip route":
-                    if hasattr(column, "route_owner") and column.route_owner == "srl_eigrpd":
+                    owner = getattr(column, "route_owner", None)
+                    if owner in overrides:
                         try:
-                            column._keys.set_sanitized("route_type", "eigrp")
+                            column._keys.set_sanitized("route_type", overrides[owner])
                         except Exception:
                             pass
                 elif getattr(column, "schema", None) and getattr(column.schema, "name", None) == "routesummary":
-                    try:
-                        if column._keys.get("route_type") == "ndk1":
-                            column._keys.set_sanitized("route_type", "eigrp")
-                    except Exception:
-                        pass
+                    if column._keys.get("route_type") == "ndk1":
+                        netinst_name = getattr(getattr(column, "parent", None), "name", "default")
+                        checkers = getattr(DataChildrenOfType, "_srl_route_summary_checkers", {})
+                        for disp_name, checker in checkers.items():
+                            try:
+                                if checker(netinst_name):
+                                    column._keys.set_sanitized("route_type", disp_name)
+                                    break
+                            except Exception:
+                                pass
                 return orig_add(self, column)
 
-            _Formatter.add = hooked_add
-            _Formatter._srl_eigrp_hooked = True
+            _Formatter.add = generic_hooked_add
+            _Formatter._srl_generic_route_hooked = True
     except Exception:
         pass
 
     try:
         from srlinux.mgmt.cli.plugins.reports.ip_route_detail import IpRouteDetailReport
-        if not getattr(IpRouteDetailReport, "_srl_eigrp_hooked", False):
+        if not getattr(IpRouteDetailReport, "_srl_generic_route_hooked", False):
             orig_populate_route_fields = IpRouteDetailReport._populate_route_fields
 
-            def hooked_populate_route_fields(self, data, ip_route, state):
+            def generic_hooked_populate_route_fields(self, data, ip_route, state):
                 orig_populate_route_fields(self, data, ip_route, state)
-                if getattr(ip_route, "route_owner", None) == "srl_eigrpd":
-                    data.route_type = "eigrp"
+                from srlinux.data.data import DataChildrenOfType
+                overrides = getattr(DataChildrenOfType, "_srl_route_type_overrides", {})
+                owner = getattr(ip_route, "route_owner", None)
+                if owner in overrides:
+                    data.route_type = overrides[owner]
 
-            IpRouteDetailReport._populate_route_fields = hooked_populate_route_fields
-            IpRouteDetailReport._srl_eigrp_hooked = True
+            IpRouteDetailReport._populate_route_fields = generic_hooked_populate_route_fields
+            IpRouteDetailReport._srl_generic_route_hooked = True
     except Exception:
         pass
 
@@ -279,7 +339,16 @@ class Plugin(CliPlugin):
         ]
 
     def load(self, cli, **_kwargs):
-        _patch_route_table_formatter()
+        # Register EIGRP with the shared, multi-tenant route display registry
+        def _eigrp_has_routes_in_netinst(netinst_name):
+            st = load_state(netinst=netinst_name)
+            return bool(st and (st.get("routes") or st.get("route")))
+
+        register_route_type_override(
+            route_owner="srl_eigrpd",
+            display_name="eigrp",
+            has_routes_checker=_eigrp_has_routes_in_netinst
+        )
 
         network = cli.show_mode.root.get_command("network-instance")
         protocols = network.get_command("protocols")
