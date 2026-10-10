@@ -77,10 +77,10 @@ def test_dataplane_ping_frr_to_srl(srl_exec):
 
 def test_show_eigrp_cli_frr(srl_exec):
     """Verify SRL1 CLI show reports for FRR peering."""
-    out_status = srl_exec("clab-srl-frr-eigrp-srl1", [
-        "sr_cli", "show network-instance default protocols eigrp status"
+    out_summary = srl_exec("clab-srl-frr-eigrp-srl1", [
+        "sr_cli", "show network-instance default protocols eigrp summary"
     ])
-    assert "Autonomous System" in out_status and "100" in out_status, f"CLI status show failed: {out_status}"
+    assert "Autonomous System" in out_summary and "100" in out_summary, f"CLI summary show failed: {out_summary}"
 
     out_nbr = srl_exec("clab-srl-frr-eigrp-srl1", [
         "sr_cli", "show network-instance default protocols eigrp neighbor"

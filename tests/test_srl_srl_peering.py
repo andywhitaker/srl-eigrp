@@ -39,10 +39,10 @@ def test_dataplane_ping(srl_exec):
 
 def test_show_eigrp_cli(srl_exec):
     """Verify SR Linux CLI show network-instance default protocols eigrp ... commands."""
-    out_status = srl_exec("clab-srl-srl-eigrp-srl1", [
-        "sr_cli", "show network-instance default protocols eigrp status"
+    out_summary = srl_exec("clab-srl-srl-eigrp-srl1", [
+        "sr_cli", "show network-instance default protocols eigrp summary"
     ])
-    assert "Autonomous System" in out_status and "100" in out_status, f"Status failed: {out_status}"
+    assert "Autonomous System" in out_summary and "100" in out_summary, f"Summary failed: {out_summary}"
 
     out_nbr = srl_exec("clab-srl-srl-eigrp-srl1", [
         "sr_cli", "show network-instance default protocols eigrp neighbor"
@@ -404,10 +404,10 @@ def test_vrf1_dataplane_ping(srl_exec):
 
 def test_vrf1_show_cli(srl_exec):
     """Verify SR Linux CLI show network-instance vrf-1 protocols eigrp commands."""
-    out_status = srl_exec("clab-srl-srl-eigrp-srl1", [
-        "sr_cli", "show network-instance vrf-1 protocols eigrp status"
+    out_summary = srl_exec("clab-srl-srl-eigrp-srl1", [
+        "sr_cli", "show network-instance vrf-1 protocols eigrp summary"
     ])
-    assert "Autonomous System" in out_status and "200" in out_status, f"VRF-1 status failed: {out_status}"
+    assert "Autonomous System" in out_summary and "200" in out_summary, f"VRF-1 summary failed: {out_summary}"
 
     out_nbr = srl_exec("clab-srl-srl-eigrp-srl1", [
         "sr_cli", "show network-instance vrf-1 protocols eigrp neighbor"

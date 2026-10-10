@@ -96,7 +96,7 @@ The package includes native CLI plugins extending both `show` and `tools` operat
 
 | Command | Description |
 | :--- | :--- |
-| `show ... protocols eigrp status` | Overall daemon status, Autonomous System, Router ID, admin/oper state, neighbor/route summary counts |
+| `show ... protocols eigrp summary` | Overall daemon status, Autonomous System, Router ID, admin/oper state, neighbor/route summary counts |
 | `show ... protocols eigrp neighbor [ip]` | Active neighbors table, or detailed view for a specific neighbor IP (timers, SRTT, RTO, learned routes) |
 | `show ... protocols eigrp interfaces [name]` | Participating interfaces table, or detailed view for a specific interface (device name, IPs, traffic stats) |
 | `show ... protocols eigrp routes` | Routes programmed in FIB, next-hops, composite metric, route type (Internal/External), and preference |
@@ -432,7 +432,7 @@ make deploy-srl
 make test-srl
 ```
 **38 Automated Tests Executed (100% Pass Rate):**
-- **IPv4 Default Instance**: Neighbor discovery, FIB route injection (preference 90), data plane ping, CLI show status/neighbor/routes/interfaces/topology/traffic, State DB verification, CPM filter validation, tools neighbor clear & reset-all.
+- **IPv4 Default Instance**: Neighbor discovery, FIB route injection (preference 90), data plane ping, CLI show summary/neighbor/routes/interfaces/topology/traffic, State DB verification, CPM filter validation, tools neighbor clear & reset-all.
 - **Config & Policy Enhancements**: Default-interface configuration, passive interface inheritance, named metrics keys, routing-policy metric augmentation, dynamic interface deletion and re-addition.
 - **Dual Admin/Oper State & Summarization**: Dual administrative and operational state modeling across all administrative controls, and dynamic summary-address tracking in State DB.
 - **Multi-VRF (`ip-vrf`)**: Secondary VRF (`vrf-1`) neighbor peering, isolated FIB injection, dataplane ping, CLI show reports, State DB streaming, and operational tools.

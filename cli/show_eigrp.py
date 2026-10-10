@@ -2,7 +2,6 @@
 ###########################################################################
 # Nokia SR Linux CLI Plugin: EIGRP Show Reports
 # Supports:
-#   show network-instance <name> protocols eigrp status
 #   show network-instance <name> protocols eigrp summary
 #   show network-instance <name> protocols eigrp neighbor [neighbor-ip]
 #   show network-instance <name> protocols eigrp routes
@@ -185,18 +184,11 @@ class Plugin(CliPlugin):
                 update_location=True
             )
 
-        if not eigrp.has_command("status"):
-            eigrp.add_command(
-                Syntax("status", help="Show EIGRP protocol status and instance details"),
-                update_location=False,
-                callback=self.show_status
-            )
-
         if not eigrp.has_command("summary"):
             eigrp.add_command(
-                Syntax("summary", help="Show EIGRP summary"),
+                Syntax("summary", help="Show EIGRP protocol summary and instance details"),
                 update_location=False,
-                callback=self.show_status
+                callback=self.show_summary
             )
 
         if not eigrp.has_command("neighbor"):
@@ -238,7 +230,7 @@ class Plugin(CliPlugin):
                 callback=self.show_traffic
             )
 
-    def show_status(self, state, arguments, output, **kwargs):
+    def show_summary(self, state, arguments, output, **kwargs):
         netinst_arg = arguments.get_value_or("network-instance", "name", "default")
         instances = get_target_instances(state=state, netinst_arg=netinst_arg)
 
@@ -246,11 +238,11 @@ class Plugin(CliPlugin):
             data = load_state(state=state, netinst=netinst)
 
             output.print_line("=" * 80)
-            output.print_line(f"EIGRP Status for Network-Instance: {netinst}")
+            output.print_line(f"EIGRP Summary for Network-Instance: {netinst}")
             output.print_line("=" * 80)
 
             if not data:
-                output.print_line("Status: EIGRP daemon not running or not configured.")
+                output.print_line("Summary: EIGRP daemon not running or not configured.")
                 output.print_line("=" * 80)
                 continue
 
@@ -282,6 +274,8 @@ class Plugin(CliPlugin):
             output.print_line(f"{'Graceful Restart':<24}: {gr_oper}")
             output.print_line(f"{'Last Telemetry Update':<24}: {updated}")
             output.print_line("=" * 80)
+ 
+    show_status = show_summary
 
     def show_neighbor(self, state, arguments, output, **kwargs):
         netinst_arg = arguments.get_value_or("network-instance", "name", "default")
