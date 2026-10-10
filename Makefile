@@ -15,8 +15,7 @@ build: cshim
 
 package: build
 	mkdir -p dist
-	docker run --rm -v $(CURDIR):/tmp -w /tmp goreleaser/nfpm:latest package --config nfpm.yaml --target dist/srl-eigrpd_0.1.0_linux_amd64.deb
-	cp -f dist/srl-eigrpd_0.1.0_linux_amd64.deb dist/srl-eigrpd_0.1.0_amd64.deb 2>/dev/null || true
+	docker run --rm -v $(CURDIR):/tmp -w /tmp goreleaser/nfpm:latest package --config nfpm.yaml --target dist/srl-eigrpd_0.1.0_amd64.deb
 
 deploy-srl: package
 	sudo clab deploy -t topologies/srl-srl.clab.yml --reconfigure

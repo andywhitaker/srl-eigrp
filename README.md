@@ -19,7 +19,7 @@ Copy the Debian package to your SR Linux device and install it:
 
 ```bash
 # On your SR Linux bash shell:
-sudo dpkg -i srl-eigrpd_0.1.0_linux_amd64.deb
+sudo dpkg -i srl-eigrpd_0.1.0_amd64.deb
 ```
 > [!NOTE]
 > The package installer automatically verifies your Control Plane Protection (CPM) filter, registers the YANG data models, and integrates with the SR Linux Application Manager (`app_mgr`).
@@ -469,4 +469,4 @@ make all
 # Clean build artifacts
 make clean
 ```
-The output `.deb` package will be created in `dist/srl-eigrpd_0.1.0_linux_amd64.deb`.
+The output `.deb` package will be created in `dist/srl-eigrpd_0.1.0_amd64.deb`.
