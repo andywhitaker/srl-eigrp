@@ -141,6 +141,20 @@ func buildInterfaceData(
 		"next-hop-self":  nextHopSelf,
 	}
 
+	if operState != "up" {
+		downReason := "interface admin disabled"
+		if adminState == "enable" {
+			if instOperState == "down" {
+				downReason = "protocol instance down"
+			} else if ipAddr == "" {
+				downReason = "no IP address configured"
+			} else {
+				downReason = "link down or inactive"
+			}
+		}
+		data["oper-down-reason"] = downReason
+	}
+
 	if ipAddr != "" {
 		data["ip-address"] = ipAddr
 		data["prefix-length"] = prefixLen
@@ -303,6 +317,15 @@ func publishInterfaceSublists(
 			"oper-state":  operStateStr,
 			"passive":     afPassive,
 		}
+		if operStateStr != "up" {
+			if adminStateStr == "disable" {
+				afData["oper-down-reason"] = "address-family admin disabled"
+			} else if instOperState == "down" {
+				afData["oper-down-reason"] = "protocol instance down"
+			} else {
+				afData["oper-down-reason"] = "interface down or unnumbered"
+			}
+		}
 		if b, err := json.Marshal(afData); err == nil {
 			*states = append(*states, &ndk.TelemetryInfo{
 				Key:  &ndk.TelemetryKey{JsPath: afIfKey},
@@ -407,12 +430,6 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 		networks := make([]string, len(inst.networks))
 		copy(networks, inst.networks)
 
-		sort.Slice(nbrList, func(i, j int) bool { return nbrList[i].IPAddress < nbrList[j].IPAddress })
-		sort.Slice(routeList, func(i, j int) bool { return routeList[i].Prefix < routeList[j].Prefix })
-		sort.Slice(intfList, func(i, j int) bool { return normalizeIfName(intfList[i].Name) < normalizeIfName(intfList[j].Name) })
-		sort.Slice(trafficList, func(i, j int) bool { return normalizeIfName(trafficList[i].Interface) < normalizeIfName(trafficList[j].Interface) })
-		sort.Slice(topoList, func(i, j int) bool { return topoList[i].Destination < topoList[j].Destination })
-
 		adminState := inst.adminState
 		if adminState == "" {
 			adminState = "enable"
@@ -421,6 +438,67 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 		if adminState == "disable" || inst.asn == 0 {
 			operState = "down"
 		}
+
+		for _, n := range nbrList {
+			if n.State != "Up" && n.State != "up" && n.OperDownReason == "" {
+				n.OperDownReason = "hold-timer expired or peering down"
+			}
+		}
+
+		seenIntfsSnapshot := make(map[string]bool)
+		for _, i := range intfList {
+			norm := normalizeIfName(i.Name)
+			seenIntfsSnapshot[norm] = true
+			if i.OperState != "up" && i.OperState != "Up" && i.OperDownReason == "" {
+				if i.AdminState == "disable" {
+					i.OperDownReason = "interface admin disabled"
+				} else if operState == "down" {
+					i.OperDownReason = "protocol instance down"
+				} else if i.IPAddress == "" {
+					i.OperDownReason = "no IP address configured"
+				} else {
+					i.OperDownReason = "link down or inactive"
+				}
+			}
+		}
+		for rawIfName, ic := range inst.configuredInterfaces {
+			norm := normalizeIfName(rawIfName)
+			if seenIntfsSnapshot[norm] {
+				continue
+			}
+			seenIntfsSnapshot[norm] = true
+			adminSt := "enable"
+			if ic != nil && ic.AdminState != "" {
+				adminSt = ic.AdminState
+			}
+			operSt := "down"
+			downReason := "interface admin disabled"
+			if adminSt == "enable" {
+				if operState == "down" {
+					downReason = "protocol instance down"
+				} else {
+					downReason = "no IP address configured"
+				}
+			}
+			intfList = append(intfList, &InterfaceInfo{
+				Name:           rawIfName,
+				InterfaceName:  norm,
+				AdminState:     adminSt,
+				IPAddress:      "",
+				PrefixLen:      0,
+				OperState:      operSt,
+				OperDownReason: downReason,
+				BfdState:       "disabled",
+				AuthMode:       "none",
+				Passive:        ic != nil && ic.Passive != nil && *ic.Passive,
+			})
+		}
+
+		sort.Slice(nbrList, func(i, j int) bool { return nbrList[i].IPAddress < nbrList[j].IPAddress })
+		sort.Slice(routeList, func(i, j int) bool { return routeList[i].Prefix < routeList[j].Prefix })
+		sort.Slice(intfList, func(i, j int) bool { return normalizeIfName(intfList[i].Name) < normalizeIfName(intfList[j].Name) })
+		sort.Slice(trafficList, func(i, j int) bool { return normalizeIfName(trafficList[i].Interface) < normalizeIfName(trafficList[j].Interface) })
+		sort.Slice(topoList, func(i, j int) bool { return topoList[i].Destination < topoList[j].Destination })
 
 		variance := inst.variance
 		if variance == 0 {
@@ -796,6 +874,15 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 			"timers":            timersData,
 			"metrics":           metricsData,
 		}
+		if item.operState != "up" {
+			if item.adminState == "disable" {
+				topData["oper-down-reason"] = "protocol admin disabled"
+			} else if item.asn == 0 {
+				topData["oper-down-reason"] = "autonomous system not configured"
+			} else {
+				topData["oper-down-reason"] = "instance initializing or inactive"
+			}
+		}
 		if item.asn > 0 {
 			topData["autonomous-system"] = item.asn
 		}
@@ -829,12 +916,6 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 			}
 			topData["authentication"] = authMap
 		}
-		if item.exportPolicy != "" {
-			topData["export-policy"] = item.exportPolicy
-		}
-		if item.importPolicy != "" {
-			topData["import-policy"] = item.importPolicy
-		}
 		if b, err := json.Marshal(topData); err == nil {
 			states = append(states, &ndk.TelemetryInfo{
 				Key:  &ndk.TelemetryKey{JsPath: topKey},
@@ -862,6 +943,9 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 				"ip-address": sn.IPAddress,
 				"interface":  normalizeIfName(sn.Interface),
 				"oper-state": operState,
+			}
+			if operState != "up" {
+				snData["oper-down-reason"] = "neighbor unreachable or inactive"
 			}
 			if b, err := json.Marshal(snData); err == nil {
 				states = append(states, &ndk.TelemetryInfo{
@@ -899,6 +983,9 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 				"bfd-state":     bfdSt,
 				"restart-state": rstSt,
 				"auth-mode":     authMd,
+			}
+			if n.State != "Up" && n.State != "up" {
+				nbrData["oper-down-reason"] = "hold-timer expired or peering down"
 			}
 			if b, err := json.Marshal(nbrData); err == nil {
 				states = append(states, &ndk.TelemetryInfo{
@@ -1064,6 +1151,13 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 				"name":        afName,
 				"admin-state": afAdmin,
 				"oper-state":  afOper,
+			}
+			if afOper != "up" {
+				if afAdmin == "disable" {
+					afData["oper-down-reason"] = "address-family admin disabled"
+				} else {
+					afData["oper-down-reason"] = "protocol instance down"
+				}
 			}
 			if expPol != "" {
 				afData["export-policy"] = expPol

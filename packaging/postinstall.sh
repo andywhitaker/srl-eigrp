@@ -3,6 +3,12 @@ chmod +x /usr/local/bin/srl-eigrpd
 
 # Auto-provision CPM filter entry for protocol 88 safely if 'cpm' filter is present
 if command -v sr_cli >/dev/null 2>&1; then
+    for i in {1..15}; do
+        if sr_cli "show version" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
     python3 - << 'EOF' || true
 import subprocess
 import re
@@ -71,3 +77,13 @@ fi
 
 # Reload application manager so YANG schemas and new binary are picked up
 sr_cli "tools system app-management application app_mgr reload" >/dev/null 2>&1 || true
+
+# Wait until YANG reload has completed and candidate mode is available
+if command -v sr_cli >/dev/null 2>&1; then
+    for i in {1..20}; do
+        if sr_cli -e "quit" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+fi

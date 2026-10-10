@@ -14,7 +14,9 @@ This daemon (`srl-eigrpd`) runs as an in-process protocol agent inside SR Linux,
 
 Loading EIGRP onto your Nokia SR Linux switch or container takes less than two minutes.
 
-### Step 1: Install the Package
+### Step 1: Install the Package (Pre-Built Binary or Build from Source)
+You can either download the pre-built release package (`srl-eigrpd_0.1.0_amd64.deb`) or compile it from source using `make package`.
+
 Copy the Debian package to your SR Linux device and install it:
 
 ```bash
@@ -23,6 +25,26 @@ sudo dpkg -i srl-eigrpd_0.1.0_amd64.deb
 ```
 > [!NOTE]
 > The package installer automatically verifies your Control Plane Protection (CPM) filter, registers the YANG data models, and integrates with the SR Linux Application Manager (`app_mgr`).
+
+#### Containerlab Automated Deployment Recipe
+When automating lab deployments in Containerlab, SR Linux management services initialize asynchronously. To prevent startup race conditions (such as attempting package installation before the CLI is ready, or applying candidate commits during YANG schema reloads), use the following verified startup pipeline on your containerlab nodes:
+
+```yaml
+topology:
+  kinds:
+    nokia_srlinux:
+      binds:
+        - srl-eigrpd_0.1.0_amd64.deb:/tmp/srl-eigrpd.deb:ro
+  nodes:
+    srl1:
+      kind: nokia_srlinux
+      image: ghcr.io/nokia/srlinux:latest
+      binds:
+        - startup/srl1.cfg:/tmp/startup.cli:ro
+      exec:
+        - bash -c 'until sr_cli "show version" >/dev/null 2>&1; do sleep 1; done; dpkg -i /tmp/srl-eigrpd.deb; sleep 10; sr_cli -ec < /tmp/startup.cli'
+```
+This loop ensures `sr_cli` is responsive, installs the Debian package cleanly, permits the Application Manager to finalize its dynamic YANG schema reload, and then commits the startup configuration without error.
 
 ---
 
@@ -45,17 +67,18 @@ set / network-instance default protocols eigrp autonomous-system 100
 set / network-instance default protocols eigrp router-id 192.0.2.1
 
 # 4. Set global default interface settings (optional)
-set / network-instance default protocols eigrp default-interface admin-state enable
 set / network-instance default protocols eigrp default-interface hello-interval 5
 set / network-instance default protocols eigrp default-interface hold-time 15
 
-# 5. Enable EIGRP on specific interfaces (inherits default-interface settings)
-set / network-instance default protocols eigrp interface ethernet-1/1.0 admin-state enable
-set / network-instance default protocols eigrp interface system0.0 admin-state enable
+# 5. Enable EIGRP on specific interfaces (admin-state defaults to enable!)
+set / network-instance default protocols eigrp interface ethernet-1/1.0
 set / network-instance default protocols eigrp interface system0.0 passive true
 
 commit now
 ```
+
+> [!TIP]
+> **Zero Boilerplate:** According to the YANG schema defaults, interface `admin-state` defaults directly to `enable`. Simply creating the interface under `/ network-instance <name> protocols eigrp interface <name>` immediately brings it up without requiring an explicit `admin-state enable` command.
 
 ---
 
@@ -92,16 +115,31 @@ P 192.0.2.2/32, 1 successors, FD is 7864320
 
 The package includes native CLI plugins extending both `show` and `tools` operational modes.
 
-### Show Commands (`show network-instance <name> protocols eigrp ...`)
+### Show Commands (`show network-instance <name> protocols eigrp ...` & `route-table`)
 
 | Command | Description |
 | :--- | :--- |
-| `show ... protocols eigrp summary` | Overall daemon status, Autonomous System, Router ID, admin/oper state, neighbor/route summary counts |
-| `show ... protocols eigrp neighbor [ip]` | Active neighbors table, or detailed view for a specific neighbor IP (timers, SRTT, RTO, learned routes) |
-| `show ... protocols eigrp interfaces [name]` | Participating interfaces table, or detailed view for a specific interface (device name, IPs, traffic stats) |
+| `show ... protocols eigrp summary` | Overall daemon status, Autonomous System, Router ID, admin/oper state, neighbor/route summary counts, down reasons |
+| `show ... protocols eigrp neighbor [ip]` | Active neighbors table, or detailed view for a specific neighbor IP (timers, SRTT, RTO, learned routes, down reasons) |
+| `show ... protocols eigrp interfaces [name]` | Participating interfaces table, or detailed view for a specific interface (device name, IPs, traffic stats, down reasons) |
 | `show ... protocols eigrp routes` | Routes programmed in FIB, next-hops, composite metric, route type (Internal/External), and preference |
 | `show ... protocols eigrp topology` | DUAL topology table showing passive/active prefixes, successor count, Feasible Distance (FD), and Reported Distance (RD) |
 | `show ... protocols eigrp traffic` | Interface packet counters (reliable/unreliable multicast, unicast, retransmissions, CR packets) |
+| `show ... route-table eigrp` | Standard SR Linux route-table filtered exclusively for active EIGRP FIB entries |
+| `show ... ipv4 route` | Native Nokia IPv4 route table showing installed EIGRP prefixes |
+| `show ... ipv6 route` | Native Nokia IPv6 route table showing installed EIGRP IPv6 prefixes |
+
+```text
+A:srl1# show network-instance default route-table eigrp
+================================================================================
+Route Table for Network-Instance: default (EIGRP Active Routes)
+--------------------------------------------------------------------------------
+Prefix           Next-Hop         Metric     Preference Type       State   
+--------------------------------------------------------------------------------
+5.5.5.5/32       10.2.3.3         8519680    90         Internal   Active  
+5.5.5.5/32       10.2.4.4         8519680    90         Internal   Active  
+================================================================================
+```
 
 ### Tools Commands (`tools network-instance <name> protocols eigrp ...`)
 
@@ -343,6 +381,74 @@ Verify IPv6 neighbors and routes:
 show network-instance default protocols eigrp neighbor
 show network-instance default ipv6 route
 ```
+
+### 16. Actionable Operational Down Reasons
+In production environments, identifying why an adjacency failed to establish or why an interface is inactive must be instantaneous. Both the native CLI plugins and NDK State DB stream explicit `oper-down-reason` diagnostic fields:
+
+| State Context | Operational Down Reason | Root Cause / Resolution |
+| :--- | :--- | :--- |
+| **Protocol Instance** | `protocol admin disabled` | Instance has `admin-state disable` |
+| **Protocol Instance** | `autonomous system not configured` | Autonomous system number is 0 or unassigned |
+| **Interface** | `interface admin disabled` | Interface has `admin-state disable` |
+| **Interface** | `no IP address configured` | Interface subinterface lacks an IPv4 or IPv6 address |
+| **Interface** | `link down or inactive` | Physical or underlying subinterface is operationally down |
+| **Neighbor** | `hold-timer expired or peering down` | Peer failed to send hellos before hold-time expired |
+| **Static Neighbor** | `neighbor unreachable or inactive` | Static peer IP is not currently responding or reachable |
+
+View down reasons directly in CLI detail commands:
+```text
+A:srl1# show network-instance default protocols eigrp interfaces ethernet-1/1.0
+================================================================================
+EIGRP Interface Details: ethernet-1/1.0
+--------------------------------------------------------------------------------
+Oper State:          down
+Down Reason:         no IP address configured
+Admin State:         enable
+...
+```
+
+### 17. Deterministic Traffic Steering & Feasible Successor Failover
+EIGRP DUAL computes composite metrics based on configurable interface bandwidth and delay:
+- **Traffic Steering via Delay**: Modifying `delay` on an interface immediately triggers DUAL recalculation, dynamically adjusting composite metrics without tearing down neighbor sessions or flapping interfaces.
+- **Feasible Successor Guarantee**: When alternate paths satisfy the Feasibility Condition ($RD < FD$), they are instantly designated as `Feasible Successor`.
+- **Zero-Packet-Loss Failover**: If the primary successor link fails or is administratively disabled, DUAL promotes the Feasible Successor to Successor immediately in hardware without sending queries or entering Active state.
+
+```text
+# Steer traffic away from a link by increasing its delay:
+enter candidate
+set / network-instance default protocols eigrp interface ethernet-1/2.0 delay 2000
+commit now
+```
+
+### 18. 5-Node Enterprise Network Topology Validation
+The EIGRP engine is validated against a 5-node redundant diamond/ladder topology located in `/home/awhitaker/temp/eigrp-test/` (`srl1` <-> `srl2` <-> {`srl3`, `srl4`} <-> `srl5`):
+
+```text
+       +------+
+       | SRL1 | (1.1.1.1/32)
+       +---+--+
+           | 10.1.2.0/24
+       +---+--+
+       | SRL2 | (2.2.2.2/32)
+       +-+--+-+
+10.2.3.0/24 |  | 10.2.4.0/24
+     +-----+    +-----+
+     |                |
+  +--+---+         +--+---+
+  | SRL3 |         | SRL4 |
+  +--+---+         +--+---+
+10.3.5.0/24 \  / 10.4.5.0/24
+     +-----+    +-----+
+           |    |
+       +---+----+
+       |  SRL5  | (5.5.5.5/32)
+       +--------+
+```
+
+1. **Equal-Cost Multipath (ECMP)**: SRL2 discovers dual paths to SRL5 via SRL3 (`10.2.3.3`) and SRL4 (`10.2.4.4`) with equal composite metric `8519680`. Both paths are installed as active ECMP successors in the FIB with 0% ping packet loss.
+2. **Dynamic Traffic Steering**: Setting `delay 2000` on SRL2 `ethernet-1/2.0` immediately shifts 100% of traffic to SRL4 (`10.2.4.4`). Path via SRL3 is automatically designated as `Feasible Successor` (FD 8519680, RD 7864320 < FD). Ping across the fabric maintains 0% packet loss.
+3. **Hitless Failover**: Disabling primary interface `ethernet-1/3.0` on SRL2 triggers immediate promotion of Feasible Successor (`10.2.3.3`) to active Successor with zero downtime.
+4. **Metric Restoration**: Removing the custom delay (`delete ... delay`) dynamically restores ECMP load balancing across both paths.
 
 ---
 

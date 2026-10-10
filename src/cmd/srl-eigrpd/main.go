@@ -50,19 +50,21 @@ type NeighborInfo struct {
 	RTO          uint32 `json:"rto-ms"`
 	BfdState     string `json:"bfd-state,omitempty"`
 	RestartState string `json:"restart-state,omitempty"`
-	AuthMode     string `json:"auth-mode,omitempty"`
+	AuthMode       string `json:"auth-mode,omitempty"`
+	OperDownReason string `json:"oper-down-reason,omitempty"`
 }
 
 type InterfaceInfo struct {
-	Name          string `json:"name"`
-	InterfaceName string `json:"interface-name,omitempty"`
-	AdminState    string `json:"admin-state,omitempty"`
-	IPAddress     string `json:"ip-address"`
-	PrefixLen     uint32 `json:"prefix-length"`
-	OperState     string `json:"oper-state"`
-	BfdState      string `json:"bfd-state,omitempty"`
-	AuthMode      string `json:"auth-mode,omitempty"`
-	Passive       bool   `json:"passive"`
+	Name           string `json:"name"`
+	InterfaceName  string `json:"interface-name,omitempty"`
+	AdminState     string `json:"admin-state,omitempty"`
+	IPAddress      string `json:"ip-address"`
+	PrefixLen      uint32 `json:"prefix-length"`
+	OperState      string `json:"oper-state"`
+	OperDownReason string `json:"oper-down-reason,omitempty"`
+	BfdState       string `json:"bfd-state,omitempty"`
+	AuthMode       string `json:"auth-mode,omitempty"`
+	Passive        bool   `json:"passive"`
 }
 
 type TopologyRouteInfo struct {

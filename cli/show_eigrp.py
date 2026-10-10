@@ -230,6 +230,14 @@ class Plugin(CliPlugin):
                 callback=self.show_traffic
             )
 
+        route_table = network.get_command_or_none("route-table")
+        if route_table and not route_table.has_command("eigrp"):
+            route_table.add_command(
+                Syntax("eigrp", help="Show EIGRP learned routing table"),
+                update_location=False,
+                callback=self.show_routes
+            )
+
     def show_summary(self, state, arguments, output, **kwargs):
         netinst_arg = arguments.get_value_or("network-instance", "name", "default")
         instances = get_target_instances(state=state, netinst_arg=netinst_arg)
@@ -260,6 +268,16 @@ class Plugin(CliPlugin):
             output.print_line(f"{'Router ID':<24}: {rid}")
             output.print_line(f"{'Admin State':<24}: {admin}")
             output.print_line(f"{'Operational State':<24}: {oper}")
+            if oper.lower() != "up":
+                down_reason = data.get("oper-down-reason")
+                if not down_reason:
+                    if admin == "disable":
+                        down_reason = "protocol admin disabled"
+                    elif asn == 0:
+                        down_reason = "autonomous-system not configured"
+                    else:
+                        down_reason = "instance initializing or inactive"
+                output.print_line(f"{'Down Reason':<24}: {down_reason}")
             output.print_line(f"{'Configured Networks':<24}: {', '.join(networks) if networks else 'None'}")
             output.print_line(f"{'Participating Interfaces':<24}: {len(interfaces)}")
             output.print_line(f"{'Established Neighbors':<24}: {len(nbrs)}")
@@ -287,6 +305,7 @@ class Plugin(CliPlugin):
             data = load_state(state=state, netinst=netinst)
             asn = data.get("autonomous-system", 0) if data else 0
             nbrs = data.get("neighbors") or data.get("neighbor", []) if data else []
+            interfaces = data.get("interfaces") or data.get("interface", []) if data else []
 
             if target_nbr and target_nbr != "*":
                 # Detailed single neighbor view
@@ -316,6 +335,9 @@ class Plugin(CliPlugin):
                 output.print_line(f"{'Neighbor IP Address':<26}: {ip}")
                 output.print_line(f"{'Interface':<26}: {norm_itf} ({raw_itf})")
                 output.print_line(f"{'Adjacency State':<26}: {st}")
+                if st.lower() != "up":
+                    down_reason = n.get("oper-down-reason") or "hold-timer expired or peering down"
+                    output.print_line(f"{'Down Reason':<26}: {down_reason}")
                 output.print_line(f"{'Hold Time':<26}: {hold} seconds")
                 output.print_line(f"{'Uptime':<26}: {up_clean} seconds")
                 output.print_line(f"{'Smooth RTT (SRTT)':<26}: {srtt} ms")
@@ -352,6 +374,34 @@ class Plugin(CliPlugin):
 
             if not nbrs:
                 output.print_line("No active EIGRP neighbors found.")
+                proto_oper = data.get("oper-state", "down") if data else "down"
+                if proto_oper.lower() != "up":
+                    proto_down_reason = data.get("oper-down-reason", "protocol instance inactive") if data else "protocol instance inactive"
+                    output.print_line(f"  Reason: Protocol instance is down ({proto_down_reason})")
+                elif not interfaces:
+                    output.print_line("  Reason: No interfaces participating in EIGRP")
+                else:
+                    valid_itfs = [i for i in interfaces if isinstance(i, dict)]
+                    all_passive = all(itf.get("passive", False) for itf in valid_itfs) if valid_itfs else False
+                    all_down = all(itf.get("oper-state", "down").lower() != "up" for itf in valid_itfs) if valid_itfs else False
+                    if all_passive:
+                        output.print_line("  Reason: All participating interfaces are passive (hello exchange suppressed)")
+                    elif all_down:
+                        down_reasons = set(itf.get("oper-down-reason", "interface down") for itf in valid_itfs if itf.get("oper-down-reason"))
+                        reasons_str = f" ({', '.join(down_reasons)})" if down_reasons else ""
+                        output.print_line(f"  Reason: All participating interfaces are operationally down{reasons_str}")
+                    else:
+                        output.print_line("  Status: Interfaces active, awaiting peer Hellos (IP protocol 88)")
+                        output.print_line("  Tip   : Verify remote peer configuration, CPM filter ('tools ... check-cpm'), and authentication")
+                static_nbrs = data.get("static-neighbor") or data.get("static_neighbor", []) if data else []
+                if static_nbrs:
+                    output.print_line("Configured Static Neighbors:")
+                    for sn in static_nbrs:
+                        sn_ip = sn.get("ip-address", "")
+                        sn_if = normalize_interface_name(sn.get("interface", ""))
+                        sn_st = sn.get("oper-state", "down")
+                        sn_rsn = sn.get("oper-down-reason", "peer unreachable")
+                        output.print_line(f"  - {sn_ip} on {sn_if}: {sn_st} ({sn_rsn})")
             else:
                 for n in nbrs:
                     ip = n.get("ip-address", "")
@@ -374,6 +424,10 @@ class Plugin(CliPlugin):
             output.print_line(f"EIGRP Neighbor Details: {target_nbr} ({target_scope})")
             output.print_line("=" * 80)
             output.print_line(f"Neighbor '{target_nbr}' not found in EIGRP neighbor table.")
+            output.print_line("Troubleshooting tips:")
+            output.print_line(f"  1. Verify peer IP {target_nbr} is on-link and directly reachable.")
+            output.print_line("  2. Verify CPM filter allows inbound protocol 88 ('tools ... check-cpm').")
+            output.print_line("  3. Verify Autonomous System number, K-values, and authentication keys match.")
             output.print_line("=" * 80)
 
     def show_routes(self, state, arguments, output, **kwargs):
@@ -470,6 +524,16 @@ class Plugin(CliPlugin):
                 output.print_line(f"{'Internal Device Name':<26}: {raw_name}")
                 output.print_line(f"{'Admin State':<26}: {itf.get('admin-state', 'enable')}")
                 output.print_line(f"{'Operational State':<26}: {oper}")
+                if oper.lower() != "up":
+                    down_reason = itf.get("oper-down-reason")
+                    if not down_reason:
+                        if itf.get('admin-state') == 'disable':
+                            down_reason = "interface admin disabled"
+                        elif not ip:
+                            down_reason = "no IP address configured"
+                        else:
+                            down_reason = "link down or inactive"
+                    output.print_line(f"{'Down Reason':<26}: {down_reason}")
                 output.print_line(f"{'Passive Interface':<26}: {'true' if itf.get('passive', False) else 'false'}")
                 output.print_line(f"{'IP Address / Prefix':<26}: {ip}/{plen}")
                 bfd_raw = itf.get('bfd-state', 'disabled')
@@ -499,11 +563,16 @@ class Plugin(CliPlugin):
                 continue
 
             # Summary view
-            output.print_line("=" * 96)
+            has_down = any(itf.get("oper-state", "Up").lower() != "up" for itf in interfaces)
+            div_len = 122 if has_down else 96
+            output.print_line("=" * div_len)
             output.print_line(f"EIGRP Interfaces for Network-Instance: {netinst} (AS: {asn})")
-            output.print_line("-" * 96)
-            output.print_line(f"{'Interface':<18} {'IP Address':<18} {'Prefix-Len':<12} {'Oper State':<12} {'Passive':<10} {'BFD':<10} {'Auth':<10}")
-            output.print_line("-" * 96)
+            output.print_line("-" * div_len)
+            if has_down:
+                output.print_line(f"{'Interface':<18} {'IP Address':<18} {'Prefix-Len':<12} {'Oper State':<12} {'Down Reason':<26} {'Passive':<9} {'BFD':<9} {'Auth':<8}")
+            else:
+                output.print_line(f"{'Interface':<18} {'IP Address':<18} {'Prefix-Len':<12} {'Oper State':<12} {'Passive':<10} {'BFD':<10} {'Auth':<10}")
+            output.print_line("-" * div_len)
 
             if not interfaces:
                 output.print_line("No active EIGRP interfaces found.")
@@ -520,11 +589,22 @@ class Plugin(CliPlugin):
                     else:
                         bfd = str(bfd_raw)
                     auth = str(itf.get("auth-mode", "none"))
-                    output.print_line(f"{name:<18} {ip:<18} {plen:<12} {oper:<12} {passive_str:<10} {bfd:<10} {auth:<10}")
+                    if has_down:
+                        down_rsn = itf.get("oper-down-reason", "") if oper.lower() != "up" else "-"
+                        if not down_rsn and oper.lower() != "up":
+                            if itf.get('admin-state') == 'disable':
+                                down_rsn = "interface admin disabled"
+                            elif not ip:
+                                down_rsn = "no IP address configured"
+                            else:
+                                down_rsn = "link down or inactive"
+                        output.print_line(f"{name:<18} {ip:<18} {plen:<12} {oper:<12} {down_rsn:<26} {passive_str:<9} {bfd:<9} {auth:<8}")
+                    else:
+                        output.print_line(f"{name:<18} {ip:<18} {plen:<12} {oper:<12} {passive_str:<10} {bfd:<10} {auth:<10}")
 
-            output.print_line("-" * 96)
+            output.print_line("-" * div_len)
             output.print_line(f"Total Interfaces: {len(interfaces)}")
-            output.print_line("=" * 96)
+            output.print_line("=" * div_len)
 
         if target_if and target_if != "*" and not itf_found_in_any:
             target_scope = netinst_arg if netinst_arg != "*" else "all network-instances"

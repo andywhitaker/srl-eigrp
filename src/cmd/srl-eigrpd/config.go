@@ -855,42 +855,56 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 		inst := d.GetOrCreateInstance(netinst)
 
 		if op == ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE {
+			d.mu.Lock()
 			if strings.Contains(jsPath, ".authentication") {
-				d.mu.Lock()
 				if inst.defaultIntf != nil {
 					inst.defaultIntf.Authentication = nil
 				}
-				intfs := make([]*InterfaceConfig, 0, len(inst.configuredInterfaces))
-				for _, ic := range inst.configuredInterfaces {
-					intfs = append(intfs, ic)
-				}
-				d.mu.Unlock()
-				for _, ic := range intfs {
-					d.applyInterface(inst, ic)
-				}
 				log.Info().Str("netinst", netinst).Msg("Deleted default-interface authentication and refreshed interfaces")
-				go d.CollectAndPublish(context.Background())
-				return
-			}
-			if strings.Contains(jsPath, ".bfd") {
-				d.mu.Lock()
+			} else if strings.Contains(jsPath, ".bfd") {
 				if inst.defaultIntf != nil {
 					inst.defaultIntf.Bfd = nil
 				}
-				intfs := make([]*InterfaceConfig, 0, len(inst.configuredInterfaces))
-				for _, ic := range inst.configuredInterfaces {
-					intfs = append(intfs, ic)
-				}
-				d.mu.Unlock()
-				for _, ic := range intfs {
-					d.applyInterface(inst, ic)
-				}
 				log.Info().Str("netinst", netinst).Msg("Deleted default-interface bfd and refreshed interfaces")
-				go d.CollectAndPublish(context.Background())
-				return
+			} else if strings.Contains(jsPath, ".passive") {
+				if inst.defaultIntf != nil {
+					inst.defaultIntf.Passive = false
+				}
+				log.Info().Str("netinst", netinst).Msg("Reset default-interface passive to default and refreshed interfaces")
+			} else if strings.Contains(jsPath, ".delay") {
+				if inst.defaultIntf != nil {
+					inst.defaultIntf.Delay = nil
+				}
+				log.Info().Str("netinst", netinst).Msg("Reset default-interface delay to default and refreshed interfaces")
+			} else if strings.Contains(jsPath, ".bandwidth") {
+				if inst.defaultIntf != nil {
+					inst.defaultIntf.Bandwidth = nil
+				}
+				log.Info().Str("netinst", netinst).Msg("Reset default-interface bandwidth to default and refreshed interfaces")
+			} else if strings.Contains(jsPath, ".hello-interval") {
+				if inst.defaultIntf != nil {
+					inst.defaultIntf.HelloInterval = 0
+				}
+				log.Info().Str("netinst", netinst).Msg("Reset default-interface hello-interval to default and refreshed interfaces")
+			} else if strings.Contains(jsPath, ".hold-time") {
+				if inst.defaultIntf != nil {
+					inst.defaultIntf.HoldTime = 0
+				}
+				log.Info().Str("netinst", netinst).Msg("Reset default-interface hold-time to default and refreshed interfaces")
+			} else if strings.Contains(jsPath, ".split-horizon") {
+				if inst.defaultIntf != nil {
+					inst.defaultIntf.SplitHorizon = nil
+				}
+				log.Info().Str("netinst", netinst).Msg("Reset default-interface split-horizon to default and refreshed interfaces")
+			} else if strings.Contains(jsPath, ".next-hop-self") {
+				if inst.defaultIntf != nil {
+					inst.defaultIntf.NextHopSelf = nil
+				}
+				log.Info().Str("netinst", netinst).Msg("Reset default-interface next-hop-self to default and refreshed interfaces")
+			} else {
+				inst.defaultIntf = nil
+				log.Info().Str("netinst", netinst).Msg("Deleted default-interface config and refreshed interfaces")
 			}
-			d.mu.Lock()
-			inst.defaultIntf = nil
 			intfs := make([]*InterfaceConfig, 0, len(inst.configuredInterfaces))
 			for _, ic := range inst.configuredInterfaces {
 				intfs = append(intfs, ic)
@@ -899,53 +913,152 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			for _, ic := range intfs {
 				d.applyInterface(inst, ic)
 			}
-			log.Info().Str("netinst", netinst).Msg("Deleted default-interface config and refreshed interfaces")
+			go d.CollectAndPublish(context.Background())
 			return
 		}
 
-		var defCfg DefaultInterfaceConfig
-		if err := json.Unmarshal([]byte(jsonStr), &defCfg); err == nil {
-			d.mu.Lock()
-			if inst.defaultIntf != nil {
-				if defCfg.AdminState == "" {
-					defCfg.AdminState = inst.defaultIntf.AdminState
-				}
-				if defCfg.HelloInterval == 0 {
-					defCfg.HelloInterval = inst.defaultIntf.HelloInterval
-				}
-				if defCfg.HoldTime == 0 {
-					defCfg.HoldTime = inst.defaultIntf.HoldTime
-				}
-				if defCfg.SplitHorizon == nil {
-					defCfg.SplitHorizon = inst.defaultIntf.SplitHorizon
-				}
-				if defCfg.NextHopSelf == nil {
-					defCfg.NextHopSelf = inst.defaultIntf.NextHopSelf
-				}
-				if defCfg.Bandwidth == nil {
-					defCfg.Bandwidth = inst.defaultIntf.Bandwidth
-				}
-				if defCfg.Delay == nil {
-					defCfg.Delay = inst.defaultIntf.Delay
-				}
-				if defCfg.Authentication == nil && !strings.Contains(jsonStr, "\"authentication\"") && (strings.Contains(jsPath, ".passive") || strings.Contains(jsPath, ".admin-state") || strings.Contains(jsPath, ".hello-interval") || strings.Contains(jsPath, ".hold-time") || strings.Contains(jsPath, ".split-horizon") || strings.Contains(jsPath, ".next-hop-self") || strings.Contains(jsPath, ".bandwidth") || strings.Contains(jsPath, ".delay") || strings.Contains(jsPath, ".bfd")) {
-					defCfg.Authentication = inst.defaultIntf.Authentication
-				}
-				if defCfg.Bfd == nil {
-					defCfg.Bfd = inst.defaultIntf.Bfd
-				}
-			}
-			inst.defaultIntf = &defCfg
-			intfs := make([]*InterfaceConfig, 0, len(inst.configuredInterfaces))
-			for _, ic := range inst.configuredInterfaces {
-				intfs = append(intfs, ic)
-			}
-			d.mu.Unlock()
-			for _, ic := range intfs {
-				d.applyInterface(inst, ic)
-			}
-			log.Info().Str("netinst", netinst).Interface("default_interface", defCfg).Msg("Updated default-interface config and refreshed interfaces")
+		d.mu.Lock()
+		if inst.defaultIntf == nil {
+			inst.defaultIntf = &DefaultInterfaceConfig{AdminState: "enable"}
 		}
+		if strings.Contains(jsPath, ".admin-state") {
+			var s string
+			if err := json.Unmarshal([]byte(jsonStr), &s); err == nil && s != "" {
+				inst.defaultIntf.AdminState = s
+			} else {
+				var leaf struct { AdminState string `json:"admin-state"` }
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil && leaf.AdminState != "" {
+					inst.defaultIntf.AdminState = leaf.AdminState
+				}
+			}
+		} else if strings.Contains(jsPath, ".passive") {
+			var pVal bool
+			if err := json.Unmarshal([]byte(jsonStr), &pVal); err == nil {
+				inst.defaultIntf.Passive = pVal
+			} else {
+				var leaf struct { Passive bool `json:"passive"` }
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
+					inst.defaultIntf.Passive = leaf.Passive
+				}
+			}
+		} else if strings.Contains(jsPath, ".delay") {
+			var dVal uint32
+			if err := json.Unmarshal([]byte(jsonStr), &dVal); err == nil {
+				inst.defaultIntf.Delay = &dVal
+			} else {
+				var leaf struct { Delay uint32 `json:"delay"` }
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
+					inst.defaultIntf.Delay = &leaf.Delay
+				}
+			}
+		} else if strings.Contains(jsPath, ".bandwidth") {
+			var bVal uint32
+			if err := json.Unmarshal([]byte(jsonStr), &bVal); err == nil {
+				inst.defaultIntf.Bandwidth = &bVal
+			} else {
+				var leaf struct { Bandwidth uint32 `json:"bandwidth"` }
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
+					inst.defaultIntf.Bandwidth = &leaf.Bandwidth
+				}
+			}
+		} else if strings.Contains(jsPath, ".hello-interval") {
+			var hVal uint16
+			if err := json.Unmarshal([]byte(jsonStr), &hVal); err == nil {
+				inst.defaultIntf.HelloInterval = hVal
+			} else {
+				var leaf struct { HelloInterval uint16 `json:"hello-interval"` }
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
+					inst.defaultIntf.HelloInterval = leaf.HelloInterval
+				}
+			}
+		} else if strings.Contains(jsPath, ".hold-time") {
+			var hVal uint16
+			if err := json.Unmarshal([]byte(jsonStr), &hVal); err == nil {
+				inst.defaultIntf.HoldTime = hVal
+			} else {
+				var leaf struct { HoldTime uint16 `json:"hold-time"` }
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
+					inst.defaultIntf.HoldTime = leaf.HoldTime
+				}
+			}
+		} else if strings.Contains(jsPath, ".split-horizon") {
+			var shVal bool
+			if err := json.Unmarshal([]byte(jsonStr), &shVal); err == nil {
+				inst.defaultIntf.SplitHorizon = &shVal
+			} else {
+				var leaf struct { SplitHorizon bool `json:"split-horizon"` }
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
+					inst.defaultIntf.SplitHorizon = &leaf.SplitHorizon
+				}
+			}
+		} else if strings.Contains(jsPath, ".next-hop-self") {
+			var nhsVal bool
+			if err := json.Unmarshal([]byte(jsonStr), &nhsVal); err == nil {
+				inst.defaultIntf.NextHopSelf = &nhsVal
+			} else {
+				var leaf struct { NextHopSelf bool `json:"next-hop-self"` }
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
+					inst.defaultIntf.NextHopSelf = &leaf.NextHopSelf
+				}
+			}
+		} else if strings.Contains(jsPath, ".authentication") {
+			var authCfg AuthConfig
+			if err := json.Unmarshal([]byte(jsonStr), &authCfg); err == nil {
+				inst.defaultIntf.Authentication = &authCfg
+			}
+		} else if strings.Contains(jsPath, ".bfd") {
+			var bfdCfg BfdConfig
+			if err := json.Unmarshal([]byte(jsonStr), &bfdCfg); err == nil {
+				inst.defaultIntf.Bfd = &bfdCfg
+			}
+		} else {
+			var defCfg DefaultInterfaceConfig
+			if err := json.Unmarshal([]byte(jsonStr), &defCfg); err == nil {
+				if defCfg.AdminState != "" {
+					inst.defaultIntf.AdminState = defCfg.AdminState
+				}
+				if strings.Contains(jsonStr, "\"passive\"") {
+					inst.defaultIntf.Passive = defCfg.Passive
+				}
+				if defCfg.HelloInterval != 0 {
+					inst.defaultIntf.HelloInterval = defCfg.HelloInterval
+				}
+				if defCfg.HoldTime != 0 {
+					inst.defaultIntf.HoldTime = defCfg.HoldTime
+				}
+				if defCfg.SplitHorizon != nil {
+					inst.defaultIntf.SplitHorizon = defCfg.SplitHorizon
+				}
+				if defCfg.NextHopSelf != nil {
+					inst.defaultIntf.NextHopSelf = defCfg.NextHopSelf
+				}
+				if defCfg.Bandwidth != nil {
+					inst.defaultIntf.Bandwidth = defCfg.Bandwidth
+				}
+				if defCfg.Delay != nil {
+					inst.defaultIntf.Delay = defCfg.Delay
+				}
+				if defCfg.Authentication != nil {
+					inst.defaultIntf.Authentication = defCfg.Authentication
+				}
+				if defCfg.Bfd != nil {
+					inst.defaultIntf.Bfd = defCfg.Bfd
+				}
+			}
+		}
+		if inst.defaultIntf.AdminState == "" {
+			inst.defaultIntf.AdminState = "enable"
+		}
+		intfs := make([]*InterfaceConfig, 0, len(inst.configuredInterfaces))
+		for _, ic := range inst.configuredInterfaces {
+			intfs = append(intfs, ic)
+		}
+		d.mu.Unlock()
+		for _, ic := range intfs {
+			d.applyInterface(inst, ic)
+		}
+		log.Info().Str("netinst", netinst).Interface("default_interface", inst.defaultIntf).Msg("Updated default-interface config and refreshed interfaces")
+		go d.CollectAndPublish(context.Background())
 		return
 	}
 
@@ -1224,6 +1337,96 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 				go d.CollectAndPublish(context.Background())
 				return
 			}
+			if strings.Contains(jsPath, ".admin-state") {
+				d.mu.Lock()
+				if ic, exists := inst.configuredInterfaces[ifName]; exists {
+					ic.AdminState = "enable"
+					d.applyInterface(inst, ic)
+				}
+				d.mu.Unlock()
+				log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Reset admin-state on interface to default enable")
+				go d.CollectAndPublish(context.Background())
+				return
+			}
+			if strings.Contains(jsPath, ".delay") {
+				d.mu.Lock()
+				if ic, exists := inst.configuredInterfaces[ifName]; exists {
+					ic.Delay = nil
+					d.applyInterface(inst, ic)
+				}
+				d.mu.Unlock()
+				log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Reset delay on interface to default")
+				go d.CollectAndPublish(context.Background())
+				return
+			}
+			if strings.Contains(jsPath, ".bandwidth") {
+				d.mu.Lock()
+				if ic, exists := inst.configuredInterfaces[ifName]; exists {
+					ic.Bandwidth = nil
+					d.applyInterface(inst, ic)
+				}
+				d.mu.Unlock()
+				log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Reset bandwidth on interface to default")
+				go d.CollectAndPublish(context.Background())
+				return
+			}
+			if strings.Contains(jsPath, ".passive") {
+				d.mu.Lock()
+				if ic, exists := inst.configuredInterfaces[ifName]; exists {
+					ic.Passive = nil
+					d.applyInterface(inst, ic)
+				}
+				d.mu.Unlock()
+				log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Reset passive on interface to default")
+				go d.CollectAndPublish(context.Background())
+				return
+			}
+			if strings.Contains(jsPath, ".hello-interval") {
+				d.mu.Lock()
+				if ic, exists := inst.configuredInterfaces[ifName]; exists {
+					ic.HelloInterval = nil
+					d.applyInterface(inst, ic)
+				}
+				d.mu.Unlock()
+				log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Reset hello-interval on interface to default")
+				go d.CollectAndPublish(context.Background())
+				return
+			}
+			if strings.Contains(jsPath, ".hold-time") {
+				d.mu.Lock()
+				if ic, exists := inst.configuredInterfaces[ifName]; exists {
+					ic.HoldTime = nil
+					d.applyInterface(inst, ic)
+				}
+				d.mu.Unlock()
+				log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Reset hold-time on interface to default")
+				go d.CollectAndPublish(context.Background())
+				return
+			}
+			if strings.Contains(jsPath, ".split-horizon") {
+				d.mu.Lock()
+				if ic, exists := inst.configuredInterfaces[ifName]; exists {
+					ic.SplitHorizon = nil
+					d.applyInterface(inst, ic)
+				}
+				d.mu.Unlock()
+				log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Reset split-horizon on interface to default")
+				go d.CollectAndPublish(context.Background())
+				return
+			}
+			if strings.Contains(jsPath, ".next-hop-self") {
+				d.mu.Lock()
+				if ic, exists := inst.configuredInterfaces[ifName]; exists {
+					ic.NextHopSelf = nil
+					d.applyInterface(inst, ic)
+				}
+				d.mu.Unlock()
+				log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Reset next-hop-self on interface to default")
+				go d.CollectAndPublish(context.Background())
+				return
+			}
+
+			// Full interface deletion
 			d.mu.Lock()
 			delete(inst.configuredInterfaces, ifName)
 			d.mu.Unlock()
@@ -1239,7 +1442,7 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			d.mu.Lock()
 			ic := inst.configuredInterfaces[ifName]
 			if ic == nil {
-				ic = &InterfaceConfig{InterfaceName: ifName}
+				ic = &InterfaceConfig{InterfaceName: ifName, AdminState: "enable"}
 				inst.configuredInterfaces[ifName] = ic
 			}
 			var saCfg SummaryAddressConfig
@@ -1267,24 +1470,136 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			return
 		}
 
-		var intfCfg InterfaceConfig
-		if err := json.Unmarshal([]byte(jsonStr), &intfCfg); err == nil {
-			intfCfg.InterfaceName = ifName
-			d.mu.Lock()
-			if existing, exists := inst.configuredInterfaces[ifName]; exists && existing != nil {
-				if len(intfCfg.SummaryAddress) == 0 && !strings.Contains(jsonStr, "\"summary-address\"") {
-					intfCfg.SummaryAddress = existing.SummaryAddress
-				}
-				if len(intfCfg.AddressFamily) == 0 && !strings.Contains(jsonStr, "\"address-family\"") {
-					intfCfg.AddressFamily = existing.AddressFamily
+		d.mu.Lock()
+		ic, exists := inst.configuredInterfaces[ifName]
+		if !exists || ic == nil {
+			ic = &InterfaceConfig{InterfaceName: ifName, AdminState: "enable"}
+			inst.configuredInterfaces[ifName] = ic
+		}
+
+		if strings.Contains(jsPath, ".admin-state") {
+			var s string
+			if err := json.Unmarshal([]byte(jsonStr), &s); err == nil && s != "" {
+				ic.AdminState = s
+			} else {
+				var leaf struct { AdminState string `json:"admin-state"` }
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil && leaf.AdminState != "" {
+					ic.AdminState = leaf.AdminState
 				}
 			}
-			inst.configuredInterfaces[ifName] = &intfCfg
-			d.mu.Unlock()
-			d.applyInterface(inst, &intfCfg)
-			log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Configured EIGRP on interface")
-			go d.CollectAndPublish(context.Background())
+		} else if strings.Contains(jsPath, ".delay") {
+			var dVal uint32
+			if err := json.Unmarshal([]byte(jsonStr), &dVal); err == nil {
+				ic.Delay = &dVal
+			} else {
+				var leaf struct { Delay uint32 `json:"delay"` }
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
+					ic.Delay = &leaf.Delay
+				}
+			}
+		} else if strings.Contains(jsPath, ".bandwidth") {
+			var bVal uint32
+			if err := json.Unmarshal([]byte(jsonStr), &bVal); err == nil {
+				ic.Bandwidth = &bVal
+			} else {
+				var leaf struct { Bandwidth uint32 `json:"bandwidth"` }
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
+					ic.Bandwidth = &leaf.Bandwidth
+				}
+			}
+		} else if strings.Contains(jsPath, ".passive") {
+			var pVal bool
+			if err := json.Unmarshal([]byte(jsonStr), &pVal); err == nil {
+				ic.Passive = &pVal
+			} else {
+				var leaf struct { Passive bool `json:"passive"` }
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
+					ic.Passive = &leaf.Passive
+				}
+			}
+		} else if strings.Contains(jsPath, ".hello-interval") {
+			var hVal uint16
+			if err := json.Unmarshal([]byte(jsonStr), &hVal); err == nil {
+				ic.HelloInterval = &hVal
+			} else {
+				var leaf struct { HelloInterval uint16 `json:"hello-interval"` }
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
+					ic.HelloInterval = &leaf.HelloInterval
+				}
+			}
+		} else if strings.Contains(jsPath, ".hold-time") {
+			var hVal uint16
+			if err := json.Unmarshal([]byte(jsonStr), &hVal); err == nil {
+				ic.HoldTime = &hVal
+			} else {
+				var leaf struct { HoldTime uint16 `json:"hold-time"` }
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
+					ic.HoldTime = &leaf.HoldTime
+				}
+			}
+		} else if strings.Contains(jsPath, ".split-horizon") {
+			var shVal bool
+			if err := json.Unmarshal([]byte(jsonStr), &shVal); err == nil {
+				ic.SplitHorizon = &shVal
+			} else {
+				var leaf struct { SplitHorizon bool `json:"split-horizon"` }
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
+					ic.SplitHorizon = &leaf.SplitHorizon
+				}
+			}
+		} else if strings.Contains(jsPath, ".next-hop-self") {
+			var nhsVal bool
+			if err := json.Unmarshal([]byte(jsonStr), &nhsVal); err == nil {
+				ic.NextHopSelf = &nhsVal
+			} else {
+				var leaf struct { NextHopSelf bool `json:"next-hop-self"` }
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
+					ic.NextHopSelf = &leaf.NextHopSelf
+				}
+			}
+		} else if strings.Contains(jsPath, ".authentication") {
+			var authCfg AuthConfig
+			if err := json.Unmarshal([]byte(jsonStr), &authCfg); err == nil {
+				ic.Authentication = &authCfg
+			}
+		} else if strings.Contains(jsPath, ".bfd") {
+			var bfdCfg BfdConfig
+			if err := json.Unmarshal([]byte(jsonStr), &bfdCfg); err == nil {
+				ic.Bfd = &bfdCfg
+			}
+		} else {
+			var parsed InterfaceConfig
+			if err := json.Unmarshal([]byte(jsonStr), &parsed); err == nil {
+				parsed.InterfaceName = ifName
+				if parsed.AdminState != "" {
+					ic.AdminState = parsed.AdminState
+				} else {
+					ic.AdminState = "enable"
+				}
+				ic.Passive = parsed.Passive
+				ic.HelloInterval = parsed.HelloInterval
+				ic.HoldTime = parsed.HoldTime
+				ic.SplitHorizon = parsed.SplitHorizon
+				ic.NextHopSelf = parsed.NextHopSelf
+				ic.Bandwidth = parsed.Bandwidth
+				ic.Delay = parsed.Delay
+				ic.Authentication = parsed.Authentication
+				ic.Bfd = parsed.Bfd
+				if len(parsed.SummaryAddress) > 0 {
+					ic.SummaryAddress = parsed.SummaryAddress
+				}
+				if len(parsed.AddressFamily) > 0 {
+					ic.AddressFamily = parsed.AddressFamily
+				}
+			}
 		}
+		if ic.AdminState == "" {
+			ic.AdminState = "enable"
+		}
+		d.mu.Unlock()
+		d.applyInterface(inst, ic)
+		log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Configured EIGRP on interface")
+		go d.CollectAndPublish(context.Background())
 		return
 	}
 

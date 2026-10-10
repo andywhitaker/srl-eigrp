@@ -36,6 +36,9 @@
 #include "eigrp_prefix.h"
 #include "eigrp_eventlog.h"
 #include "eigrp_auth.h"
+#include "eigrp_list.h"
+#include "eigrp_table.h"
+#include "eigrp_topology.h"
 
 extern int srl_netns_socket_open(const char *netinst);
 extern int srl_netns_enter(const char *netinst, int *saved_ns);
@@ -2422,6 +2425,85 @@ int srlShimActiveTimeUpdate(const char *netinst, uint16_t minutes) {
     return 0;
 }
 
+static void srl_intf_metric_update(eigrp_instance_t *runtime, eigrp_intf_t *ei) {
+    if (!runtime || !runtime->topology_table || !ei) return;
+
+    eigrp_table_node_t *rn;
+    eigrp_prefix_descriptor_t *prefix;
+    eigrp_route_descriptor_t *route;
+    eigrp_topology_route_iterator_t iterator;
+
+    eigrp_metrics_t metric;
+    memset(&metric, 0, sizeof(metric));
+    metric.bandwidth = eigrp_bandwidth_to_scaled(ei->params.bandwidth);
+    metric.delay = eigrp_delay_to_scaled(ei->params.delay);
+    metric.load = ei->params.load;
+    metric.reliability = ei->params.reliability;
+    metric.mtu[0] = 0xDC;
+    metric.mtu[1] = 0x05;
+    metric.mtu[2] = 0x00;
+    metric.hop_count = 0;
+
+    for (rn = eigrp_table_first(runtime->topology_table); rn; rn = eigrp_table_next(rn)) {
+        prefix = rn->info;
+        if (!prefix) continue;
+        for (route = eigrp_topology_route_iterator_first(prefix, &iterator); route;
+             route = eigrp_topology_route_iterator_next(&iterator)) {
+            if (route->ei == ei && route->adv_router == runtime->neighbor_self) {
+                route->metric = metric;
+                route->reported_metric = metric;
+                route->total_metric = metric;
+                route->distance = eigrp_metric_calculate(runtime, metric);
+                route->reported_distance = 0;
+            }
+        }
+    }
+
+    eigrp_topology_metric_update(runtime);
+
+    for (rn = eigrp_table_first(runtime->topology_table); rn; rn = eigrp_table_next(rn)) {
+        prefix = rn->info;
+        if (!prefix) continue;
+        bool has_conn = false;
+        for (route = eigrp_topology_route_iterator_first(prefix, &iterator); route;
+             route = eigrp_topology_route_iterator_next(&iterator)) {
+            if (route->adv_router == runtime->neighbor_self && route->ei) {
+                eigrp_metrics_t m;
+                memset(&m, 0, sizeof(m));
+                m.bandwidth = eigrp_bandwidth_to_scaled(route->ei->params.bandwidth);
+                m.delay = eigrp_delay_to_scaled(route->ei->params.delay);
+                m.load = route->ei->params.load;
+                m.reliability = route->ei->params.reliability;
+                m.mtu[0] = 0xDC;
+                m.mtu[1] = 0x05;
+                m.mtu[2] = 0x00;
+                m.hop_count = 0;
+                route->metric = m;
+                route->reported_metric = m;
+                route->total_metric = m;
+                route->distance = eigrp_metric_calculate(runtime, m);
+                route->reported_distance = 0;
+                has_conn = true;
+            }
+        }
+        if (has_conn) {
+            eigrp_route_descriptor_t *best = eigrp_topology_route_read(prefix);
+            if (best && best->adv_router == runtime->neighbor_self) {
+                prefix->distance = best->distance;
+                prefix->fdistance = best->distance;
+                prefix->rdistance = 0;
+                prefix->reported_metric = best->reported_metric;
+                eigrp_update_routing_table(runtime, prefix);
+                prefix->req_action |= EIGRP_FSM_NEED_UPDATE;
+                if (!eigrp_list_lookup(runtime->topology_changes, prefix)) {
+                    eigrp_list_add(runtime->topology_changes, prefix);
+                }
+            }
+        }
+    }
+    eigrp_update_send_all(runtime, NULL);
+}
+
 int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive, uint16_t hello_interval, uint16_t hold_time, bool admin_up, bool split_horizon, bool next_hop_self, uint32_t bandwidth, uint32_t delay) {
     if (!ifname || !ifname[0]) return -1;
     const char *ni = (netinst && netinst[0]) ? netinst : "default";
@@ -2462,6 +2544,8 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
     found->passive = passive;
     if (bandwidth > 0) {
         found->bandwidth = bandwidth;
+    } else {
+        found->bandwidth = EIGRP_BANDWIDTH_DEFAULT;
     }
 
     eigrp_prefix_t pfx;
@@ -2496,12 +2580,25 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
             ei->params.passive_interface = passive ? EIGRP_INTF_PASSIVE : EIGRP_INTF_ACTIVE;
             ei->split_horizon = split_horizon;
             ei->next_hop_self = next_hop_self;
-            if (bandwidth > 0) {
+            bool metric_changed = false;
+            if (bandwidth > 0 && bandwidth != ei->params.bandwidth) {
                 ei->params.bandwidth = bandwidth;
                 ei->curr_bandwidth = bandwidth;
+                metric_changed = true;
+            } else if (bandwidth == 0 && ei->params.bandwidth != EIGRP_BANDWIDTH_DEFAULT) {
+                ei->params.bandwidth = EIGRP_BANDWIDTH_DEFAULT;
+                ei->curr_bandwidth = EIGRP_BANDWIDTH_DEFAULT;
+                metric_changed = true;
             }
-            if (delay > 0) {
+            if (delay > 0 && delay != ei->params.delay) {
                 ei->params.delay = delay;
+                metric_changed = true;
+            } else if (delay == 0 && ei->params.delay != EIGRP_DELAY_DEFAULT) {
+                ei->params.delay = EIGRP_DELAY_DEFAULT;
+                metric_changed = true;
+            }
+            if (metric_changed) {
+                srl_intf_metric_update(runtime, ei);
             }
             eigrp_intf_multicast_update(EIGRP_SET, ei);
             if (passive) {
@@ -2610,6 +2707,8 @@ int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passi
     found->passive_v6 = passive;
     if (bandwidth > 0) {
         found->bandwidth = bandwidth;
+    } else {
+        found->bandwidth = EIGRP_BANDWIDTH_DEFAULT;
     }
 
     char actual_ifname[64];
@@ -2652,12 +2751,25 @@ int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passi
             ei6->params.passive_interface = passive ? EIGRP_INTF_PASSIVE : EIGRP_INTF_ACTIVE;
             ei6->split_horizon = split_horizon;
             ei6->next_hop_self = next_hop_self;
-            if (bandwidth > 0) {
+            bool metric_changed = false;
+            if (bandwidth > 0 && bandwidth != ei6->params.bandwidth) {
                 ei6->params.bandwidth = bandwidth;
                 ei6->curr_bandwidth = bandwidth;
+                metric_changed = true;
+            } else if (bandwidth == 0 && ei6->params.bandwidth != EIGRP_BANDWIDTH_DEFAULT) {
+                ei6->params.bandwidth = EIGRP_BANDWIDTH_DEFAULT;
+                ei6->curr_bandwidth = EIGRP_BANDWIDTH_DEFAULT;
+                metric_changed = true;
             }
-            if (delay > 0) {
+            if (delay > 0 && delay != ei6->params.delay) {
                 ei6->params.delay = delay;
+                metric_changed = true;
+            } else if (delay == 0 && ei6->params.delay != EIGRP_DELAY_DEFAULT) {
+                ei6->params.delay = EIGRP_DELAY_DEFAULT;
+                metric_changed = true;
+            }
+            if (metric_changed) {
+                srl_intf_metric_update(runtime_v6, ei6);
             }
             eigrp_intf_multicast_update(EIGRP_SET, ei6);
             if (passive) {

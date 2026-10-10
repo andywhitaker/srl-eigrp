@@ -74,6 +74,11 @@ module srl_nokia-eigrp {
         type srl_nokia-comm:oper-state;
         description "Operational state of the address family on this interface";
       }
+      leaf oper-down-reason {
+        config false;
+        type string;
+        description "Reason why the address family is operationally down on this interface";
+      }
       leaf passive {
         type boolean;
         default false;
@@ -205,12 +210,18 @@ module srl_nokia-eigrp {
     uses eigrp-interface-address-family-config;
     leaf admin-state {
       type srl_nokia-comm:admin-state;
+      default "enable";
       description "Administrative state of the EIGRP interface";
     }
     leaf oper-state {
       config false;
       type srl_nokia-comm:oper-state;
       description "Operational state of the EIGRP interface";
+    }
+    leaf oper-down-reason {
+      config false;
+      type string;
+      description "Reason why the interface is operationally down";
     }
     leaf passive {
       type boolean;
@@ -293,6 +304,7 @@ module srl_nokia-eigrp {
       description "Bidirectional Forwarding Detection (BFD) interface configuration";
       leaf admin-state {
         type srl_nokia-comm:admin-state;
+        default "disable";
         description "Enable or disable BFD on this interface";
       }
       leaf oper-state {
@@ -609,6 +621,11 @@ module srl_nokia-eigrp {
         type srl_nokia-comm:oper-state;
         description "Operational state of the EIGRP protocol instance";
       }
+      leaf oper-down-reason {
+        config false;
+        type string;
+        description "Reason why the protocol instance is operationally down";
+      }
       leaf total-interfaces {
         config false;
         type uint32;
@@ -639,6 +656,7 @@ module srl_nokia-eigrp {
         leaf bfd-state { type string; description "BFD session operational state"; }
         leaf restart-state { type string; description "Graceful restart status"; }
         leaf auth-mode { type string; description "Authentication mode negotiated/used"; }
+        leaf oper-down-reason { type string; description "Reason why neighbor is down or failed to establish"; }
       }
       list route {
         key "prefix";
@@ -668,6 +686,11 @@ module srl_nokia-eigrp {
           config false;
           type srl_nokia-comm:oper-state;
           description "Operational state of the static neighbor";
+        }
+        leaf oper-down-reason {
+          config false;
+          type string;
+          description "Reason why the static neighbor is operationally down";
         }
       }
       list topology {
