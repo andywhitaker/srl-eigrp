@@ -1,6 +1,6 @@
 # EIGRP for Nokia SR Linux (NDK Protocol Daemon)
 
-[![Build & Tests](https://img.shields.io/badge/tests-38%20passed-brightgreen.svg)]()
+[![Build & Tests](https://img.shields.io/badge/tests-47%20passed-brightgreen.svg)]()
 [![Platform](https://img.shields.io/badge/platform-Nokia%20SR%20Linux%2024.x%2B-blue.svg)]()
 [![License](https://img.shields.io/badge/license-GPL--2.0-yellow.svg)]()
 
@@ -10,23 +10,56 @@ This daemon (`srl-eigrpd`) runs as an in-process protocol agent inside SR Linux,
 
 ---
 
-## ⚡ Quick Start: 3 Simple Steps
+## ⚡ Installation & Quick Start
 
-Loading EIGRP onto your Nokia SR Linux switch or container takes less than two minutes.
+Installing EIGRP onto Nokia SR Linux takes less than two minutes whether running on physical hardware, virtual machines, or containerized lab environments.
 
-### Step 1: Install the Package (Pre-Built Binary or Build from Source)
-You can either download the pre-built release package (`srl-eigrpd_0.1.0_amd64.deb`) or compile it from source using `make package`.
+### Step 1: Package Installation
 
-Copy the Debian package to your SR Linux device and install it:
+#### Option A: Production Switches & Virtual Machines (Bare-Metal / VM / KVM / ESXi)
+On production hardware switches (e.g., Nokia 7220 IXR, 7250 IXR) or virtual appliances (SR Linux VM):
 
-```bash
-# On your SR Linux bash shell:
-sudo dpkg -i srl-eigrpd_0.1.0_amd64.deb
-```
-> [!NOTE]
-> The package installer automatically verifies your Control Plane Protection (CPM) filter, registers the YANG data models, and integrates with the SR Linux Application Manager (`app_mgr`).
+1. **Transfer the Package**:
+   ```bash
+   scp dist/srl-eigrpd_0.1.0_amd64.deb admin@<switch-ip>:/tmp/
+   ```
 
-#### Containerlab Automated Deployment Recipe
+2. **Install via Debian Package Manager**:
+   Log into the switch via SSH, enter the underlying Linux shell, and install:
+   ```bash
+   # From sr_cli:
+   A:srl1# bash
+   
+   # In bash:
+   sudo dpkg -i /tmp/srl-eigrpd_0.1.0_amd64.deb
+   ```
+   > [!NOTE]
+   > The package post-installation script automatically:
+   > - Dynamically verifies Control Plane Protection (CPM) filters for IP protocol 88 (without clobbering existing filter entry IDs).
+   > - Installs the dynamic YANG schemas in `/opt/srlinux/models/srl_nokia/models/network-instance/`.
+   > - Deploys CLI plugins to `/etc/opt/srlinux/cli/plugins/`.
+   > - Registers the daemon with the SR Linux Application Manager (`/etc/opt/srlinux/appmgr/srl-eigrpd.yml`).
+
+3. **Verify Daemon & AppMgr Status**:
+   Back in `sr_cli`:
+   ```text
+   A:srl1# info from state system app-management application srl_eigrpd
+       state running
+       last-start-time "..."
+   ```
+
+4. **Verify CPM Filter**:
+   ```text
+   A:srl1# tools network-instance default protocols eigrp check-cpm
+   ================================================================================
+   Control Plane Management (CPM) Filter Status for EIGRP
+   --------------------------------------------------------------------------------
+   IPv4 CPM Filter (protocol 88): Accepted (Entry 88)
+   IPv6 CPM Filter (next-header 88): Accepted (Entry 88)
+   ================================================================================
+   ```
+
+#### Option B: Containerlab Automated Deployment Recipe
 When automating lab deployments in Containerlab, SR Linux management services initialize asynchronously. To prevent startup race conditions (such as attempting package installation before the CLI is ready, or applying candidate commits during YANG schema reloads), use the following verified startup pipeline on your containerlab nodes:
 
 ```yaml
@@ -34,7 +67,7 @@ topology:
   kinds:
     nokia_srlinux:
       binds:
-        - srl-eigrpd_0.1.0_amd64.deb:/tmp/srl-eigrpd.deb:ro
+        - dist/srl-eigrpd_0.1.0_amd64.deb:/tmp/srl-eigrpd.deb:ro
   nodes:
     srl1:
       kind: nokia_srlinux
@@ -61,24 +94,27 @@ set / interface ethernet-1/1 subinterface 0 ipv4 address 10.0.0.1/30
 # 2. Add interface to network-instance default
 set / network-instance default interface ethernet-1/1.0
 
-# 3. Enable EIGRP Autonomous System 100
+# 3. Enable EIGRP Autonomous System 100 & Router ID
 set / network-instance default protocols eigrp admin-state enable
 set / network-instance default protocols eigrp autonomous-system 100
 set / network-instance default protocols eigrp router-id 192.0.2.1
 
-# 4. Set global default interface settings (optional)
-set / network-instance default protocols eigrp default-interface hello-interval 5
-set / network-instance default protocols eigrp default-interface hold-time 15
+# 4. Enable address family (defaults to enable if address is present)
+set / network-instance default protocols eigrp address-family ipv4-unicast admin-state enable
 
-# 5. Enable EIGRP on specific interfaces (admin-state defaults to enable!)
+# 5. Set default-interface parameters (optional)
+set / network-instance default protocols eigrp default-interface address-family ipv4-unicast hello-interval 5
+set / network-instance default protocols eigrp default-interface address-family ipv4-unicast hold-time 15
+
+# 6. Enable EIGRP on specific interfaces (admin-state defaults to enable!)
 set / network-instance default protocols eigrp interface ethernet-1/1.0
-set / network-instance default protocols eigrp interface system0.0 passive true
+set / network-instance default protocols eigrp interface system0.0 address-family ipv4-unicast passive true
 
 commit now
 ```
 
 > [!TIP]
-> **Zero Boilerplate:** According to the YANG schema defaults, interface `admin-state` defaults directly to `enable`. Simply creating the interface under `/ network-instance <name> protocols eigrp interface <name>` immediately brings it up without requiring an explicit `admin-state enable` command.
+> **Zero Boilerplate:** According to the YANG schema defaults, interface `admin-state` defaults directly to `enable`. Simply creating the interface under `/ network-instance <name> protocols eigrp interface <name>` immediately brings it up without requiring an explicit `admin-state enable` command. To persist across switch reboots on physical hardware, run `save startup` or `/commit save-running`.
 
 ---
 
@@ -194,10 +230,10 @@ All features are fully modeled in YANG under `/network-instance <name>/protocols
 Like SR Linux OSPF and IS-IS, interfaces are configured under `interface <name>` and inherit settings from `default-interface`:
 ```text
 set / network-instance default protocols eigrp default-interface admin-state enable
-set / network-instance default protocols eigrp default-interface hello-interval 5
-set / network-instance default protocols eigrp default-interface hold-time 15
+set / network-instance default protocols eigrp default-interface address-family ipv4-unicast hello-interval 5
+set / network-instance default protocols eigrp default-interface address-family ipv4-unicast hold-time 15
 set / network-instance default protocols eigrp interface ethernet-1/1.0 admin-state enable
-set / network-instance default protocols eigrp interface system0.0 passive true
+set / network-instance default protocols eigrp interface system0.0 address-family ipv4-unicast passive true
 ```
 
 ### 2. Unequal-Cost Load Balancing (Variance)
@@ -215,11 +251,12 @@ set / network-instance default protocols eigrp maximum-paths 4
 ### 4. Named Metric Weights (K-Values)
 Configure K-values using semantic parameter names:
 ```text
-set / network-instance default protocols eigrp metrics bandwidth 1     # K1: Bandwidth
-set / network-instance default protocols eigrp metrics load 0          # K2: Load
-set / network-instance default protocols eigrp metrics delay 1         # K3: Delay
-set / network-instance default protocols eigrp metrics reliability 0   # K4: Reliability
-set / network-instance default protocols eigrp metrics mtu 0           # K5: MTU
+set / network-instance default protocols eigrp metrics bandwidth 1             # K1: Bandwidth
+set / network-instance default protocols eigrp metrics load 0                  # K2: Load
+set / network-instance default protocols eigrp metrics delay 1                 # K3: Delay
+set / network-instance default protocols eigrp metrics reliability 0           # K4: Reliability
+set / network-instance default protocols eigrp metrics mtu 0                   # K5: MTU
+set / network-instance default protocols eigrp metrics extended-attributes 0    # K6: Extended attributes
 ```
 
 ### 5. Address Families & Routing Policy Redistribution (`export-policy` / `import-policy`)
@@ -259,7 +296,8 @@ set / network-instance vrf-1 protocols eigrp admin-state enable
 set / network-instance vrf-1 protocols eigrp autonomous-system 200
 set / network-instance vrf-1 protocols eigrp router-id 192.0.2.11
 set / network-instance vrf-1 protocols eigrp interface ethernet-1/1.1 admin-state enable
-set / network-instance vrf-1 protocols eigrp interface lo0.1 admin-state enable passive true
+set / network-instance vrf-1 protocols eigrp interface lo0.1 admin-state enable
+set / network-instance vrf-1 protocols eigrp interface lo0.1 address-family ipv4-unicast passive true
 ```
 All routes, FIB injection via NDK, and telemetry streaming are completely isolated per network instance and viewable via `show network-instance <name> protocols eigrp ...`.
 
@@ -552,7 +590,7 @@ Deploys two interconnected SR Linux nodes (`srl1` <-> `srl2`) running EIGRP:
 make deploy-srl
 make test-srl
 ```
-**38 Automated Tests Executed (100% Pass Rate):**
+**47 Automated Tests Executed (100% Pass Rate):**
 - **IPv4 Default Instance**: Neighbor discovery, FIB route injection (preference 90), data plane ping, CLI show summary/neighbor/routes/interfaces/topology/traffic, State DB verification, CPM filter validation, tools neighbor clear & reset-all.
 - **Config & Policy Enhancements**: Default-interface configuration, passive interface inheritance, named metrics keys, routing-policy metric augmentation, dynamic interface deletion and re-addition.
 - **Dual Admin/Oper State & Summarization**: Dual administrative and operational state modeling across all administrative controls, and dynamic summary-address tracking in State DB.

@@ -348,38 +348,6 @@ module srl_nokia-eigrp {
       type srl_nokia-comm:oper-state;
       description "Operational state of EIGRP default-interface";
     }
-    leaf passive {
-      status deprecated;
-      type boolean;
-      default false;
-      description "Deprecated: Use address-family passive instead. Suppress sending/receiving EIGRP hellos on interfaces by default";
-    }
-    leaf hello-interval {
-      status deprecated;
-      type uint16 { range "1..65535"; }
-      default 5;
-      units "seconds";
-      description "Deprecated: Use address-family hello-interval instead. Hello interval in seconds by default";
-    }
-    leaf hold-time {
-      status deprecated;
-      type uint16 { range "1..65535"; }
-      default 15;
-      units "seconds";
-      description "Deprecated: Use address-family hold-time instead. Hold time in seconds by default";
-    }
-    leaf split-horizon {
-      status deprecated;
-      type boolean;
-      default true;
-      description "Deprecated: Use address-family split-horizon instead. Enable or disable split-horizon on interfaces by default";
-    }
-    leaf next-hop-self {
-      status deprecated;
-      type boolean;
-      default false;
-      description "Deprecated: Use address-family next-hop-self instead. Advertise this router as next hop on interfaces by default";
-    }
     leaf bandwidth {
       type uint32 { range "1..10000000"; }
       units "kilobits-per-second";
@@ -389,76 +357,6 @@ module srl_nokia-eigrp {
       type uint32 { range "1..16777215"; }
       units "10-microseconds";
       description "Interface delay in 10-microsecond units by default";
-    }
-    container authentication {
-      status deprecated;
-      description "Deprecated: Use address-family authentication instead. Authentication configuration applied by default to interfaces";
-      leaf admin-state {
-        type srl_nokia-comm:admin-state;
-        default "enable";
-        description "Administrative state of authentication by default";
-      }
-      leaf oper-state {
-        config false;
-        type srl_nokia-comm:oper-state;
-        description "Operational state of authentication";
-      }
-      leaf mode {
-        type enumeration {
-          enum none;
-          enum md5;
-          enum hmac-sha-256;
-        }
-        default "none";
-        description "Authentication mode for EIGRP packets";
-      }
-      leaf keychain {
-        type leafref {
-          path "/srl_nokia-system:system/srl_nokia-keychains:authentication/srl_nokia-keychains:keychain/srl_nokia-keychains:name";
-        }
-        description "Reference to system authentication keychain (/system/authentication/keychain)";
-      }
-      leaf authentication-key {
-        type string;
-        description "Direct plaintext authentication key or password";
-      }
-    }
-    container bfd {
-      status deprecated;
-      description "Deprecated: Use address-family bfd instead. Bidirectional Forwarding Detection (BFD) default interface configuration";
-      leaf admin-state {
-        type srl_nokia-comm:admin-state;
-        default "disable";
-        description "Administrative state of BFD on interfaces by default";
-      }
-      leaf oper-state {
-        config false;
-        type srl_nokia-comm:oper-state;
-        description "Operational state of BFD on default interface";
-      }
-      leaf desired-minimum-tx-interval {
-        type uint32 {
-          range "10000..100000000";
-        }
-        units "microseconds";
-        default "1000000";
-        description "Desired minimum transmit interval in microseconds";
-      }
-      leaf required-minimum-receive {
-        type uint32 {
-          range "10000..100000000";
-        }
-        units "microseconds";
-        default "1000000";
-        description "Required minimum receive interval in microseconds";
-      }
-      leaf detection-multiplier {
-        type uint8 {
-          range "1..20";
-        }
-        default "3";
-        description "Detection multiplier for BFD session";
-      }
     }
   }
 
@@ -479,33 +377,6 @@ module srl_nokia-eigrp {
       type string;
       description "Reason why the interface is operationally down";
     }
-    leaf passive {
-      status deprecated;
-      type boolean;
-      description "Deprecated: Use address-family passive instead. Suppress sending/receiving EIGRP hellos on this interface";
-    }
-    leaf hello-interval {
-      status deprecated;
-      type uint16 { range "1..65535"; }
-      units "seconds";
-      description "Deprecated: Use address-family hello-interval instead. Hello interval in seconds";
-    }
-    leaf hold-time {
-      status deprecated;
-      type uint16 { range "1..65535"; }
-      units "seconds";
-      description "Deprecated: Use address-family hold-time instead. Hold time in seconds";
-    }
-    leaf split-horizon {
-      status deprecated;
-      type boolean;
-      description "Deprecated: Use address-family split-horizon instead. Enable or disable split-horizon on this interface";
-    }
-    leaf next-hop-self {
-      status deprecated;
-      type boolean;
-      description "Deprecated: Use address-family next-hop-self instead. Advertise this router as next hop on this interface";
-    }
     leaf bandwidth {
       type uint32 { range "1..10000000"; }
       units "kilobits-per-second";
@@ -515,108 +386,6 @@ module srl_nokia-eigrp {
       type uint32 { range "1..16777215"; }
       units "10-microseconds";
       description "Configured interface delay in 10-microsecond units";
-    }
-    list summary-address {
-      status deprecated;
-      key "prefix";
-      description "Deprecated: Use address-family summary-address instead. Configure summary address on this interface";
-      leaf prefix {
-        type srl_nokia-comm:ip-prefix;
-        description "Summary IP prefix to advertise";
-      }
-      leaf distance {
-        type uint8 { range "1..255"; }
-        default 5;
-        description "Administrative distance for summary discard route";
-      }
-      leaf oper-state {
-        config false;
-        type srl_nokia-comm:oper-state;
-        description "Operational state of the summary address route";
-      }
-    }
-    container authentication {
-      status deprecated;
-      description "Deprecated: Use address-family authentication instead. Interface packet authentication configuration";
-      leaf admin-state {
-        type srl_nokia-comm:admin-state;
-        default "enable";
-        description "Administrative state of authentication";
-      }
-      leaf oper-state {
-        config false;
-        type srl_nokia-comm:oper-state;
-        description "Operational state of authentication";
-      }
-      leaf mode {
-        type enumeration {
-          enum none;
-          enum md5;
-          enum hmac-sha-256;
-        }
-        default "none";
-        description "Authentication mode for EIGRP packets";
-      }
-      leaf keychain {
-        type leafref {
-          path "/srl_nokia-system:system/srl_nokia-keychains:authentication/srl_nokia-keychains:keychain/srl_nokia-keychains:name";
-        }
-        description "Reference to system authentication keychain (/system/authentication/keychain)";
-      }
-      leaf authentication-key {
-        type string;
-        description "Direct plaintext authentication key or password";
-      }
-    }
-    container bfd {
-      status deprecated;
-      description "Deprecated: Use address-family bfd instead. Bidirectional Forwarding Detection (BFD) interface configuration";
-      leaf admin-state {
-        type srl_nokia-comm:admin-state;
-        default "disable";
-        description "Enable or disable BFD on this interface";
-      }
-      leaf oper-state {
-        config false;
-        type srl_nokia-comm:oper-state;
-        description "Operational state of BFD on this interface";
-      }
-      leaf desired-minimum-tx-interval {
-        type uint32 {
-          range "10000..100000000";
-        }
-        units "microseconds";
-        default "1000000";
-        description "Desired minimum transmit interval in microseconds";
-      }
-      leaf required-minimum-receive {
-        type uint32 {
-          range "10000..100000000";
-        }
-        units "microseconds";
-        default "1000000";
-        description "Required minimum receive interval in microseconds";
-      }
-      leaf detection-multiplier {
-        type uint8 {
-          range "1..20";
-        }
-        default "3";
-        description "Detection multiplier for BFD session";
-      }
-    }
-    container bfd-state {
-      status deprecated;
-      config false;
-      description "Deprecated: Use address-family bfd-state instead. Operational state of BFD on the interface";
-      leaf session-state {
-        type string;
-        description "BFD session state (up, down, admin-down, init)";
-      }
-      leaf remote-address {
-        type srl_nokia-comm:ip-address;
-        description "Remote peer address monitored by BFD";
-      }
     }
   }
 
@@ -725,22 +494,10 @@ module srl_nokia-eigrp {
           default 0;
           description "MTU weight (K5)";
         }
-        leaf k6 {
-          type uint8;
-          default 0;
-          description "Extended attributes weight (K6)";
-        }
         leaf extended-attributes {
           type uint8;
           default 0;
           description "Extended attributes weight (K6)";
-        }
-        leaf rib-scale {
-          type uint8 {
-            range "1..255";
-          }
-          default 128;
-          description "Scale factor for converting 64-bit wide metrics to 32-bit RIB metrics";
         }
       }
       container default-interface {

@@ -547,18 +547,19 @@ type TimersConfig struct {
 }
 
 type MetricsConfig struct {
-	Bandwidth   uint8  `json:"bandwidth"`
-	Load        uint8  `json:"load"`
-	Delay       uint8  `json:"delay"`
-	Reliability uint8  `json:"reliability"`
-	Mtu         uint8  `json:"mtu"`
-	K1          *uint8 `json:"k1,omitempty"`
-	K2          *uint8 `json:"k2,omitempty"`
-	K3          *uint8 `json:"k3,omitempty"`
-	K4          *uint8 `json:"k4,omitempty"`
-	K5          *uint8 `json:"k5,omitempty"`
-	K6          *uint8 `json:"k6,omitempty"`
-	RibScale    *uint8 `json:"rib-scale,omitempty"`
+	Bandwidth          uint8  `json:"bandwidth"`
+	Load               uint8  `json:"load"`
+	Delay              uint8  `json:"delay"`
+	Reliability        uint8  `json:"reliability"`
+	Mtu                uint8  `json:"mtu"`
+	ExtendedAttributes *uint8 `json:"extended-attributes,omitempty"`
+	K1                 *uint8 `json:"k1,omitempty"`
+	K2                 *uint8 `json:"k2,omitempty"`
+	K3                 *uint8 `json:"k3,omitempty"`
+	K4                 *uint8 `json:"k4,omitempty"`
+	K5                 *uint8 `json:"k5,omitempty"`
+	K6                 *uint8 `json:"k6,omitempty"`
+	RibScale           *uint8 `json:"rib-scale,omitempty"`
 }
 
 type PolicyMetricConfig struct {
@@ -950,7 +951,9 @@ func (d *EigrpDaemon) applyMetrics(netinst string, m *MetricsConfig, ribScale ui
 			k5 = *m.K5
 		}
 
-		if m.K6 != nil {
+		if m.ExtendedAttributes != nil {
+			k6 = *m.ExtendedAttributes
+		} else if m.K6 != nil {
 			k6 = *m.K6
 		}
 	}
@@ -1428,31 +1431,73 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 				var p bool
 				if err := json.Unmarshal([]byte(jsonStr), &p); err == nil {
 					inst.defaultIntf.SetAfiPassive(afName, &p)
+				} else {
+					var leaf struct {
+						Passive bool `json:"passive"`
+					}
+					if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
+						inst.defaultIntf.SetAfiPassive(afName, &leaf.Passive)
+					}
 				}
 			} else if strings.Contains(jsPath, ".hello-interval") {
 				var h uint16
 				if err := json.Unmarshal([]byte(jsonStr), &h); err == nil {
 					inst.defaultIntf.SetAfiHelloInterval(afName, &h)
+				} else {
+					var leaf struct {
+						HelloInterval uint16 `json:"hello-interval"`
+					}
+					if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
+						inst.defaultIntf.SetAfiHelloInterval(afName, &leaf.HelloInterval)
+					}
 				}
 			} else if strings.Contains(jsPath, ".hold-time") {
 				var h uint16
 				if err := json.Unmarshal([]byte(jsonStr), &h); err == nil {
 					inst.defaultIntf.SetAfiHoldTime(afName, &h)
+				} else {
+					var leaf struct {
+						HoldTime uint16 `json:"hold-time"`
+					}
+					if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
+						inst.defaultIntf.SetAfiHoldTime(afName, &leaf.HoldTime)
+					}
 				}
 			} else if strings.Contains(jsPath, ".split-horizon") {
 				var sh bool
 				if err := json.Unmarshal([]byte(jsonStr), &sh); err == nil {
 					inst.defaultIntf.SetAfiSplitHorizon(afName, &sh)
+				} else {
+					var leaf struct {
+						SplitHorizon bool `json:"split-horizon"`
+					}
+					if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
+						inst.defaultIntf.SetAfiSplitHorizon(afName, &leaf.SplitHorizon)
+					}
 				}
 			} else if strings.Contains(jsPath, ".next-hop-self") {
 				var nhs bool
 				if err := json.Unmarshal([]byte(jsonStr), &nhs); err == nil {
 					inst.defaultIntf.SetAfiNextHopSelf(afName, &nhs)
+				} else {
+					var leaf struct {
+						NextHopSelf bool `json:"next-hop-self"`
+					}
+					if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
+						inst.defaultIntf.SetAfiNextHopSelf(afName, &leaf.NextHopSelf)
+					}
 				}
 			} else if strings.Contains(jsPath, ".admin-state") {
 				var s string
-				if err := json.Unmarshal([]byte(jsonStr), &s); err == nil {
+				if err := json.Unmarshal([]byte(jsonStr), &s); err == nil && s != "" {
 					inst.defaultIntf.SetAfiAdminState(afName, s)
+				} else {
+					var leaf struct {
+						AdminState string `json:"admin-state"`
+					}
+					if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil && leaf.AdminState != "" {
+						inst.defaultIntf.SetAfiAdminState(afName, leaf.AdminState)
+					}
 				}
 			} else if strings.Contains(jsPath, ".authentication") {
 				var auth AuthConfig

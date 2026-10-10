@@ -83,12 +83,8 @@ func buildInterfaceData(
 	ipAddr string,
 	prefixLen uint32,
 	rawOperState string,
-	passive bool,
-	bfdSessionState string,
-	bfdRemoteAddr string,
 	ic *InterfaceConfig,
 	defIntf *DefaultInterfaceConfig,
-	instAuth *AuthConfig,
 	instOperState string,
 ) map[string]interface{} {
 	adminState := "enable"
@@ -107,50 +103,10 @@ func buildInterfaceData(
 		}
 	}
 
-	isPassive := passive
-	if ic != nil && ic.Passive != nil {
-		isPassive = *ic.Passive
-	} else if defIntf != nil {
-		isPassive = defIntf.Passive
-	}
-
-	helloInterval := uint16(5)
-	if ic != nil && ic.HelloInterval != nil && *ic.HelloInterval > 0 {
-		helloInterval = *ic.HelloInterval
-	} else if defIntf != nil && defIntf.HelloInterval > 0 {
-		helloInterval = defIntf.HelloInterval
-	}
-
-	holdTime := uint16(15)
-	if ic != nil && ic.HoldTime != nil && *ic.HoldTime > 0 {
-		holdTime = *ic.HoldTime
-	} else if defIntf != nil && defIntf.HoldTime > 0 {
-		holdTime = defIntf.HoldTime
-	}
-
-	splitHorizon := true
-	if ic != nil && ic.SplitHorizon != nil {
-		splitHorizon = *ic.SplitHorizon
-	} else if defIntf != nil && defIntf.SplitHorizon != nil {
-		splitHorizon = *defIntf.SplitHorizon
-	}
-
-	nextHopSelf := false
-	if ic != nil && ic.NextHopSelf != nil {
-		nextHopSelf = *ic.NextHopSelf
-	} else if defIntf != nil && defIntf.NextHopSelf != nil {
-		nextHopSelf = *defIntf.NextHopSelf
-	}
-
 	data := map[string]interface{}{
 		"interface-name": normName,
 		"admin-state":    adminState,
 		"oper-state":     operState,
-		"passive":        isPassive,
-		"hello-interval": helloInterval,
-		"hold-time":      holdTime,
-		"split-horizon":  splitHorizon,
-		"next-hop-self":  nextHopSelf,
 	}
 
 	if operState != "up" {
@@ -182,79 +138,6 @@ func buildInterfaceData(
 		data["delay"] = *ic.Delay
 	} else if defIntf != nil && defIntf.Delay != nil && *defIntf.Delay > 0 {
 		data["delay"] = *defIntf.Delay
-	}
-
-	var authCfg *AuthConfig
-	if ic != nil && ic.Authentication != nil && ic.Authentication.Mode != "" {
-		authCfg = ic.Authentication
-	} else if defIntf != nil && defIntf.Authentication != nil && defIntf.Authentication.Mode != "" {
-		authCfg = defIntf.Authentication
-	} else if instAuth != nil && instAuth.Mode != "" {
-		authCfg = instAuth
-	}
-	if authCfg != nil {
-		authMap := map[string]interface{}{
-			"mode": authCfg.Mode,
-		}
-		if authCfg.Keychain != "" {
-			authMap["keychain"] = authCfg.Keychain
-		}
-		if authCfg.AuthenticationKey != "" {
-			authMap["authentication-key"] = authCfg.AuthenticationKey
-		}
-		data["authentication"] = authMap
-	}
-
-	bfdAdmin := "disable"
-	bfdTx := uint32(1000000)
-	bfdRx := uint32(1000000)
-	bfdMult := uint8(3)
-	if defIntf != nil && defIntf.Bfd != nil {
-		if defIntf.Bfd.AdminState != "" {
-			bfdAdmin = defIntf.Bfd.AdminState
-		}
-		if defIntf.Bfd.DesiredMinimumTxInterval != nil && *defIntf.Bfd.DesiredMinimumTxInterval > 0 {
-			bfdTx = *defIntf.Bfd.DesiredMinimumTxInterval
-		}
-		if defIntf.Bfd.RequiredMinimumReceive != nil && *defIntf.Bfd.RequiredMinimumReceive > 0 {
-			bfdRx = *defIntf.Bfd.RequiredMinimumReceive
-		}
-		if defIntf.Bfd.DetectionMultiplier != nil && *defIntf.Bfd.DetectionMultiplier > 0 {
-			bfdMult = *defIntf.Bfd.DetectionMultiplier
-		}
-	}
-	if ic != nil && ic.Bfd != nil {
-		if ic.Bfd.AdminState != "" {
-			bfdAdmin = ic.Bfd.AdminState
-		}
-		if ic.Bfd.DesiredMinimumTxInterval != nil && *ic.Bfd.DesiredMinimumTxInterval > 0 {
-			bfdTx = *ic.Bfd.DesiredMinimumTxInterval
-		}
-		if ic.Bfd.RequiredMinimumReceive != nil && *ic.Bfd.RequiredMinimumReceive > 0 {
-			bfdRx = *ic.Bfd.RequiredMinimumReceive
-		}
-		if ic.Bfd.DetectionMultiplier != nil && *ic.Bfd.DetectionMultiplier > 0 {
-			bfdMult = *ic.Bfd.DetectionMultiplier
-		}
-	}
-
-	bfdOper := "down"
-	if bfdAdmin == "enable" && operState == "up" {
-		bfdOper = "up"
-	}
-	data["bfd"] = map[string]interface{}{
-		"admin-state":                 bfdAdmin,
-		"oper-state":                  bfdOper,
-		"desired-minimum-tx-interval": bfdTx,
-		"required-minimum-receive":   bfdRx,
-		"detection-multiplier":        bfdMult,
-	}
-
-	if bfdSessionState != "" {
-		data["bfd-state"] = map[string]interface{}{
-			"session-state":  bfdSessionState,
-			"remote-address": bfdRemoteAddr,
-		}
 	}
 
 	return data
@@ -515,36 +398,6 @@ func publishInterfaceSublists(
 						Data: &ndk.TelemetryData{JsonContent: string(b)},
 					})
 				}
-			}
-		}
-	}
-
-	// Also publish top-level summary-address for backward compatibility
-	if ic != nil && len(ic.SummaryAddress) > 0 {
-		for _, sa := range ic.SummaryAddress {
-			if sa.Prefix == "" {
-				continue
-			}
-			dist := sa.Distance
-			if dist == 0 {
-				dist = 5
-			}
-			saKey := fmt.Sprintf(".network_instance{.name==\"%s\"}.protocols.eigrp.interface{.interface-name==\"%s\"}.summary-address{.prefix==\"%s\"}", ni, normName, sa.Prefix)
-			currentKeys[saKey] = struct{}{}
-			saOper := "up"
-			if operStateNorm == "down" || instOperState == "down" {
-				saOper = "down"
-			}
-			saData := map[string]interface{}{
-				"prefix":     sa.Prefix,
-				"distance":   dist,
-				"oper-state": saOper,
-			}
-			if b, err := json.Marshal(saData); err == nil {
-				*states = append(*states, &ndk.TelemetryInfo{
-					Key:  &ndk.TelemetryKey{JsPath: saKey},
-					Data: &ndk.TelemetryData{JsonContent: string(b)},
-				})
 			}
 		}
 	}
@@ -928,49 +781,22 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 
 		// Default interface data
 		defIntfAdmin := "enable"
-		defIntfPass := false
-		defIntfHello := uint16(5)
-		defIntfHold := uint16(15)
-		defIntfSplit := true
-		defIntfNextHop := false
 		var defIntfBw *uint32
 		var defIntfDelay *uint32
-		var defIntfAuth *AuthConfig
-		var defIntfBfd *BfdConfig
 		if item.defaultIntf != nil {
 			if item.defaultIntf.AdminState != "" {
 				defIntfAdmin = item.defaultIntf.AdminState
 			}
-			defIntfPass = item.defaultIntf.Passive
-			if item.defaultIntf.HelloInterval > 0 {
-				defIntfHello = item.defaultIntf.HelloInterval
-			}
-			if item.defaultIntf.HoldTime > 0 {
-				defIntfHold = item.defaultIntf.HoldTime
-			}
-			if item.defaultIntf.SplitHorizon != nil {
-				defIntfSplit = *item.defaultIntf.SplitHorizon
-			}
-			if item.defaultIntf.NextHopSelf != nil {
-				defIntfNextHop = *item.defaultIntf.NextHopSelf
-			}
 			defIntfBw = item.defaultIntf.Bandwidth
 			defIntfDelay = item.defaultIntf.Delay
-			defIntfAuth = item.defaultIntf.Authentication
-			defIntfBfd = item.defaultIntf.Bfd
 		}
 		defOper := "up"
 		if item.operState == "down" || defIntfAdmin == "disable" {
 			defOper = "down"
 		}
 		defIntfData := map[string]interface{}{
-			"admin-state":    defIntfAdmin,
-			"oper-state":     defOper,
-			"passive":        defIntfPass,
-			"hello-interval": defIntfHello,
-			"hold-time":      defIntfHold,
-			"split-horizon":  defIntfSplit,
-			"next-hop-self":  defIntfNextHop,
+			"admin-state": defIntfAdmin,
+			"oper-state":  defOper,
 		}
 		if defIntfBw != nil && *defIntfBw > 0 {
 			defIntfData["bandwidth"] = *defIntfBw
@@ -978,52 +804,13 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 		if defIntfDelay != nil && *defIntfDelay > 0 {
 			defIntfData["delay"] = *defIntfDelay
 		}
-		if defIntfAuth != nil && defIntfAuth.Mode != "" {
-			aMap := map[string]interface{}{"mode": defIntfAuth.Mode}
-			if defIntfAuth.Keychain != "" {
-				aMap["keychain"] = defIntfAuth.Keychain
-			}
-			if defIntfAuth.AuthenticationKey != "" {
-				aMap["authentication-key"] = defIntfAuth.AuthenticationKey
-			}
-			defIntfData["authentication"] = aMap
-		}
-		bfdDefAdmin := "disable"
-		bfdDefTx := uint32(1000000)
-		bfdDefRx := uint32(1000000)
-		bfdDefMult := uint8(3)
-		if defIntfBfd != nil {
-			if defIntfBfd.AdminState != "" {
-				bfdDefAdmin = defIntfBfd.AdminState
-			}
-			if defIntfBfd.DesiredMinimumTxInterval != nil && *defIntfBfd.DesiredMinimumTxInterval > 0 {
-				bfdDefTx = *defIntfBfd.DesiredMinimumTxInterval
-			}
-			if defIntfBfd.RequiredMinimumReceive != nil && *defIntfBfd.RequiredMinimumReceive > 0 {
-				bfdDefRx = *defIntfBfd.RequiredMinimumReceive
-			}
-			if defIntfBfd.DetectionMultiplier != nil && *defIntfBfd.DetectionMultiplier > 0 {
-				bfdDefMult = *defIntfBfd.DetectionMultiplier
-			}
-		}
-		bfdDefOper := "down"
-		if bfdDefAdmin == "enable" && defOper == "up" {
-			bfdDefOper = "up"
-		}
-		defIntfData["bfd"] = map[string]interface{}{
-			"admin-state":                 bfdDefAdmin,
-			"oper-state":                  bfdDefOper,
-			"desired-minimum-tx-interval": bfdDefTx,
-			"required-minimum-receive":   bfdDefRx,
-			"detection-multiplier":        bfdDefMult,
-		}
 
 		// Default interface address families
 		for _, afName := range []string{"ipv4-unicast", "ipv6-unicast"} {
 			defAfKey := fmt.Sprintf(".network_instance{.name==\"%s\"}.protocols.eigrp.default-interface.address-family{.name==\"%s\"}", ni, afName)
 			currentKeys[defAfKey] = struct{}{}
 			defAfAdmin := defIntfAdmin
-			defAfPass := defIntfPass
+			defAfPass := false
 			defAfHello := uint16(5)
 			defAfHold := uint16(15)
 			defAfSplit := true
@@ -1154,7 +941,6 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 		delay := uint8(1)
 		rel := uint8(0)
 		mtu := uint8(0)
-		k6 := uint8(0)
 		extAttr := uint8(0)
 		ribScale := item.ribScale
 		if ribScale == 0 {
@@ -1181,12 +967,10 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 			if item.metrics.K5 != nil {
 				mtu = *item.metrics.K5
 			}
-			if item.metrics.K6 != nil {
-				k6 = *item.metrics.K6
+			if item.metrics.ExtendedAttributes != nil {
+				extAttr = *item.metrics.ExtendedAttributes
+			} else if item.metrics.K6 != nil {
 				extAttr = *item.metrics.K6
-			}
-			if item.metrics.RibScale != nil && *item.metrics.RibScale > 0 {
-				ribScale = *item.metrics.RibScale
 			}
 		}
 		metricsData := map[string]interface{}{
@@ -1195,9 +979,7 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 			"delay":               delay,
 			"reliability":         rel,
 			"mtu":                 mtu,
-			"k6":                  k6,
 			"extended-attributes": extAttr,
-			"rib-scale":           ribScale,
 		}
 
 		// Top-level delivery node (.network_instance{.name==ni}.protocols.eigrp)
@@ -1383,27 +1165,13 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 				ic = item.configuredInterfaces[i.Name]
 			}
 
-			var bfdSessionState string
-			var bfdRemoteAddr string
-			for _, n := range item.nbrList {
-				if normalizeIfName(n.Interface) == normName && n.BfdState != "" && n.BfdState != "disabled" {
-					bfdSessionState = n.BfdState
-					bfdRemoteAddr = n.IPAddress
-					break
-				}
-			}
-
 			intfData := buildInterfaceData(
 				normName,
 				i.IPAddress,
 				i.PrefixLen,
 				i.OperState,
-				i.Passive,
-				bfdSessionState,
-				bfdRemoteAddr,
 				ic,
 				item.defaultIntf,
-				item.authentication,
 				item.operState,
 			)
 
@@ -1446,12 +1214,8 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 				"",
 				0,
 				"down",
-				false,
-				"",
-				"",
 				ic,
 				item.defaultIntf,
-				item.authentication,
 				item.operState,
 			)
 

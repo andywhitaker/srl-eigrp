@@ -428,12 +428,21 @@ func (d *EigrpDaemon) OnNeighborReport(netinst, ip, ifname, state string, hold u
 
 	// Check whether BFD is enabled for this interface or instance
 	bfdEnabled := false
-	if ic, ok := inst.configuredInterfaces[ifname]; ok && ic.Bfd != nil && ic.Bfd.AdminState == "enable" {
-		bfdEnabled = true
-	} else if ic, ok := inst.configuredInterfaces[normIf]; ok && ic.Bfd != nil && ic.Bfd.AdminState == "enable" {
-		bfdEnabled = true
-	} else if inst.defaultIntf != nil && inst.defaultIntf.Bfd != nil && inst.defaultIntf.Bfd.AdminState == "enable" {
-		bfdEnabled = true
+	if ic, ok := inst.configuredInterfaces[ifname]; ok {
+		bfd := ic.GetAfiBfd(afiName, inst.defaultIntf)
+		if bfd != nil && bfd.AdminState == "enable" {
+			bfdEnabled = true
+		}
+	} else if ic, ok := inst.configuredInterfaces[normIf]; ok {
+		bfd := ic.GetAfiBfd(afiName, inst.defaultIntf)
+		if bfd != nil && bfd.AdminState == "enable" {
+			bfdEnabled = true
+		}
+	} else if inst.defaultIntf != nil {
+		bfd := inst.defaultIntf.GetAfiBfd(afiName)
+		if bfd != nil && bfd.AdminState == "enable" {
+			bfdEnabled = true
+		}
 	}
 
 	if bfdEnabled {

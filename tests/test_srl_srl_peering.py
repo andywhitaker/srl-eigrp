@@ -360,7 +360,7 @@ def test_default_interface_passive_inheritance(srl_exec):
     set_passive = """sr_cli << 'EOF'
 enter candidate
 discard stay
-set / network-instance default protocols eigrp default-interface passive true
+set / network-instance default protocols eigrp default-interface address-family ipv4-unicast passive true
 commit now
 EOF"""
     out_p = srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", set_passive])
@@ -384,7 +384,7 @@ EOF"""
         unset_passive = """sr_cli << 'EOF'
 enter candidate
 discard stay
-set / network-instance default protocols eigrp default-interface passive false
+set / network-instance default protocols eigrp default-interface address-family ipv4-unicast passive false
 commit now
 EOF"""
         srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", unset_passive])
@@ -906,14 +906,14 @@ def test_packet_authentication_md5_and_sha256(srl_exec):
 enter candidate
 discard stay
 set / system authentication keychain eigrp-test-md5 admin-state enable type ospf key 1 algorithm md5 authentication-key authsecret123
-set / network-instance default protocols eigrp interface ethernet-1/1.0 authentication mode md5 keychain eigrp-test-md5
+set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast authentication mode md5 keychain eigrp-test-md5
 commit now
 EOF"""
         cfg_srl2_md5 = """sr_cli << 'EOF'
 enter candidate
 discard stay
 set / system authentication keychain eigrp-test-md5 admin-state enable type ospf key 1 algorithm md5 authentication-key authsecret123
-set / network-instance default protocols eigrp interface ethernet-1/1.0 authentication mode md5 keychain eigrp-test-md5
+set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast authentication mode md5 keychain eigrp-test-md5
 commit now
 EOF"""
         srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_srl1_md5])
@@ -959,14 +959,14 @@ EOF"""
 enter candidate
 discard stay
 set / system authentication keychain eigrp-test-sha admin-state enable type isis key 1 algorithm hmac-sha-256 authentication-key shasecret456
-set / network-instance default protocols eigrp interface ethernet-1/1.0 authentication mode hmac-sha-256 keychain eigrp-test-sha
+set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast authentication mode hmac-sha-256 keychain eigrp-test-sha
 commit now
 EOF"""
         cfg_srl2_sha = """sr_cli << 'EOF'
 enter candidate
 discard stay
 set / system authentication keychain eigrp-test-sha admin-state enable type isis key 1 algorithm hmac-sha-256 authentication-key shasecret456
-set / network-instance default protocols eigrp interface ethernet-1/1.0 authentication mode hmac-sha-256 keychain eigrp-test-sha
+set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast authentication mode hmac-sha-256 keychain eigrp-test-sha
 commit now
 EOF"""
         srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_srl1_sha])
@@ -987,13 +987,13 @@ EOF"""
         cfg_srl1_direct = """sr_cli << 'EOF'
 enter candidate
 discard stay
-set / network-instance default protocols eigrp interface ethernet-1/1.0 authentication mode md5 authentication-key directsecret123
+set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast authentication mode md5 authentication-key directsecret123
 commit now
 EOF"""
         cfg_srl2_direct = """sr_cli << 'EOF'
 enter candidate
 discard stay
-set / network-instance default protocols eigrp interface ethernet-1/1.0 authentication mode md5 authentication-key directsecret123
+set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast authentication mode md5 authentication-key directsecret123
 commit now
 EOF"""
         srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_srl1_direct])
@@ -1020,7 +1020,7 @@ EOF"""
         cfg_revert = """sr_cli << 'EOF'
 enter candidate
 discard stay
-delete / network-instance default protocols eigrp interface ethernet-1/1.0 authentication
+delete / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast authentication
 delete / system authentication keychain eigrp-test-md5
 delete / system authentication keychain eigrp-test-sha
 commit now
@@ -1086,7 +1086,7 @@ def test_bfd_neighbor_teardown(srl_exec):
     # 1. Enable BFD on SRL1 & SRL2 interface
     cfg_bfd_enable = """sr_cli << 'EOF'
 enter candidate
-/ network-instance default protocols eigrp interface ethernet-1/1.0 bfd admin-state enable desired-minimum-tx-interval 100000 required-minimum-receive 100000 detection-multiplier 3
+/ network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast bfd admin-state enable desired-minimum-tx-interval 100000 required-minimum-receive 100000 detection-multiplier 3
 commit now
 EOF"""
     srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_bfd_enable])
@@ -1131,7 +1131,7 @@ EOF"""
     # 4. Clean up BFD config
     cfg_bfd_clean = """sr_cli << 'EOF'
 enter candidate
-delete / network-instance default protocols eigrp interface ethernet-1/1.0 bfd
+delete / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast bfd
 commit now
 EOF"""
     srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_bfd_clean])
@@ -1233,7 +1233,7 @@ def test_summary_address_state_db(srl_exec):
         cfg_sa = """sr_cli << 'EOF'
 enter candidate
 discard stay
-set / network-instance default protocols eigrp interface ethernet-1/1.0 summary-address 10.128.0.0/16 distance 15
+set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast summary-address 10.128.0.0/16 distance 15
 commit now
 EOF"""
         srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_sa])
@@ -1253,7 +1253,7 @@ EOF"""
         cfg_clean = """sr_cli << 'EOF'
 enter candidate
 discard stay
-delete / network-instance default protocols eigrp interface ethernet-1/1.0 summary-address 10.128.0.0/16
+delete / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast summary-address 10.128.0.0/16
 commit now
 EOF"""
         srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_clean])
@@ -1272,7 +1272,7 @@ EOF"""
         cfg_ensure = """sr_cli << 'EOF'
 enter candidate
 discard stay
-delete / network-instance default protocols eigrp interface ethernet-1/1.0 summary-address 10.128.0.0/16
+delete / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast summary-address 10.128.0.0/16
 commit now
 EOF"""
         srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_ensure])
