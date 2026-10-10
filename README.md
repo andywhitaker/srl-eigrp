@@ -125,20 +125,22 @@ The package includes native CLI plugins extending both `show` and `tools` operat
 | `show ... protocols eigrp routes` | Routes programmed in FIB, next-hops, composite metric, route type (Internal/External), and preference |
 | `show ... protocols eigrp topology` | DUAL topology table showing passive/active prefixes, successor count, Feasible Distance (FD), and Reported Distance (RD) |
 | `show ... protocols eigrp traffic` | Interface packet counters (reliable/unreliable multicast, unicast, retransmissions, CR packets) |
-| `show ... route-table eigrp` | Standard SR Linux route-table filtered exclusively for active EIGRP FIB entries |
-| `show ... ipv4 route` | Native Nokia IPv4 route table showing installed EIGRP prefixes |
-| `show ... ipv6 route` | Native Nokia IPv6 route table showing installed EIGRP IPv6 prefixes |
+| `show ... ipv4 route eigrp [prefix]` | EIGRP learned IPv4 routing table installed in FIB |
+| `show ... ipv6 route eigrp [prefix]` | EIGRP learned IPv6 routing table installed in FIB |
+| `show ... ipv4 route` | Native Nokia IPv4 route table showing installed EIGRP prefixes (rendered as `eigrp`) |
+| `show ... ipv6 route` | Native Nokia IPv6 route table showing installed EIGRP IPv6 prefixes (rendered as `eigrp`) |
 
 ```text
-A:srl1# show network-instance default route-table eigrp
-================================================================================
-Route Table for Network-Instance: default (EIGRP Active Routes)
---------------------------------------------------------------------------------
-Prefix           Next-Hop         Metric     Preference Type       State   
---------------------------------------------------------------------------------
-5.5.5.5/32       10.2.3.3         8519680    90         Internal   Active  
-5.5.5.5/32       10.2.4.4         8519680    90         Internal   Active  
-================================================================================
+A:srl1# show network-instance default ipv4 route eigrp
+==================================================================================================
+EIGRP Learned IPv4 Routes for Network-Instance: default (AS: 100, RIB-Scale: 128)
+--------------------------------------------------------------------------------------------------
+Prefix               Next-Hop         Metric       Wide-Metric        Type       Pref  
+--------------------------------------------------------------------------------------------------
+192.0.2.2/32         10.0.0.2         61440        7864320            Internal   90    
+--------------------------------------------------------------------------------------------------
+Total Routes: 1
+==================================================================================================
 ```
 
 ### Tools Commands (`tools network-instance <name> protocols eigrp ...`)

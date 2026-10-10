@@ -15,7 +15,7 @@ def test_srl_neighbor_established(srl_exec):
     assert "10.0.0.2" in out and "Up" in out, f"Neighbor not established: {out}"
 
 def test_srl_fib_route_installed(srl_exec):
-    """Verify remote loopback (192.0.2.2/32) is installed in SRL1's FIB with preference 90."""
+    """Verify remote loopback (192.0.2.2/32) is installed in SRL1's FIB with preference 90 and eigrp route type."""
     out = ""
     for _ in range(15):
         time.sleep(2)
@@ -24,7 +24,25 @@ def test_srl_fib_route_installed(srl_exec):
         ])
         if "192.0.2.2/32" in out and "90" in out:
             break
-    assert "192.0.2.2/32" in out and "90" in out, f"Route not found in FIB: {out}"
+    assert "192.0.2.2/32" in out and "90" in out and "eigrp" in out, f"Route not found in FIB or not eigrp: {out}"
+
+    # Verify route type in detail view
+    out_detail = srl_exec("clab-srl-srl-eigrp-srl1", [
+        "sr_cli", "show network-instance default ipv4 route 192.0.2.2/32 detail"
+    ])
+    assert "Route Type" in out_detail and "eigrp" in out_detail, f"Route detail not eigrp: {out_detail}"
+
+    # Verify structured JSON output renders Route Type as eigrp
+    out_json = srl_exec("clab-srl-srl-eigrp-srl1", [
+        "sr_cli", "show network-instance default ipv4 route | as json"
+    ])
+    assert '"Route Type": "eigrp"' in out_json or '"route-type": "eigrp"' in out_json, f"JSON route type not eigrp: {out_json}"
+
+    # Verify route summary renders eigrp
+    out_summary = srl_exec("clab-srl-srl-eigrp-srl1", [
+        "sr_cli", "show network-instance default ipv4 route summary"
+    ])
+    assert "eigrp" in out_summary, f"Route summary not eigrp: {out_summary}"
 
 def test_dataplane_ping(srl_exec):
     """Verify end-to-end dataplane forwarding between SRL loopbacks in default network-instance."""
@@ -64,6 +82,16 @@ def test_show_eigrp_cli(srl_exec):
             break
         time.sleep(1)
     assert "192.0.2.2/32" in out_routes and "10.0.0.2" in out_routes, f"Routes show failed: {out_routes}"
+ 
+    out_v4_routes = srl_exec("clab-srl-srl-eigrp-srl1", [
+        "sr_cli", "show network-instance default ipv4 route eigrp"
+    ])
+    assert "192.0.2.2/32" in out_v4_routes and "10.0.0.2" in out_v4_routes, f"IPv4 route eigrp show failed: {out_v4_routes}"
+
+    out_v4_subnet = srl_exec("clab-srl-srl-eigrp-srl1", [
+        "sr_cli", "show network-instance default ipv4 route eigrp 192.0.2.0/24"
+    ])
+    assert "192.0.2.2/32" in out_v4_subnet and "10.0.0.2" in out_v4_subnet, f"IPv4 route eigrp subnet filter failed: {out_v4_subnet}"
 
     out_if = srl_exec("clab-srl-srl-eigrp-srl1", [
         "sr_cli", "show network-instance default protocols eigrp interfaces"
@@ -390,7 +418,7 @@ def test_srl_vrf1_neighbor_established(srl_exec):
 
 
 def test_srl_vrf1_fib_route_installed(srl_exec):
-    """Verify remote loopback (192.0.2.22/32) is installed in SRL1's vrf-1 FIB with preference 90."""
+    """Verify remote loopback (192.0.2.22/32) is installed in SRL1's vrf-1 FIB with preference 90 and eigrp route type."""
     out = ""
     for _ in range(15):
         time.sleep(2)
@@ -399,7 +427,7 @@ def test_srl_vrf1_fib_route_installed(srl_exec):
         ])
         if "192.0.2.22/32" in out and "90" in out:
             break
-    assert "192.0.2.22/32" in out and "90" in out, f"VRF-1 route not found in FIB: {out}"
+    assert "192.0.2.22/32" in out and "90" in out and "eigrp" in out, f"VRF-1 route not found in FIB or not eigrp: {out}"
 
 
 def test_vrf1_dataplane_ping(srl_exec):
@@ -431,6 +459,11 @@ def test_vrf1_show_cli(srl_exec):
         "sr_cli", "show network-instance vrf-1 protocols eigrp routes"
     ])
     assert "192.0.2.22/32" in out_routes and "10.1.0.2" in out_routes, f"VRF-1 routes show failed: {out_routes}"
+
+    out_v4_routes = srl_exec("clab-srl-srl-eigrp-srl1", [
+        "sr_cli", "show network-instance vrf-1 ipv4 route eigrp"
+    ])
+    assert "192.0.2.22/32" in out_v4_routes and "10.1.0.2" in out_v4_routes, f"VRF-1 ipv4 route eigrp failed: {out_v4_routes}"
 
     out_if = srl_exec("clab-srl-srl-eigrp-srl1", [
         "sr_cli", "show network-instance vrf-1 protocols eigrp interfaces"
@@ -598,7 +631,7 @@ def test_srl_ipv6_fib_route_installed(srl_exec):
         ])
         if "2001:db8::2/128" in out and "90" in out and "2001:db8:1::2" in out:
             break
-    assert "2001:db8::2/128" in out and "90" in out and "2001:db8:1::2" in out, f"IPv6 route not found in FIB on SRL1: {out}"
+    assert "2001:db8::2/128" in out and "90" in out and "2001:db8:1::2" in out and "eigrp" in out, f"IPv6 route not found in FIB on SRL1: {out}"
 
     # Also verify SRL2 FIB has SRL1 loopback (2001:db8::1/128)
     out2 = ""
@@ -609,7 +642,7 @@ def test_srl_ipv6_fib_route_installed(srl_exec):
         ])
         if "2001:db8::1/128" in out2 and "90" in out2 and "2001:db8:1::1" in out2:
             break
-    assert "2001:db8::1/128" in out2 and "90" in out2 and "2001:db8:1::1" in out2, f"IPv6 route not found in FIB on SRL2: {out2}"
+    assert "2001:db8::1/128" in out2 and "90" in out2 and "2001:db8:1::1" in out2 and "eigrp" in out2, f"IPv6 route not found in FIB on SRL2: {out2}"
 
 
 def test_srl_ipv6_dataplane_ping(srl_exec):
@@ -643,6 +676,16 @@ def test_srl_ipv6_cli_show(srl_exec):
         "sr_cli", "show network-instance default protocols eigrp routes"
     ])
     assert "2001:db8::2/128" in out_routes, f"IPv6 route missing from CLI routes: {out_routes}"
+
+    out_v6_routes = srl_exec("clab-srl-srl-eigrp-srl1", [
+        "sr_cli", "show network-instance default ipv6 route eigrp"
+    ])
+    assert "2001:db8::2/128" in out_v6_routes and "2001:db8:1::2" in out_v6_routes, f"IPv6 route eigrp failed: {out_v6_routes}"
+
+    out_v6_subnet = srl_exec("clab-srl-srl-eigrp-srl1", [
+        "sr_cli", "show network-instance default ipv6 route eigrp 2001:db8::/64"
+    ])
+    assert "2001:db8::2/128" in out_v6_subnet and "2001:db8:1::2" in out_v6_subnet, f"IPv6 route eigrp subnet filter failed: {out_v6_subnet}"
 
     out_nbr = srl_exec("clab-srl-srl-eigrp-srl1", [
         "sr_cli", "show network-instance default protocols eigrp neighbor"

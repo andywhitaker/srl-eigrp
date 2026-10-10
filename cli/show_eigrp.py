@@ -9,6 +9,7 @@
 #   show network-instance <name> protocols eigrp topology
 #   show network-instance <name> protocols eigrp traffic
 ###########################################################################
+import ipaddress
 import json
 import os
 import re
@@ -164,15 +165,122 @@ def load_state(state=None, netinst="default"):
     return local_data if local_data else None
 
 
+def _match_prefix(route_pfx_str, target_pfx):
+    if not target_pfx or target_pfx == "*":
+        return True
+    if route_pfx_str == target_pfx:
+        return True
+    try:
+        if "/" in target_pfx:
+            target_net = ipaddress.ip_network(target_pfx, strict=False)
+            route_net = ipaddress.ip_network(route_pfx_str, strict=False)
+            if route_net.subnet_of(target_net):
+                return True
+        else:
+            target_ip = ipaddress.ip_address(target_pfx)
+            route_net = ipaddress.ip_network(route_pfx_str, strict=False)
+            if target_ip in route_net:
+                return True
+    except Exception:
+        pass
+    return route_pfx_str.startswith(target_pfx)
+
+
+def _patch_route_table_formatter():
+    try:
+        from srlinux.data.data import DataChildrenOfType
+        if not getattr(DataChildrenOfType, "_srl_eigrp_hooked", False):
+            orig_create = DataChildrenOfType.create
+
+            def hooked_create(self, *args, **kwargs):
+                schema_name = getattr(getattr(self, "schema", None), "name", None)
+                if schema_name == "ip route":
+                    try:
+                        keys = self._get_keys(*args, **kwargs)
+                        if keys.get("route_owner") == "srl_eigrpd" and keys.get("route_type") == "ndk1":
+                            keys["route_type"] = "eigrp"
+                            current_item = self._get_sanitized_or_none(keys)
+                            if current_item:
+                                return current_item
+                            self._check_modifications_are_allowed()
+                            return self._create(False, keys)
+                    except Exception:
+                        pass
+                elif schema_name == "routesummary":
+                    try:
+                        keys = self._get_keys(*args, **kwargs)
+                        if keys.get("route_type") == "ndk1":
+                            netinst_name = getattr(getattr(self, "parent", None), "name", "default")
+                            st = load_state(netinst=netinst_name)
+                            if st and (st.get("routes") or st.get("route")):
+                                keys["route_type"] = "eigrp"
+                                current_item = self._get_sanitized_or_none(keys)
+                                if current_item:
+                                    return current_item
+                                self._check_modifications_are_allowed()
+                                return self._create(False, keys)
+                    except Exception:
+                        pass
+                return orig_create(self, *args, **kwargs)
+
+            DataChildrenOfType.create = hooked_create
+            DataChildrenOfType._srl_eigrp_hooked = True
+    except Exception:
+        pass
+
+    try:
+        from srlinux.data.column_formatter import _Formatter
+        if not getattr(_Formatter, "_srl_eigrp_hooked", False):
+            orig_add = _Formatter.add
+
+            def hooked_add(self, column):
+                if getattr(column, "schema", None) and getattr(column.schema, "name", None) == "ip route":
+                    if hasattr(column, "route_owner") and column.route_owner == "srl_eigrpd":
+                        try:
+                            column._keys.set_sanitized("route_type", "eigrp")
+                        except Exception:
+                            pass
+                elif getattr(column, "schema", None) and getattr(column.schema, "name", None) == "routesummary":
+                    try:
+                        if column._keys.get("route_type") == "ndk1":
+                            column._keys.set_sanitized("route_type", "eigrp")
+                    except Exception:
+                        pass
+                return orig_add(self, column)
+
+            _Formatter.add = hooked_add
+            _Formatter._srl_eigrp_hooked = True
+    except Exception:
+        pass
+
+    try:
+        from srlinux.mgmt.cli.plugins.reports.ip_route_detail import IpRouteDetailReport
+        if not getattr(IpRouteDetailReport, "_srl_eigrp_hooked", False):
+            orig_populate_route_fields = IpRouteDetailReport._populate_route_fields
+
+            def hooked_populate_route_fields(self, data, ip_route, state):
+                orig_populate_route_fields(self, data, ip_route, state)
+                if getattr(ip_route, "route_owner", None) == "srl_eigrpd":
+                    data.route_type = "eigrp"
+
+            IpRouteDetailReport._populate_route_fields = hooked_populate_route_fields
+            IpRouteDetailReport._srl_eigrp_hooked = True
+    except Exception:
+        pass
+
+
 class Plugin(CliPlugin):
-    """Adds EIGRP show reports under network-instance protocols eigrp."""
+    """Adds EIGRP show reports under network-instance protocols eigrp, and ipv4/v6 route eigrp."""
 
     def get_required_plugins(self):
         return [
             RequiredPlugin(module="srlinux", plugin="netinst_reports"),
+            RequiredPlugin(module="srlinux", plugin="ip_route_reports"),
         ]
 
     def load(self, cli, **_kwargs):
+        _patch_route_table_formatter()
+
         network = cli.show_mode.root.get_command("network-instance")
         protocols = network.get_command("protocols")
 
@@ -201,8 +309,10 @@ class Plugin(CliPlugin):
             )
 
         if not eigrp.has_command("routes"):
+            routes_cmd = Syntax("routes", help="Show EIGRP learned routing table")
+            routes_cmd.add_unnamed_argument("prefix", default="*")
             eigrp.add_command(
-                Syntax("routes", help="Show EIGRP learned routing table"),
+                routes_cmd,
                 update_location=False,
                 callback=self.show_routes
             )
@@ -230,13 +340,30 @@ class Plugin(CliPlugin):
                 callback=self.show_traffic
             )
 
-        route_table = network.get_command_or_none("route-table")
-        if route_table and not route_table.has_command("eigrp"):
-            route_table.add_command(
-                Syntax("eigrp", help="Show EIGRP learned routing table"),
-                update_location=False,
-                callback=self.show_routes
-            )
+        # Register eigrp show commands under ipv4 route and ipv6 route
+        ipv4 = network.get_command_or_none("ipv4")
+        if ipv4:
+            ipv4_route = ipv4.get_command_or_none("route")
+            if ipv4_route and not ipv4_route.has_command("eigrp"):
+                eigrp_v4 = Syntax("eigrp", help="Show EIGRP learned IPv4 routing table")
+                eigrp_v4.add_unnamed_argument("prefix", default="*")
+                ipv4_route.add_command(
+                    eigrp_v4,
+                    update_location=False,
+                    callback=self.show_routes_v4
+                )
+
+        ipv6 = network.get_command_or_none("ipv6")
+        if ipv6:
+            ipv6_route = ipv6.get_command_or_none("route")
+            if ipv6_route and not ipv6_route.has_command("eigrp"):
+                eigrp_v6 = Syntax("eigrp", help="Show EIGRP learned IPv6 routing table")
+                eigrp_v6.add_unnamed_argument("prefix", default="*")
+                ipv6_route.add_command(
+                    eigrp_v6,
+                    update_location=False,
+                    callback=self.show_routes_v6
+                )
 
     def show_summary(self, state, arguments, output, **kwargs):
         netinst_arg = arguments.get_value_or("network-instance", "name", "default")
@@ -430,22 +557,39 @@ class Plugin(CliPlugin):
             output.print_line("  3. Verify Autonomous System number, K-values, and authentication keys match.")
             output.print_line("=" * 80)
 
-    def show_routes(self, state, arguments, output, **kwargs):
+    def show_routes(self, state, arguments, output, af_filter=None, **kwargs):
         netinst_arg = arguments.get_value_or("network-instance", "name", "default")
         instances = get_target_instances(state=state, netinst_arg=netinst_arg)
+        target_pfx = arguments.get_value_or("eigrp", "prefix", "*")
+        if not target_pfx or target_pfx == "*":
+            target_pfx = arguments.get_value_or("routes", "prefix", "*")
 
         for netinst in instances:
             data = load_state(state=state, netinst=netinst)
             asn = data.get("autonomous-system", 0) if data else 0
             rib_scale = data.get("rib-scale", 128) if data else 128
-            routes = data.get("routes") or data.get("route", []) if data else []
+            all_routes = data.get("routes") or data.get("route", []) if data else []
+
+            if af_filter == "ipv4":
+                routes = [r for r in all_routes if ":" not in str(r.get("prefix", ""))]
+                title_af = " IPv4"
+            elif af_filter == "ipv6":
+                routes = [r for r in all_routes if ":" in str(r.get("prefix", ""))]
+                title_af = " IPv6"
+            else:
+                routes = all_routes
+                title_af = ""
+
+            if target_pfx and target_pfx != "*":
+                routes = [r for r in routes if _match_prefix(str(r.get("prefix", "")), target_pfx)]
+
             is_v6 = any(":" in str(r.get("prefix", "")) or ":" in str(r.get("next-hop", "")) for r in routes)
             pfx_w = 28 if is_v6 else 20
             nh_w = 26 if is_v6 else 16
             div_len = 114 if is_v6 else 98
 
             output.print_line("=" * div_len)
-            output.print_line(f"EIGRP Learned Routes for Network-Instance: {netinst} (AS: {asn}, RIB-Scale: {rib_scale})")
+            output.print_line(f"EIGRP Learned{title_af} Routes for Network-Instance: {netinst} (AS: {asn}, RIB-Scale: {rib_scale})")
             output.print_line("-" * div_len)
             output.print_line(f"{'Prefix':<{pfx_w}} {'Next-Hop':<{nh_w}} {'Metric':<12} {'Wide-Metric':<18} {'Type':<10} {'Pref':<6}")
             output.print_line("-" * div_len)
@@ -466,6 +610,12 @@ class Plugin(CliPlugin):
             output.print_line("-" * div_len)
             output.print_line(f"Total Routes: {len(routes)}")
             output.print_line("=" * div_len)
+
+    def show_routes_v4(self, state, arguments, output, **kwargs):
+        return self.show_routes(state, arguments, output, af_filter="ipv4", **kwargs)
+
+    def show_routes_v6(self, state, arguments, output, **kwargs):
+        return self.show_routes(state, arguments, output, af_filter="ipv6", **kwargs)
 
     def show_interfaces(self, state, arguments, output, **kwargs):
         netinst_arg = arguments.get_value_or("network-instance", "name", "default")
