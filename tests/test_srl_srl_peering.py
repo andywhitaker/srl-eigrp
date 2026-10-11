@@ -1105,7 +1105,7 @@ EOF"""
     try:
         # Ensure neighbor is Up and BFD is Up
         bfd_up = False
-        for _ in range(15):
+        for _ in range(25):
             time.sleep(1)
             out = srl_exec("clab-srl-srl-eigrp-srl1", [
                 "sr_cli", "show network-instance default protocols eigrp neighbor"
@@ -1302,6 +1302,7 @@ discard stay
 / routing-policy policy eigrp-policy statement 20 match protocol ospfv2
 / routing-policy policy eigrp-policy statement 20 action policy-result accept
 / routing-policy policy eigrp-policy statement 20 action eigrp metric bandwidth 100000 delay 100 reliability 255 load 1 mtu 1500
+/ network-instance default protocols eigrp address-family ipv4-unicast export-policy eigrp-policy
 commit now
 EOF"""
         cfg_srl2 = """sr_cli << 'EOF'
@@ -1320,7 +1321,7 @@ EOF"""
 
         route_learned = False
         out_routes = ""
-        for _ in range(30):
+        for _ in range(60):
             time.sleep(1)
             out_routes = srl_exec("clab-srl-srl-eigrp-srl2", [
                 "sr_cli", "show network-instance default protocols eigrp routes"
@@ -1339,6 +1340,7 @@ enter candidate
 discard stay
 delete / network-instance default protocols ospf instance ospf2
 delete / routing-policy policy eigrp-policy statement 20
+delete / network-instance default protocols eigrp address-family ipv4-unicast export-policy
 commit now
 EOF"""
         clean_srl2 = """sr_cli << 'EOF'
@@ -1456,6 +1458,7 @@ discard stay
 / routing-policy policy eigrp-policy statement 60 match protocol bgp
 / routing-policy policy eigrp-policy statement 60 action policy-result accept
 / routing-policy policy eigrp-policy statement 60 action eigrp metric bandwidth 100000 delay 100 reliability 255 load 1 mtu 1500
+/ network-instance default protocols eigrp address-family ipv4-unicast export-policy eigrp-policy
 commit now
 EOF"""
         cfg_srl2 = """sr_cli << 'EOF'
@@ -1497,6 +1500,7 @@ enter candidate
 discard stay
 delete / network-instance default protocols bgp
 delete / routing-policy policy eigrp-policy statement 60
+delete / network-instance default protocols eigrp address-family ipv4-unicast export-policy
 commit now
 EOF"""
         clean_srl2 = """sr_cli << 'EOF'
@@ -1536,6 +1540,7 @@ discard stay
 / routing-policy policy eigrp-policy statement 70 match protocol isis
 / routing-policy policy eigrp-policy statement 70 action policy-result accept
 / routing-policy policy eigrp-policy statement 70 action eigrp metric bandwidth 100000 delay 100 reliability 255 load 1 mtu 1500
+/ network-instance default protocols eigrp address-family ipv4-unicast export-policy eigrp-policy
 commit now
 EOF"""
         cfg_srl2 = """sr_cli << 'EOF'
@@ -1554,7 +1559,7 @@ EOF"""
 
         route_learned = False
         out_routes = ""
-        for _ in range(30):
+        for _ in range(60):
             time.sleep(1)
             out_routes = srl_exec("clab-srl-srl-eigrp-srl2", [
                 "sr_cli", "show network-instance default protocols eigrp routes"
@@ -1573,6 +1578,7 @@ enter candidate
 discard stay
 delete / network-instance default protocols isis instance isis1
 delete / routing-policy policy eigrp-policy statement 70
+delete / network-instance default protocols eigrp address-family ipv4-unicast export-policy
 commit now
 EOF"""
         clean_srl2 = """sr_cli << 'EOF'

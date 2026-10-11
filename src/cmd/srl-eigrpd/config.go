@@ -2217,7 +2217,7 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 	}
 
 	// 8a. Handle sub-path interface address-family notification
-	if strings.Contains(jsPath, ".protocols.eigrp.interface") && strings.Contains(jsPath, ".address-family") && !strings.Contains(jsPath, ".default-interface") {
+	if strings.Contains(jsPath, ".protocols.eigrp.interface") && (strings.Contains(jsPath, ".address-family") || strings.Contains(jsPath, ".address_family")) && !strings.Contains(jsPath, ".default-interface") && !strings.Contains(jsPath, ".default_interface") {
 		ifName := extractIntfName(cfg)
 		afName := extractAfName(cfg)
 		if ifName == "" || afName == "" {

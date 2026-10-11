@@ -2393,6 +2393,9 @@ static eigrp_result_t srl_topo_prefix_cb(const eigrp_topology_prefix_state_t *st
     const char *ni = (const char *)arg;
     if (!ni) ni = "default";
     if (!st) return EIGRP_RESULT_SUCCESS;
+    if (st->successor_count == 0 && !st->active && (st->feasible_distance >= 4294967295ULL || st->feasible_distance == 0)) {
+        return EIGRP_RESULT_SUCCESS;
+    }
     char pfx_str[64] = "";
     int afi = (st->destination.address.afi == EIGRP_AFI_IPV6) ? AF_INET6 : AF_INET;
     inet_ntop(afi, st->destination.address.bytes, pfx_str, sizeof(pfx_str));

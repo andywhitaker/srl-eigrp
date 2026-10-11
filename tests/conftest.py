@@ -4,9 +4,11 @@ import os
 
 @pytest.fixture(scope="session")
 def srl_exec():
-    def _exec(container, cmd):
+    def _exec(container, cmd, check=False):
         full_cmd = ["docker", "exec", container] + cmd
-        res = subprocess.run(full_cmd, capture_output=True, text=True, check=True)
+        res = subprocess.run(full_cmd, capture_output=True, text=True)
+        if check and res.returncode != 0:
+            raise subprocess.CalledProcessError(res.returncode, full_cmd, res.stdout, res.stderr)
         return res.stdout
     return _exec
 

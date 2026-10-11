@@ -17,7 +17,7 @@ func (d *EigrpDaemon) OnRouteAdd(netinst string, prefix string, nexthop string, 
 	if netinst == "" {
 		netinst = "default"
 	}
-	if wideMetric == ^uint64(0) || (wideMetric == 0 && metric == 0xFFFFFFFF) {
+	if wideMetric == ^uint64(0) || wideMetric >= 0xffffffffffff || wideMetric == 0xffffffff || metric == 0xFFFFFFFF {
 		d.OnRouteDel(netinst, prefix)
 		return
 	}
