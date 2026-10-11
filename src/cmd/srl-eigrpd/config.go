@@ -2249,6 +2249,11 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 					delete(inst.interfaces, i)
 				}
 			}
+			for tfIf := range inst.traffic {
+				if normalizeIfName(tfIf) == normIf {
+					delete(inst.traffic, tfIf)
+				}
+			}
 			d.mu.Unlock()
 			C.srlShimInterfaceDisable(cNetinst, cIfname)
 			C.srlShimInterfaceDisableV6(cNetinst, cIfname)

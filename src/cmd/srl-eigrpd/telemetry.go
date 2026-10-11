@@ -459,17 +459,28 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 			if !inst.IsAfiEnabled(afiName) {
 				continue
 			}
+			normIf := normalizeIfName(n.Interface)
+			var ic *InterfaceConfig
+			if c, ok := inst.configuredInterfaces[n.Interface]; ok {
+				ic = c
+			} else if c, ok := inst.configuredInterfaces[normIf]; ok {
+				ic = c
+			} else {
+				for k, v := range inst.configuredInterfaces {
+					if normalizeIfName(k) == normIf {
+						ic = v
+						break
+					}
+				}
+			}
+			if ic == nil {
+				continue
+			}
 			defPassive := false
 			if inst.defaultIntf != nil {
 				defPassive = inst.defaultIntf.IsAfiPassive(afiName)
 			}
-			isPassive := defPassive
-			normIf := normalizeIfName(n.Interface)
-			if ic, ok := inst.configuredInterfaces[n.Interface]; ok {
-				isPassive = ic.IsAfiPassive(afiName, defPassive)
-			} else if ic, ok := inst.configuredInterfaces[normIf]; ok {
-				isPassive = ic.IsAfiPassive(afiName, defPassive)
-			}
+			isPassive := ic.IsAfiPassive(afiName, defPassive)
 			if !isPassive {
 				nbrList = append(nbrList, n)
 			}
@@ -487,6 +498,23 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 		}
 		intfList := make([]*InterfaceInfo, 0, len(inst.interfaces))
 		for _, i := range inst.interfaces {
+			normName := normalizeIfName(i.Name)
+			var ic *InterfaceConfig
+			if c, ok := inst.configuredInterfaces[i.Name]; ok {
+				ic = c
+			} else if c, ok := inst.configuredInterfaces[normName]; ok {
+				ic = c
+			} else {
+				for k, v := range inst.configuredInterfaces {
+					if normalizeIfName(k) == normName {
+						ic = v
+						break
+					}
+				}
+			}
+			if ic == nil {
+				continue
+			}
 			intfList = append(intfList, i)
 		}
 		topoList := make([]*TopologyPrefixInfo, 0, len(inst.topology))
@@ -502,6 +530,23 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 		}
 		trafficList := make([]*TrafficInfo, 0, len(inst.traffic))
 		for _, tf := range inst.traffic {
+			normIf := normalizeIfName(tf.Interface)
+			var ic *InterfaceConfig
+			if c, ok := inst.configuredInterfaces[tf.Interface]; ok {
+				ic = c
+			} else if c, ok := inst.configuredInterfaces[normIf]; ok {
+				ic = c
+			} else {
+				for k, v := range inst.configuredInterfaces {
+					if normalizeIfName(k) == normIf {
+						ic = v
+						break
+					}
+				}
+			}
+			if ic == nil {
+				continue
+			}
 			trafficList = append(trafficList, tf)
 		}
 		networks := make([]string, len(inst.networks))

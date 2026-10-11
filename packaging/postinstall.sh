@@ -86,4 +86,8 @@ if command -v sr_cli >/dev/null 2>&1; then
         fi
         sleep 1
     done
+
+    # Ensure srl_eigrpd starts cleanly after AppMgr reload on upgrade
+    sr_cli "tools system app-management application srl_eigrpd restart" >/dev/null 2>&1 || \
+    sr_cli "tools system app-management application srl_eigrpd start" >/dev/null 2>&1 || true
 fi

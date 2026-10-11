@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-and-package:
+    name: Build, Lint & Package
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+          cache-dependency-path: src/cmd/srl-eigrpd/go.sum
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libtool autoconf automake pkg-config
+
+      - name: Build Upstream OpenEIGRP Core
+        run: make core
+
+      - name: Build C Shim
+        run: make cshim
+
+      - name: Run Go Vet & Build Binary
+        run: |
+          (cd src/cmd/srl-eigrpd && go vet ./...)
+          make build
+
+      - name: Validate Python Syntax (CLI & Tests)
+        run: |
+          python3 -m py_compile cli/show_eigrp.py cli/tools_eigrp.py
+          python3 -m py_compile tests/test_srl_srl_peering.py tests/test_srl_frr_interop.py
+
+      - name: Install nFPM
+        run: |
+          echo 'deb [trusted=yes] https://repo.goreleaser.com/apt/ /' | sudo tee /etc/apt/sources.list.d/goreleaser.list
+          sudo apt-get update
+          sudo apt-get install -y nfpm
+
+      - name: Build Debian Package
+        run: |
+          mkdir -p dist
+          nfpm package --config nfpm.yaml --target dist/srl-eigrpd_0.1.0_amd64.deb
+
+      - name: Verify Debian Package Structure
+        run: |
+          dpkg -c dist/srl-eigrpd_0.1.0_amd64.deb
+          dpkg -I dist/srl-eigrpd_0.1.0_amd64.deb
+
+      - name: Upload Debian Package Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: srl-eigrpd_0.1.0_amd64.deb
+          path: dist/srl-eigrpd_0.1.0_amd64.deb
+          if-no-files-found: error

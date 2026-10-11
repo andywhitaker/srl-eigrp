@@ -70,6 +70,17 @@ void srl_netns_leave(int saved_ns) {
     }
 }
 
+static void srl_set_socket_rcvbuf(int fd) {
+    int bufsize = 8 * 1024 * 1024; // 8 MB ideal production buffer
+#ifdef SO_RCVBUFFORCE
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &bufsize, sizeof(bufsize)) < 0) {
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+    }
+#else
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+#endif
+}
+
 int srl_netns_socket_open(const char *netinst) {
     int saved_ns = -1;
     if (srl_netns_enter(netinst, &saved_ns) < 0) {
@@ -81,6 +92,8 @@ int srl_netns_socket_open(const char *netinst) {
     srl_netns_leave(saved_ns);
 
     if (fd < 0) return -1;
+
+    srl_set_socket_rcvbuf(fd);
 
     int hincl = 1;
     setsockopt(fd, IPPROTO_IP, IP_HDRINCL, &hincl, sizeof(hincl));
@@ -108,6 +121,8 @@ int srl_netns_ipv6_socket_open(const char *netinst) {
     srl_netns_leave(saved_ns);
 
     if (fd < 0) return -1;
+
+    srl_set_socket_rcvbuf(fd);
 
     int pktinfo = 1;
     setsockopt(fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &pktinfo, sizeof(pktinfo));

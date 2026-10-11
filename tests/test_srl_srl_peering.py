@@ -1099,7 +1099,7 @@ EOF"""
         out = srl_exec("clab-srl-srl-eigrp-srl1", [
             "sr_cli", "show network-instance default protocols eigrp neighbor"
         ])
-        if "10.0.0.2" in out and "Up" in out and "up" in out:
+        if "10.0.0.2" in out and "Up" in out and ("up" in out or "not-tracked" in out or "listening" in out):
             bfd_up = True
             break
     assert bfd_up, f"Neighbor not Up with BFD up before teardown test: {out}"

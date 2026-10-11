@@ -6,6 +6,8 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	ndk "github.com/nokia/srlinux-ndk-go/ndk"
 	"github.com/rs/zerolog/log"
@@ -15,7 +17,7 @@ func (d *EigrpDaemon) OnRouteAdd(netinst string, prefix string, nexthop string, 
 	if netinst == "" {
 		netinst = "default"
 	}
-	if metric == 0xFFFFFFFF || wideMetric >= 4294967295 || metric >= 33554431 {
+	if metric == 0xFFFFFFFF || wideMetric == ^uint64(0) {
 		d.OnRouteDel(netinst, prefix)
 		return
 	}
@@ -135,8 +137,14 @@ func (d *EigrpDaemon) OnRouteAdd(netinst string, prefix string, nexthop string, 
 		External:   isExt,
 	}
 	d.mu.Unlock()
-	log.Info().Str("netinst", netinst).Str("prefix", prefix).Strs("nexthops", validNhStrs).Uint32("pref", pref).Uint64("wide_metric", wideMetric).Msg("Injected EIGRP route into FIB")
-	go d.publishTelemetry(context.Background())
+	d.mu.RLock()
+	syncActive := d.fibSyncActive
+	d.mu.RUnlock()
+	if syncActive {
+		d.ScheduleFibSyncEnd(3 * time.Second)
+	}
+
+	d.triggerDebouncedTelemetry()
 }
 
 func (d *EigrpDaemon) WithdrawAfRoutes(netinst, afName string) {
@@ -185,7 +193,7 @@ func (d *EigrpDaemon) WithdrawAfRoutes(netinst, afName string) {
 	for _, pfx := range toWithdraw {
 		d.withdrawRouteInternal(netinst, pfx)
 	}
-	go d.publishTelemetry(context.Background())
+	d.triggerDebouncedTelemetry()
 }
 
 func (d *EigrpDaemon) withdrawRouteInternal(netinst string, prefix string) {
@@ -270,5 +278,83 @@ func (d *EigrpDaemon) OnRouteDel(netinst string, prefix string) {
 	}
 
 	d.withdrawRouteInternal(netinst, prefix)
-	go d.publishTelemetry(context.Background())
+	d.triggerDebouncedTelemetry()
+}
+
+var (
+	fibSyncMu    sync.Mutex
+	fibSyncTimer *time.Timer
+
+	ribTeleMu    sync.Mutex
+	ribTeleTimer *time.Timer
+)
+
+func (d *EigrpDaemon) triggerDebouncedTelemetry() {
+	ribTeleMu.Lock()
+	defer ribTeleMu.Unlock()
+
+	if ribTeleTimer != nil {
+		ribTeleTimer.Stop()
+	}
+	ribTeleTimer = time.AfterFunc(300*time.Millisecond, func() {
+		d.publishTelemetry(context.Background())
+	})
+}
+
+func (d *EigrpDaemon) FibSyncStart(ctx context.Context) {
+	d.mu.Lock()
+	d.fibSyncActive = true
+	d.mu.Unlock()
+
+	log.Info().Msg("Initiating NDK hitless FIB state synchronization")
+	if _, err := d.nhgClient.SyncStart(ctx, &ndk.SyncRequest{}); err != nil {
+		log.Error().Err(err).Msg("nhgClient.SyncStart failed")
+	}
+	if _, err := d.routeClient.SyncStart(ctx, &ndk.SyncRequest{}); err != nil {
+		log.Error().Err(err).Msg("routeClient.SyncStart failed")
+	}
+}
+
+func (d *EigrpDaemon) FibSyncEnd(ctx context.Context) {
+	d.mu.Lock()
+	if !d.fibSyncActive {
+		d.mu.Unlock()
+		return
+	}
+	d.fibSyncActive = false
+	d.mu.Unlock()
+
+	fibSyncMu.Lock()
+	if fibSyncTimer != nil {
+		fibSyncTimer.Stop()
+		fibSyncTimer = nil
+	}
+	fibSyncMu.Unlock()
+
+	log.Info().Msg("Completing NDK hitless FIB state synchronization (purging orphaned routes and NHGs)")
+	if _, err := d.routeClient.SyncEnd(ctx, &ndk.SyncRequest{}); err != nil {
+		log.Error().Err(err).Msg("routeClient.SyncEnd failed")
+	}
+	if _, err := d.nhgClient.SyncEnd(ctx, &ndk.SyncRequest{}); err != nil {
+		log.Error().Err(err).Msg("nhgClient.SyncEnd failed")
+	}
+}
+
+func (d *EigrpDaemon) ScheduleFibSyncEnd(delay time.Duration) {
+	d.mu.RLock()
+	active := d.fibSyncActive
+	d.mu.RUnlock()
+	if !active {
+		return
+	}
+
+	fibSyncMu.Lock()
+	defer fibSyncMu.Unlock()
+
+	if fibSyncTimer != nil {
+		fibSyncTimer.Stop()
+	}
+	fibSyncTimer = time.AfterFunc(delay, func() {
+		d.FibSyncEnd(context.Background())
+	})
 }

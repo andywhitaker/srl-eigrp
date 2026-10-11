@@ -2799,6 +2799,15 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
                 req.interface_name = (ei->name && ei->name[0]) ? ei->name : actual_ifname;
                 size_t affected = 0;
                 (void)eigrp_nbr_clear(runtime, &req, NULL, NULL, &affected);
+                if (ei->nbrs) {
+                    eigrp_list_item_t *nbr_node = NULL, *next_node = NULL;
+                    eigrp_nbr_t *nbr = NULL;
+                    for (EIGRP_LIST_ITERATE(ei->nbrs, nbr_node, next_node, nbr)) {
+                        if (nbr) {
+                            eigrp_nbr_delete(nbr);
+                        }
+                    }
+                }
             }
             eigrp_intf_down(ei);
         }
@@ -2984,6 +2993,15 @@ int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passi
                     req.interface_name = (ei6->name && ei6->name[0]) ? ei6->name : actual_ifname;
                     size_t affected = 0;
                     (void)eigrp_nbr_clear(runtime_v6, &req, NULL, NULL, &affected);
+                    if (ei6->nbrs) {
+                        eigrp_list_item_t *nbr_node = NULL, *next_node = NULL;
+                        eigrp_nbr_t *nbr = NULL;
+                        for (EIGRP_LIST_ITERATE(ei6->nbrs, nbr_node, next_node, nbr)) {
+                            if (nbr) {
+                                eigrp_nbr_delete(nbr);
+                            }
+                        }
+                    }
                 }
                 eigrp_intf_down(ei6);
             }
@@ -3014,6 +3032,15 @@ int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passi
                 req.interface_name = (ei6->name && ei6->name[0]) ? ei6->name : actual_ifname;
                 size_t affected = 0;
                 (void)eigrp_nbr_clear(runtime_v6, &req, NULL, NULL, &affected);
+                if (ei6->nbrs) {
+                    eigrp_list_item_t *nbr_node = NULL, *next_node = NULL;
+                    eigrp_nbr_t *nbr = NULL;
+                    for (EIGRP_LIST_ITERATE(ei6->nbrs, nbr_node, next_node, nbr)) {
+                        if (nbr) {
+                            eigrp_nbr_delete(nbr);
+                        }
+                    }
+                }
             }
             eigrp_intf_down(ei6);
         }

@@ -67,7 +67,7 @@ eigrp_result_t eigrp_rib_route_add(eigrp_instance_t *eigrp, const eigrp_rib_rout
     int is_ext = (route->install.type == EIGRP_RIB_ROUTE_EXTERNAL) ? 1 : 0;
     uint8_t rib_scale = srl_get_rib_scale(netinst);
     if (rib_scale == 0) rib_scale = 128;
-    if (route->metric >= EIGRP_64BIT_METRIC_INFINITY || route->metric >= 4294967295ULL) {
+    if (route->metric >= EIGRP_64BIT_METRIC_INFINITY) {
         srlGoRouteDel((char *)netinst, pfx_str);
         return EIGRP_RESULT_SUCCESS;
     }

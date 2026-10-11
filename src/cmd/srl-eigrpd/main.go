@@ -287,6 +287,7 @@ type EigrpDaemon struct {
 	policies     map[string]*PolicyMetricConfig
 	policyDefs   map[string]*PolicyDef
 	redistChan   chan string
+	fibSyncActive bool
 }
 
 var daemonApp *EigrpDaemon
@@ -385,7 +386,7 @@ func (d *EigrpDaemon) BfdSessionAddOrUpdate(netinst, peerIP, ifname, adminState 
 	if adminState == "enable" {
 		cur := inst.bfdSessions[peerIP]
 		if cur == "" || cur == "disabled" {
-			inst.bfdSessions[peerIP] = "up"
+			inst.bfdSessions[peerIP] = "not-tracked"
 		}
 		if nbr, ok := inst.neighbors[peerIP]; ok {
 			nbr.BfdState = inst.bfdSessions[peerIP]
@@ -405,6 +406,23 @@ func (d *EigrpDaemon) OnNeighborReport(netinst, ip, ifname, state string, hold u
 	defer d.mu.Unlock()
 
 	normIf := normalizeIfName(ifname)
+	var ic *InterfaceConfig
+	if c, ok := inst.configuredInterfaces[ifname]; ok {
+		ic = c
+	} else if c, ok := inst.configuredInterfaces[normIf]; ok {
+		ic = c
+	} else {
+		for k, v := range inst.configuredInterfaces {
+			if normalizeIfName(k) == normIf {
+				ic = v
+				break
+			}
+		}
+	}
+	if ic == nil {
+		return
+	}
+
 	afiName := "ipv4-unicast"
 	if strings.Contains(ip, ":") {
 		afiName = "ipv6-unicast"
@@ -416,31 +434,19 @@ func (d *EigrpDaemon) OnNeighborReport(netinst, ip, ifname, state string, hold u
 	if inst.defaultIntf != nil {
 		defPassive = inst.defaultIntf.IsAfiPassive(afiName)
 	}
-	isPassive := defPassive
-	if ic, ok := inst.configuredInterfaces[ifname]; ok {
-		isPassive = ic.IsAfiPassive(afiName, defPassive)
-	} else if ic, ok := inst.configuredInterfaces[normIf]; ok {
-		isPassive = ic.IsAfiPassive(afiName, defPassive)
-	}
+	isPassive := ic.IsAfiPassive(afiName, defPassive)
 	if isPassive {
 		return
 	}
 
 	// Check whether BFD is enabled for this interface or instance
 	bfdEnabled := false
-	if ic, ok := inst.configuredInterfaces[ifname]; ok {
-		bfd := ic.GetAfiBfd(afiName, inst.defaultIntf)
-		if bfd != nil && bfd.AdminState == "enable" {
-			bfdEnabled = true
-		}
-	} else if ic, ok := inst.configuredInterfaces[normIf]; ok {
-		bfd := ic.GetAfiBfd(afiName, inst.defaultIntf)
-		if bfd != nil && bfd.AdminState == "enable" {
-			bfdEnabled = true
-		}
+	bfd := ic.GetAfiBfd(afiName, inst.defaultIntf)
+	if bfd != nil && bfd.AdminState == "enable" {
+		bfdEnabled = true
 	} else if inst.defaultIntf != nil {
-		bfd := inst.defaultIntf.GetAfiBfd(afiName)
-		if bfd != nil && bfd.AdminState == "enable" {
+		bfdDef := inst.defaultIntf.GetAfiBfd(afiName)
+		if bfdDef != nil && bfdDef.AdminState == "enable" {
 			bfdEnabled = true
 		}
 	}
@@ -448,15 +454,9 @@ func (d *EigrpDaemon) OnNeighborReport(netinst, ip, ifname, state string, hold u
 	if bfdEnabled {
 		if sess, ok := inst.bfdSessions[ip]; ok && sess != "" && sess != "disabled" {
 			bfdState = sess
-			if state == "Up" && (sess == "down" || sess == "admin-down" || sess == "init") {
-				inst.bfdSessions[ip] = "up"
-				bfdState = "up"
-			}
-		} else if state == "Up" {
-			inst.bfdSessions[ip] = "up"
-			bfdState = "up"
 		} else {
-			bfdState = "init"
+			bfdState = "not-tracked"
+			inst.bfdSessions[ip] = "not-tracked"
 		}
 	} else {
 		bfdState = "disabled"
@@ -465,24 +465,13 @@ func (d *EigrpDaemon) OnNeighborReport(netinst, ip, ifname, state string, hold u
 
 	// Check interface config for auth mode fallback
 	if authMode == "" || authMode == "none" {
-		afiName := "ipv4-unicast"
-		if strings.Contains(ip, ":") {
-			afiName = "ipv6-unicast"
-		}
-		if ic, ok := inst.configuredInterfaces[ifname]; ok {
-			auth := ic.GetAfiAuthentication(afiName, inst.defaultIntf, inst.authentication)
-			if auth != nil && auth.Mode != "" {
-				authMode = auth.Mode
-			}
-		} else if ic, ok := inst.configuredInterfaces[normIf]; ok {
-			auth := ic.GetAfiAuthentication(afiName, inst.defaultIntf, inst.authentication)
-			if auth != nil && auth.Mode != "" {
-				authMode = auth.Mode
-			}
+		auth := ic.GetAfiAuthentication(afiName, inst.defaultIntf, inst.authentication)
+		if auth != nil && auth.Mode != "" {
+			authMode = auth.Mode
 		} else if inst.defaultIntf != nil {
-			auth := inst.defaultIntf.GetAfiAuthentication(afiName)
-			if auth != nil && auth.Mode != "" {
-				authMode = auth.Mode
+			authDef := inst.defaultIntf.GetAfiAuthentication(afiName)
+			if authDef != nil && authDef.Mode != "" {
+				authMode = authDef.Mode
 			} else if inst.authentication != nil && inst.authentication.Mode != "" {
 				authMode = inst.authentication.Mode
 			}
@@ -539,6 +528,16 @@ func (d *EigrpDaemon) OnInterfaceReport(netinst, name, ipAddr string, prefixlen 
 		ic = c
 	} else if c, ok := inst.configuredInterfaces[normIf]; ok {
 		ic = c
+	} else {
+		for k, v := range inst.configuredInterfaces {
+			if normalizeIfName(k) == normIf {
+				ic = v
+				break
+			}
+		}
+	}
+	if ic == nil {
+		return
 	}
 
 	authMode := "none"
@@ -659,6 +658,23 @@ func (d *EigrpDaemon) OnTrafficReport(netinst, ifname string, rmcast, umcast, ru
 	inst := d.GetOrCreateInstance(netinst)
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	normIf := normalizeIfName(ifname)
+	var ic *InterfaceConfig
+	if c, ok := inst.configuredInterfaces[ifname]; ok {
+		ic = c
+	} else if c, ok := inst.configuredInterfaces[normIf]; ok {
+		ic = c
+	} else {
+		for k, v := range inst.configuredInterfaces {
+			if normalizeIfName(k) == normIf {
+				ic = v
+				break
+			}
+		}
+	}
+	if ic == nil {
+		return
+	}
 	info := &TrafficInfo{
 		Interface:       ifname,
 		ReliableMcast:   rmcast,
@@ -952,6 +968,9 @@ func main() {
 
 	daemonApp.Register(ctx)
 
+	daemonApp.FibSyncStart(ctx)
+	daemonApp.ScheduleFibSyncEnd(10 * time.Second)
+
 	if err := daemonApp.InitNotificationStream(ctx); err != nil {
 		log.Fatal().Err(err).Msg("Failed to initialize notification stream")
 	}
@@ -966,6 +985,7 @@ func main() {
 	sig := <-sigCh
 
 	log.Info().Str("signal", sig.String()).Msg("Shutting down srl-eigrpd...")
+	daemonApp.FibSyncEnd(context.Background())
 	C.srlShimFinish()
 	if conn != nil {
 		conn.Close()

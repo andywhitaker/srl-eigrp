@@ -91,24 +91,29 @@ module srl_nokia-eigrp {
       }
       leaf passive {
         type boolean;
+        default false;
         description "Suppress sending/receiving EIGRP hellos for this address family";
       }
       leaf hello-interval {
         type uint16 { range "1..65535"; }
+        default 5;
         units "seconds";
         description "Hello interval in seconds for this address family";
       }
       leaf hold-time {
         type uint16 { range "1..65535"; }
+        default 15;
         units "seconds";
         description "Hold time in seconds for this address family";
       }
       leaf split-horizon {
         type boolean;
+        default true;
         description "Enable or disable split-horizon on this interface for this address family";
       }
       leaf next-hop-self {
         type boolean;
+        default false;
         description "Advertise this router as next hop on this interface for this address family";
       }
       list summary-address {
@@ -713,12 +718,12 @@ module srl_nokia-eigrp {
         srl_nokia-ext:unordered-state-list "true";
         description "Per-interface protocol traffic statistics";
         leaf interface { type string; }
-        leaf reliable-multicast { type uint64; }
-        leaf unreliable-multicast { type uint64; }
-        leaf reliable-unicast { type uint64; }
-        leaf unreliable-unicast { type uint64; }
-        leaf retransmissions { type uint64; }
-        leaf cr-packets { type uint64; }
+        leaf reliable-multicast { type srl_nokia-comm:zero-based-counter64; }
+        leaf unreliable-multicast { type srl_nokia-comm:zero-based-counter64; }
+        leaf reliable-unicast { type srl_nokia-comm:zero-based-counter64; }
+        leaf unreliable-unicast { type srl_nokia-comm:zero-based-counter64; }
+        leaf retransmissions { type srl_nokia-comm:zero-based-counter64; }
+        leaf cr-packets { type srl_nokia-comm:zero-based-counter64; }
       }
     }
   }

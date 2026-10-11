@@ -398,8 +398,9 @@ A:srl1# tools network-instance default protocols eigrp graceful-restart planned-
 ### 14. Bidirectional Forwarding Detection (BFD)
 Integrates EIGRP with the Nokia SR Linux micro-BFD engine for sub-second failure detection:
 - **Hardware-Accelerated Detection**: Offloads hello monitoring to the SR Linux BFD subsystem, detecting physical link and forwarding failures in milliseconds.
-- **NDK BFD Service Integration**: Listens for asynchronous `BfdSessionNotification` events from the NDK manager.
-- **Fast Adjacency Teardown**: Upon BFD session down transition, immediately clears the neighbor adjacency and triggers DUAL recalculation without waiting for hold timer expiration.
+- **NDK BFD Service Integration**: Listens for asynchronous `BfdSessionNotification` events from the NDK manager. The daemon only transitions a neighbor's BFD state to `up` when an explicit `BFD_SESSION_STATUS_UP` notification is received from the NDK manager.
+- **Native Next-Hop Group Tracking Requirement**: In SR Linux, programmatic BFD session creation by custom NDK applications requires native next-hop group tracking (configured under `/ bfd` or via native route next-hop group tracking). When running standalone or prior to receiving an NDK BFD session event, the operational state is transparently reported as `not-tracked` rather than falsely asserting an active session.
+- **Fast Adjacency Teardown**: Upon BFD session down transition (`BFD_SESSION_STATUS_DOWN` or `BFD_SESSION_STATUS_ADMIN_DOWN`), immediately clears the neighbor adjacency and triggers DUAL recalculation without waiting for hold timer expiration.
 
 ```text
 # Enable BFD globally for all EIGRP interfaces via default-interface
