@@ -90,7 +90,7 @@ int srl_netns_socket_open(const char *netinst) {
         return -1;
     }
 
-    int fd = socket(AF_INET, SOCK_RAW, IPPROTO_EIGRPIGP);
+    int fd = socket(AF_INET, SOCK_RAW | SOCK_CLOEXEC, IPPROTO_EIGRPIGP);
 
     srl_netns_leave(saved_ns);
 
@@ -110,6 +110,9 @@ int srl_netns_socket_open(const char *netinst) {
     uint8_t ttl = 1;
     setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
 
+    int tos = 0xc0; // DSCP CS6 (Internetwork Control)
+    setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+
     return fd;
 }
 
@@ -119,7 +122,7 @@ int srl_netns_ipv6_socket_open(const char *netinst) {
         return -1;
     }
 
-    int fd = socket(AF_INET6, SOCK_RAW, IPPROTO_EIGRPIGP);
+    int fd = socket(AF_INET6, SOCK_RAW | SOCK_CLOEXEC, IPPROTO_EIGRPIGP);
 
     srl_netns_leave(saved_ns);
 
@@ -136,6 +139,9 @@ int srl_netns_ipv6_socket_open(const char *netinst) {
     int hops = 1;
     setsockopt(fd, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &hops, sizeof(hops));
     setsockopt(fd, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &hops, sizeof(hops));
+
+    int tclass = 0xc0; // DSCP CS6 (Internetwork Control)
+    setsockopt(fd, IPPROTO_IPV6, IPV6_TCLASS, &tclass, sizeof(tclass));
 
     return fd;
 }

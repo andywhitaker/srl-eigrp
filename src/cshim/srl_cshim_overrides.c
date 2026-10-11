@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -96,6 +97,7 @@ int __wrap_eigrp_make_md5_digest(eigrp_intf_t *ei, eigrp_stream_t *s, uint8_t fl
 
     if (!srl_auth_key_get(ei, &key_id, key_string, sizeof(key_string))) {
         eigrp_auth_tlv_md5_delete(auth_TLV);
+        explicit_bzero(key_string, sizeof(key_string));
         return EIGRP_AUTH_TYPE_NONE;
     }
 
@@ -130,6 +132,7 @@ int __wrap_eigrp_make_md5_digest(eigrp_intf_t *ei, eigrp_stream_t *s, uint8_t fl
     eigrp_stream_set_endp(s, backup_end);
 
     eigrp_auth_tlv_md5_delete(auth_TLV);
+    explicit_bzero(key_string, sizeof(key_string));
     return EIGRP_AUTH_TYPE_MD5_LEN;
 }
 
@@ -177,6 +180,7 @@ int __wrap_eigrp_check_md5_digest(eigrp_stream_t *s,
             nbr->ei->name);
         memcpy(auth_TLV->digest, orig, EIGRP_AUTH_TYPE_MD5_LEN);
         eigrph->checksum = saved_checksum;
+        explicit_bzero(key_string, sizeof(key_string));
         return 0;
     }
 
@@ -207,7 +211,9 @@ int __wrap_eigrp_check_md5_digest(eigrp_stream_t *s,
     memcpy(auth_TLV->digest, orig, EIGRP_AUTH_TYPE_MD5_LEN);
     eigrph->checksum = saved_checksum;
 
-    if (memcmp(orig, digest, EIGRP_AUTH_TYPE_MD5_LEN) != 0) {
+    int match = (memcmp(orig, digest, EIGRP_AUTH_TYPE_MD5_LEN) == 0);
+    explicit_bzero(key_string, sizeof(key_string));
+    if (!match) {
         eigrp_log(EIGRP_LOG_WARNING, "interface %s: eigrp_check_md5 checksum mismatch",
               eigrp_intf_name_string(nbr->ei));
         return 0;
@@ -243,6 +249,7 @@ int __wrap_eigrp_make_sha256_digest(eigrp_intf_t *ei, eigrp_stream_t *s, uint8_t
     if (!srl_auth_key_get(ei, &key_id, key_string, sizeof(key_string))
         || !srl_auth_sha256_source(ei, NULL, source_ip, sizeof(source_ip))) {
         eigrp_auth_tlv_sha256_delete(auth_tlv);
+        explicit_bzero(key_string, sizeof(key_string));
         return 0;
     }
 
@@ -264,8 +271,8 @@ int __wrap_eigrp_make_sha256_digest(eigrp_intf_t *ei, eigrp_stream_t *s, uint8_t
     eigrp_stream_put(s, auth_tlv, EIGRP_AUTH_SHA256_TLV_SIZE);
     eigrp_stream_set_endp(s, backup_end);
     eigrp_auth_tlv_sha256_delete(auth_tlv);
-    memset(key_string, 0, sizeof(key_string));
-    memset(key_buffer, 0, sizeof(key_buffer));
+    explicit_bzero(key_string, sizeof(key_string));
+    explicit_bzero(key_buffer, sizeof(key_buffer));
     return EIGRP_AUTH_TYPE_SHA256_LEN;
 }
 
@@ -299,8 +306,10 @@ int __wrap_eigrp_check_sha256_digest(eigrp_stream_t *s,
         return 0;
     key_id = authTLV ? ntohl(authTLV->key_id) : 0;
     if (!srl_auth_key_get(nbr->ei, &key_id, key_string, sizeof(key_string))
-        || !srl_auth_sha256_source(nbr->ei, nbr, source_ip, sizeof(source_ip)))
+        || !srl_auth_sha256_source(nbr->ei, nbr, source_ip, sizeof(source_ip))) {
+        explicit_bzero(key_string, sizeof(key_string));
         return 0;
+    }
 
     header = (struct eigrp_header *)s->data;
     saved_checksum = header->checksum;
@@ -321,8 +330,8 @@ int __wrap_eigrp_check_sha256_digest(eigrp_stream_t *s,
     valid = memcmp(original, digest, sizeof(original)) == 0;
     if (valid)
         nbr->crypt_seqnum = authTLV->key_sequence;
-    memset(key_string, 0, sizeof(key_string));
-    memset(key_buffer, 0, sizeof(key_buffer));
+    explicit_bzero(key_string, sizeof(key_string));
+    explicit_bzero(key_buffer, sizeof(key_buffer));
     return valid;
 }
 
@@ -345,10 +354,12 @@ uint16_t __wrap_eigrp_auth_tlv_md5_encode(eigrp_stream_t *s, eigrp_intf_t *ei)
         memset(authTLV->digest, 0, EIGRP_AUTH_TYPE_MD5_LEN);
         eigrp_stream_put(s, authTLV, sizeof(struct TLV_MD5_Authentication_Type));
         eigrp_auth_tlv_md5_delete(authTLV);
+        explicit_bzero(key_string, sizeof(key_string));
         return EIGRP_AUTH_MD5_TLV_SIZE;
     }
 
     eigrp_auth_tlv_md5_delete(authTLV);
+    explicit_bzero(key_string, sizeof(key_string));
     return 0;
 }
 
@@ -371,10 +382,12 @@ uint16_t __wrap_eigrp_auth_tlv_sha256_encode(eigrp_stream_t *s, eigrp_intf_t *ei
         memset(authTLV->digest, 0, EIGRP_AUTH_TYPE_SHA256_LEN);
         eigrp_stream_put(s, authTLV, sizeof(struct TLV_SHA256_Authentication_Type));
         eigrp_auth_tlv_sha256_delete(authTLV);
+        explicit_bzero(key_string, sizeof(key_string));
         return EIGRP_AUTH_SHA256_TLV_SIZE;
     }
 
     eigrp_auth_tlv_sha256_delete(authTLV);
+    explicit_bzero(key_string, sizeof(key_string));
     return 0;
 }
 

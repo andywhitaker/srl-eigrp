@@ -24,6 +24,7 @@
 #include <ctype.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
+#include <stdarg.h>
 
 #include "srl_cshim.h"
 #include "eigrp_structs.h"
@@ -176,6 +177,25 @@ uint32_t eigrp_sys_timer_remaining_seconds(const eigrp_event_t *event) {
  * Instances, Bindings & Interface Tables
  * ------------------------------------------------------------------------ */
 
+#define SRL_DEDUP_CACHE_SIZE 128
+#define SRL_DEDUP_WINDOW_MS  250
+
+typedef struct {
+    uint32_t hash;
+    uint16_t len;
+    uint16_t ip_id;
+    uint16_t eigrp_csum;
+    uint8_t  rx_source; /* 1 = fd, 2 = pkt_fd */
+    uint8_t  afi;
+    uint64_t timestamp_ms;
+} srl_dedup_entry_t;
+
+typedef struct {
+    srl_dedup_entry_t entries[SRL_DEDUP_CACHE_SIZE];
+    size_t next_idx;
+    pthread_mutex_t lock;
+} srl_dedup_table_t;
+
 typedef struct srl_binding {
     eigrp_instance_t *eigrp;
     char netinst[64];
@@ -183,6 +203,7 @@ typedef struct srl_binding {
     int fd;      /* raw IP proto-88 socket in srbase-<netinst>: TX + multicast RX */
     int pkt_fd;  /* AF_PACKET socket on wire ports: unicast RX fallback (-1 if off) */
     int rx_fd;   /* fd the event loop polls: epoll over fd+pkt_fd, or fd itself */
+    srl_dedup_table_t dedup;
     struct srl_binding *next;
 } srl_binding_t;
 
@@ -199,6 +220,8 @@ typedef struct srl_intf {
     char netinst[64];
     char ifname[64];
     eigrp_ifindex_t ifindex;
+    eigrp_ifindex_t root_ifindex;
+    uint16_t vlan_id;
     eigrp_prefix_t address;
     eigrp_prefix_t address_v6;
     eigrp_prefix_t global_v6;
@@ -224,20 +247,31 @@ static bool srl_match_ifname(const char *dev_name, const char *cfg_name) {
     if (!dev_name || !cfg_name) return false;
     if (strcmp(dev_name, cfg_name) == 0) return true;
 
+    // Strip optional containerlab prefix like "srl1-" or "clab-srl1-"
+    const char *d = dev_name;
+    if (strncmp(d, "srl", 3) == 0 || strncmp(d, "clab", 4) == 0) {
+        const char *dash = strchr(d, '-');
+        if (dash) d = dash + 1;
+    }
+
     int ds_inst = 0, ds_sub = 0;
     int cs_inst = 0, cs_sub = 0;
     bool dev_sys = false, cfg_sys = false;
 
-    if (sscanf(dev_name, "system%d.%d", &ds_inst, &ds_sub) == 2) {
+    if (sscanf(d, "system%d.%d", &ds_inst, &ds_sub) == 2 ||
+        sscanf(d, "mgmt%d.%d", &ds_inst, &ds_sub) == 2) {
         dev_sys = true;
-    } else if (sscanf(dev_name, "system%d", &ds_inst) == 1) {
+    } else if (sscanf(d, "system%d", &ds_inst) == 1 ||
+               sscanf(d, "mgmt%d", &ds_inst) == 1) {
         ds_sub = 0;
         dev_sys = true;
     }
 
-    if (sscanf(cfg_name, "system%d.%d", &cs_inst, &cs_sub) == 2) {
+    if (sscanf(cfg_name, "system%d.%d", &cs_inst, &cs_sub) == 2 ||
+        sscanf(cfg_name, "mgmt%d.%d", &cs_inst, &cs_sub) == 2) {
         cfg_sys = true;
-    } else if (sscanf(cfg_name, "system%d", &cs_inst) == 1) {
+    } else if (sscanf(cfg_name, "system%d", &cs_inst) == 1 ||
+               sscanf(cfg_name, "mgmt%d", &cs_inst) == 1) {
         cs_sub = 0;
         cfg_sys = true;
     }
@@ -249,14 +283,16 @@ static bool srl_match_ifname(const char *dev_name, const char *cfg_name) {
     int dc1 = 0, dp1 = 0, ds1 = 0;
     int cc1 = 0, cp1 = 0, cs1 = 0;
     bool dev_parsed = false;
-    if (sscanf(dev_name, "e%d-%d.%d", &dc1, &dp1, &ds1) == 3) {
+    if (sscanf(d, "e%d-%d.%d", &dc1, &dp1, &ds1) == 3 ||
+        sscanf(d, "e%d-%d-%d", &dc1, &dp1, &ds1) == 3 ||
+        sscanf(d, "e%d-%d_%d", &dc1, &dp1, &ds1) == 3) {
         dev_parsed = true;
-    } else if (sscanf(dev_name, "ethernet-%d/%d.%d", &dc1, &dp1, &ds1) == 3) {
+    } else if (sscanf(d, "ethernet-%d/%d.%d", &dc1, &dp1, &ds1) == 3) {
         dev_parsed = true;
-    } else if (sscanf(dev_name, "e%d-%d", &dc1, &dp1) == 2) {
+    } else if (sscanf(d, "e%d-%d", &dc1, &dp1) == 2) {
         ds1 = 0;
         dev_parsed = true;
-    } else if (sscanf(dev_name, "ethernet-%d/%d", &dc1, &dp1) == 2) {
+    } else if (sscanf(d, "ethernet-%d/%d", &dc1, &dp1) == 2) {
         ds1 = 0;
         dev_parsed = true;
     }
@@ -264,7 +300,9 @@ static bool srl_match_ifname(const char *dev_name, const char *cfg_name) {
     bool cfg_parsed = false;
     if (sscanf(cfg_name, "ethernet-%d/%d.%d", &cc1, &cp1, &cs1) == 3) {
         cfg_parsed = true;
-    } else if (sscanf(cfg_name, "e%d-%d.%d", &cc1, &cp1, &cs1) == 3) {
+    } else if (sscanf(cfg_name, "e%d-%d.%d", &cc1, &cp1, &cs1) == 3 ||
+               sscanf(cfg_name, "e%d-%d-%d", &cc1, &cp1, &cs1) == 3 ||
+               sscanf(cfg_name, "e%d-%d_%d", &cc1, &cp1, &cs1) == 3) {
         cfg_parsed = true;
     } else if (sscanf(cfg_name, "ethernet-%d/%d", &cc1, &cp1) == 2) {
         cs1 = 0;
@@ -314,6 +352,568 @@ static srl_binding_t *g_bindings = NULL;
 static srl_intf_t *g_interfaces = NULL;
 static pthread_mutex_t g_data_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
 static char g_pending_netinst[64] = "default";
+
+static bool srl_match_single_dev_wire(const char *d, const char *base_name) {
+    if (!d || !base_name) return false;
+    if (strcmp(d, base_name) == 0) return true;
+
+    int n1 = 0, n2 = 0;
+    int d_inst = 0, b_inst = 0;
+    if ((sscanf(base_name, "system%d%n", &b_inst, &n1) == 1 && base_name[n1] == '\0') &&
+        (sscanf(d, "system%d%n", &d_inst, &n2) == 1 && d[n2] == '\0')) {
+        return (d_inst == b_inst);
+    }
+    if ((sscanf(base_name, "mgmt%d%n", &b_inst, &n1) == 1 && base_name[n1] == '\0') &&
+        (sscanf(d, "mgmt%d%n", &d_inst, &n2) == 1 && d[n2] == '\0')) {
+        return (d_inst == b_inst);
+    }
+
+    // Parse base_name for ethernet-X/Y or eX-Y (strictly wire device, no subinterface)
+    int bc = 0, bp = 0;
+    bool base_parsed = false;
+    if (sscanf(base_name, "ethernet-%d/%d%n", &bc, &bp, &n1) == 2 && base_name[n1] == '\0') {
+        base_parsed = true;
+    } else if (sscanf(base_name, "e%d-%d%n", &bc, &bp, &n1) == 2 && base_name[n1] == '\0') {
+        base_parsed = true;
+    }
+
+    if (!base_parsed) {
+        return false;
+    }
+
+    // dev_name in root netns MUST be a base wire device: eX-Y or ethernet-X/Y
+    // MUST NOT match internal veth peers like eX-Y-Z or subinterfaces like eX-Y.Z
+    int dc = 0, dp = 0;
+    if (sscanf(d, "e%d-%d%n", &dc, &dp, &n2) == 2 && d[n2] == '\0') {
+        return (dc == bc && dp == bp);
+    }
+    if (sscanf(d, "ethernet-%d/%d%n", &dc, &dp, &n2) == 2 && d[n2] == '\0') {
+        return (dc == bc && dp == bp);
+    }
+
+    return false;
+}
+
+static bool srl_match_root_wire_ifname(const char *dev_name, const char *base_name) {
+    if (!dev_name || !base_name) return false;
+    if (srl_match_single_dev_wire(dev_name, base_name)) return true;
+
+    // Check suffix candidates after each hyphen (e.g. "clab-srl1-e1-1" -> "srl1-e1-1" -> "e1-1")
+    const char *p = dev_name;
+    while ((p = strchr(p, '-')) != NULL) {
+        p++; // advance past '-'
+        if (*p && srl_match_single_dev_wire(p, base_name)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static eigrp_ifindex_t srl_resolve_root_ifindex(const char *ifname) {
+    if (!ifname || !ifname[0]) return 0;
+
+    // Strip subinterface suffix (.0, .1) FIRST to obtain the parent wire interface name
+    char base_name[IFNAMSIZ] = {0};
+    strncpy(base_name, ifname, sizeof(base_name) - 1);
+    char *dot = strrchr(base_name, '.');
+    if (dot) {
+        *dot = '\0';
+    } else {
+        int c = 0, p = 0, s = 0;
+        if (sscanf(ifname, "e%d-%d-%d", &c, &p, &s) == 3 ||
+            sscanf(ifname, "e%d-%d_%d", &c, &p, &s) == 3) {
+            snprintf(base_name, sizeof(base_name), "e%d-%d", c, p);
+        }
+    }
+
+    int cur_ns = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
+    srl_netns_restore_root();
+
+    eigrp_ifindex_t idx = (eigrp_ifindex_t)if_nametoindex(base_name);
+    if (idx == 0) {
+        struct if_nameindex *nlist = if_nameindex();
+        if (nlist) {
+            for (struct if_nameindex *cur = nlist; cur->if_index != 0 && cur->if_name != NULL; cur++) {
+                if (srl_match_root_wire_ifname(cur->if_name, base_name)) {
+                    idx = (eigrp_ifindex_t)cur->if_index;
+                    break;
+                }
+            }
+            if (idx == 0) {
+                for (struct if_nameindex *cur = nlist; cur->if_index != 0 && cur->if_name != NULL; cur++) {
+                    if (srl_match_root_wire_ifname(cur->if_name, ifname)) {
+                        idx = (eigrp_ifindex_t)cur->if_index;
+                        break;
+                    }
+                }
+            }
+            if_freenameindex(nlist);
+        }
+    }
+
+    if (cur_ns >= 0) {
+        setns(cur_ns, CLONE_NEWNET);
+        close(cur_ns);
+    }
+    return idx;
+}
+
+static bool srl_is_debug_enabled(void) {
+    static int cached_debug = -1;
+    if (cached_debug == -1) {
+        const char *env = getenv("SRL_EIGRP_DEBUG");
+        cached_debug = (env && (strcmp(env, "1") == 0 || strcasecmp(env, "true") == 0)) ? 1 : 0;
+    }
+    return cached_debug == 1;
+}
+
+static void srl_log(int level, const char *fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    srlGoLog(level, buf);
+}
+
+static bool g_pkt_fd_disabled = false;
+
+void srlShimSetPktFdDisabled(bool disabled) {
+    g_pkt_fd_disabled = disabled;
+}
+
+bool srlShimGetPktFdDisabled(void) {
+    if (g_pkt_fd_disabled) return true;
+    const char *env = getenv("SRL_EIGRP_DISABLE_PKT_FD");
+    if (env && (strcmp(env, "1") == 0 || strcasecmp(env, "true") == 0 || strcasecmp(env, "yes") == 0)) {
+        return true;
+    }
+    return false;
+}
+
+#define SRL_BPF_MAX_IFINDEXES 250
+
+static struct sock_filter *srl_build_bpf_filter(const uint32_t *ifindexes, size_t num_if, size_t *out_len) {
+    if (!out_len) return NULL;
+    if (num_if > SRL_BPF_MAX_IFINDEXES) num_if = SRL_BPF_MAX_IFINDEXES;
+
+    size_t total_insns = (num_if == 0) ? 1 : (num_if + 32);
+    struct sock_filter *insns = calloc(total_insns, sizeof(struct sock_filter));
+    if (!insns) {
+        *out_len = 0;
+        return NULL;
+    }
+
+    size_t idx = 0;
+    if (num_if == 0) {
+        insns[idx++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, 0);
+    } else {
+        size_t proto_start = 2 + num_if;
+        insns[idx++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, (uint32_t)(SKF_AD_OFF + SKF_AD_IFINDEX));
+        for (size_t i = 0; i < num_if; i++) {
+            uint8_t jt = (uint8_t)(proto_start - (2 + i));
+            insns[idx++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, ifindexes[i], jt, 0);
+        }
+        insns[idx++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, 0);
+
+        // proto_start + 0: Load EtherType at offset 12
+        insns[idx++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 12);
+        // proto_start + 1: If IPv4 (0x0800), jump to CHECK_IP4_UNTAGGED (proto_start + 16)
+        insns[idx++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x0800, 14, 0);
+        // proto_start + 2: If IPv6 (0x86dd), jump to CHECK_IP6_UNTAGGED (proto_start + 18)
+        insns[idx++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x86dd, 15, 0);
+        // proto_start + 3: If 0x8100 (VLAN), jump to CHECK_VLAN1 (proto_start + 6)
+        insns[idx++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x8100, 2, 0);
+        // proto_start + 4: If 0x88a8 (Service VLAN), jump to CHECK_VLAN1 (proto_start + 6)
+        insns[idx++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x88a8, 1, 0);
+        // proto_start + 5: Drop other ethertypes
+        insns[idx++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, 0);
+
+        // proto_start + 6 (CHECK_VLAN1): Load EtherType/TPID at offset 16
+        insns[idx++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 16);
+        // proto_start + 7: If IPv4 (0x0800), jump to CHECK_IP4_SINGLE (proto_start + 20)
+        insns[idx++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x0800, 12, 0);
+        // proto_start + 8: If IPv6 (0x86dd), jump to CHECK_IP6_SINGLE (proto_start + 22)
+        insns[idx++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x86dd, 13, 0);
+        // proto_start + 9: If 0x8100 (double-tagged), jump to CHECK_VLAN2 (proto_start + 12)
+        insns[idx++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x8100, 2, 0);
+        // proto_start + 10: If 0x88a8 (double-tagged), jump to CHECK_VLAN2 (proto_start + 12)
+        insns[idx++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x88a8, 1, 0);
+        // proto_start + 11: Drop
+        insns[idx++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, 0);
+
+        // proto_start + 12 (CHECK_VLAN2): Load EtherType at offset 20
+        insns[idx++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 20);
+        // proto_start + 13: If IPv4 (0x0800), jump to CHECK_IP4_DOUBLE (proto_start + 24)
+        insns[idx++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x0800, 10, 0);
+        // proto_start + 14: If IPv6 (0x86dd), jump to CHECK_IP6_DOUBLE (proto_start + 26)
+        insns[idx++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x86dd, 11, 0);
+        // proto_start + 15: Drop
+        insns[idx++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, 0);
+
+        // proto_start + 16 (CHECK_IP4_UNTAGGED): Load IPv4 proto at offset 14+9 = 23
+        insns[idx++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 23);
+        // proto_start + 17: If 88, jump to PASS (proto_start + 28), else DROP (proto_start + 29)
+        insns[idx++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 88, 10, 11);
+
+        // proto_start + 18 (CHECK_IP6_UNTAGGED): Load IPv6 next header at offset 14+6 = 20
+        insns[idx++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 20);
+        // proto_start + 19: If 88, jump to PASS (proto_start + 28), else DROP (proto_start + 29)
+        insns[idx++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 88, 8, 9);
+
+        // proto_start + 20 (CHECK_IP4_SINGLE): Load IPv4 proto at offset 18+9 = 27
+        insns[idx++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 27);
+        // proto_start + 21: If 88, jump to PASS (proto_start + 28), else DROP (proto_start + 29)
+        insns[idx++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 88, 6, 7);
+
+        // proto_start + 22 (CHECK_IP6_SINGLE): Load IPv6 next header at offset 18+6 = 24
+        insns[idx++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 24);
+        // proto_start + 23: If 88, jump to PASS (proto_start + 28), else DROP (proto_start + 29)
+        insns[idx++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 88, 4, 5);
+
+        // proto_start + 24 (CHECK_IP4_DOUBLE): Load IPv4 proto at offset 22+9 = 31
+        insns[idx++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 31);
+        // proto_start + 25: If 88, jump to PASS (proto_start + 28), else DROP (proto_start + 29)
+        insns[idx++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 88, 2, 3);
+
+        // proto_start + 26 (CHECK_IP6_DOUBLE): Load IPv6 next header at offset 22+6 = 28
+        insns[idx++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 28);
+        // proto_start + 27: If 88, jump to PASS (proto_start + 28), else DROP (proto_start + 29)
+        insns[idx++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 88, 0, 1);
+
+        // proto_start + 28: PASS
+        insns[idx++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, 65535);
+        // proto_start + 29: DROP
+        insns[idx++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, 0);
+    }
+
+    *out_len = idx;
+    return insns;
+}
+
+uint32_t srlTestRunBPFFilter(const uint32_t *ifindexes, size_t num_if, const uint8_t *pkt, size_t pkt_len, uint32_t ifindex) {
+    size_t insn_count = 0;
+    struct sock_filter *insns = srl_build_bpf_filter(ifindexes, num_if, &insn_count);
+    if (!insns || insn_count == 0) return 0;
+
+    uint32_t A = 0;
+    size_t pc = 0;
+    while (pc < insn_count) {
+        struct sock_filter *inst = &insns[pc++];
+        uint16_t code = inst->code;
+        switch (code) {
+        case BPF_LD | BPF_W | BPF_ABS:
+            if (inst->k == (uint32_t)(SKF_AD_OFF + SKF_AD_IFINDEX)) {
+                A = ifindex;
+            } else if (inst->k + 4 <= pkt_len) {
+                A = ((uint32_t)pkt[inst->k] << 24) | ((uint32_t)pkt[inst->k + 1] << 16) |
+                    ((uint32_t)pkt[inst->k + 2] << 8) | (uint32_t)pkt[inst->k + 3];
+            } else {
+                free(insns);
+                return 0;
+            }
+            break;
+        case BPF_LD | BPF_H | BPF_ABS:
+            if (inst->k + 2 <= pkt_len) {
+                A = ((uint32_t)pkt[inst->k] << 8) | (uint32_t)pkt[inst->k + 1];
+            } else {
+                free(insns);
+                return 0;
+            }
+            break;
+        case BPF_LD | BPF_B | BPF_ABS:
+            if (inst->k < pkt_len) {
+                A = (uint32_t)pkt[inst->k];
+            } else {
+                free(insns);
+                return 0;
+            }
+            break;
+        case BPF_JMP | BPF_JEQ | BPF_K:
+            if (A == inst->k) {
+                pc += inst->jt;
+            } else {
+                pc += inst->jf;
+            }
+            break;
+        case BPF_RET | BPF_K: {
+            uint32_t ret_val = inst->k;
+            free(insns);
+            return ret_val;
+        }
+        default:
+            free(insns);
+            return 0;
+        }
+    }
+    free(insns);
+    return 0;
+}
+
+static void srl_update_bpf_filter(srl_binding_t *b) {
+    if (!b || b->pkt_fd < 0) return;
+
+    bool is_v6 = (b->eigrp && eigrp_instance_afi(b->eigrp) == EIGRP_AFI_IPV6);
+
+    // Collect root ifindexes for active EIGRP interfaces in this netinst matching AFI
+    uint32_t ifindexes[SRL_BPF_MAX_IFINDEXES];
+    size_t num_if = 0;
+
+    pthread_mutex_lock(&g_data_lock);
+    for (srl_intf_t *ci = g_interfaces; ci && num_if < SRL_BPF_MAX_IFINDEXES; ci = ci->next) {
+        bool active = is_v6 ? ci->active_v6 : ci->active;
+        if (strcmp(ci->netinst, b->netinst) == 0 && active) {
+            if (ci->root_ifindex == 0) {
+                ci->root_ifindex = srl_resolve_root_ifindex(ci->ifname);
+            }
+            if (ci->root_ifindex > 0) {
+                bool found = false;
+                for (size_t i = 0; i < num_if; i++) {
+                    if (ifindexes[i] == (uint32_t)ci->root_ifindex) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found && num_if < SRL_BPF_MAX_IFINDEXES) {
+                    ifindexes[num_if++] = (uint32_t)ci->root_ifindex;
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_data_lock);
+
+    size_t total_insns = 0;
+    struct sock_filter *insns = srl_build_bpf_filter(ifindexes, num_if, &total_insns);
+    if (!insns) return;
+
+    struct sock_fprog prog = {
+        .len = (unsigned short)total_insns,
+        .filter = insns,
+    };
+
+    setsockopt(b->pkt_fd, SOL_SOCKET, SO_ATTACH_FILTER, &prog, sizeof(prog));
+    free(insns);
+}
+
+static void srl_update_bpf_filter_netinst(const char *netinst) {
+    if (!netinst) return;
+    pthread_mutex_lock(&g_data_lock);
+    for (srl_binding_t *b = g_bindings; b; b = b->next) {
+        if (strcmp(b->netinst, netinst) == 0 && b->pkt_fd >= 0) {
+            srl_update_bpf_filter(b);
+        }
+    }
+    pthread_mutex_unlock(&g_data_lock);
+}
+
+static void srl_pkt_multicast_membership(int pkt_fd, int ifindex, bool join) {
+    if (pkt_fd < 0 || ifindex <= 0) return;
+
+    struct packet_mreq mr;
+    int opt = join ? PACKET_ADD_MEMBERSHIP : PACKET_DROP_MEMBERSHIP;
+
+    // Restore PACKET_MR_PROMISC so the Linux kernel driver on wire interface
+    // (e.g. e1-1 in root namespace) delivers unicast EIGRP frames addressed to
+    // subinterface MACs as well as multicast frames to pkt_fd.
+    // The attached kernel cBPF filter guarantees all non-EIGRP packets are discarded in kernel space.
+    memset(&mr, 0, sizeof(mr));
+    mr.mr_ifindex = ifindex;
+    mr.mr_type = PACKET_MR_PROMISC;
+    setsockopt(pkt_fd, SOL_PACKET, opt, &mr, sizeof(mr));
+
+    static const uint8_t eigrp_v4_mcast_mac[6] = {0x01, 0x00, 0x5e, 0x00, 0x00, 0x0a};
+    static const uint8_t eigrp_v6_mcast_mac[6] = {0x33, 0x33, 0x00, 0x00, 0x0a};
+
+    // Targeted multicast join for IPv4 EIGRP (224.0.0.10 -> 01:00:5e:00:00:0a)
+    memset(&mr, 0, sizeof(mr));
+    mr.mr_ifindex = ifindex;
+    mr.mr_type = PACKET_MR_MULTICAST;
+    mr.mr_alen = 6;
+    memcpy(mr.mr_address, eigrp_v4_mcast_mac, 6);
+    setsockopt(pkt_fd, SOL_PACKET, opt, &mr, sizeof(mr));
+
+    // Targeted multicast join for IPv6 EIGRP (ff02::a -> 33:33:00:00:00:0a)
+    memset(&mr, 0, sizeof(mr));
+    mr.mr_ifindex = ifindex;
+    mr.mr_type = PACKET_MR_MULTICAST;
+    mr.mr_alen = 6;
+    memcpy(mr.mr_address, eigrp_v6_mcast_mac, 6);
+    setsockopt(pkt_fd, SOL_PACKET, opt, &mr, sizeof(mr));
+}
+
+static void srl_intf_membership_update(const char *netinst, eigrp_ifindex_t root_ifindex, bool join) {
+    if (!netinst || root_ifindex == 0) return;
+    pthread_mutex_lock(&g_data_lock);
+    for (srl_binding_t *b = g_bindings; b; b = b->next) {
+        if (strcmp(b->netinst, netinst) == 0 && b->pkt_fd >= 0) {
+            srl_pkt_multicast_membership(b->pkt_fd, (int)root_ifindex, join);
+        }
+    }
+    pthread_mutex_unlock(&g_data_lock);
+}
+
+static void srl_fd_multicast_membership_update(const char *netinst, eigrp_ifindex_t ifindex, bool is_v6, bool join) {
+    if (!netinst || ifindex == 0) return;
+    pthread_mutex_lock(&g_data_lock);
+    for (srl_binding_t *b = g_bindings; b; b = b->next) {
+        if (strcmp(b->netinst, netinst) == 0 && b->fd >= 0 && b->eigrp) {
+            bool inst_v6 = (eigrp_instance_afi(b->eigrp) == EIGRP_AFI_IPV6);
+            if (is_v6 && inst_v6) {
+                struct ipv6_mreq mreq6;
+                memset(&mreq6, 0, sizeof(mreq6));
+                inet_pton(AF_INET6, "ff02::a", &mreq6.ipv6mr_multiaddr);
+                mreq6.ipv6mr_interface = (int)ifindex;
+                int opt = join ? IPV6_JOIN_GROUP : IPV6_DROP_MEMBERSHIP;
+                int rc = setsockopt(b->fd, IPPROTO_IPV6, opt, &mreq6, sizeof(mreq6));
+                if (rc < 0 && errno != EADDRINUSE && errno != EADDRNOTAVAIL && errno != ENOENT && errno != ENODEV) {
+                    if (srl_is_debug_enabled()) {
+                        srl_log(1, "CSHIM: setsockopt IPV6_%s_GROUP ifindex=%u fd=%d errno=%d (%s)",
+                                join ? "JOIN" : "DROP", (unsigned)ifindex, b->fd, errno, strerror(errno));
+                    }
+                }
+            } else if (!is_v6 && !inst_v6) {
+                struct ip_mreqn mreq;
+                memset(&mreq, 0, sizeof(mreq));
+                mreq.imr_multiaddr.s_addr = htonl(EIGRP_MULTICAST_ADDRESS);
+                mreq.imr_ifindex = (int)ifindex;
+                for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+                    if (strcmp(ci->netinst, netinst) == 0 && ci->ifindex == ifindex) {
+                        if (ci->address.address.afi == EIGRP_AFI_IPV4) {
+                            memcpy(&mreq.imr_address, ci->address.address.bytes, 4);
+                        }
+                        break;
+                    }
+                }
+                int opt = join ? IP_ADD_MEMBERSHIP : IP_DROP_MEMBERSHIP;
+                int rc = setsockopt(b->fd, IPPROTO_IP, opt, &mreq, sizeof(mreq));
+                if (rc < 0 && errno != EADDRINUSE && errno != EADDRNOTAVAIL && errno != ENOENT && errno != ENODEV) {
+                    if (srl_is_debug_enabled()) {
+                        srl_log(1, "CSHIM: setsockopt IP_%s_MEMBERSHIP ifindex=%u fd=%d errno=%d (%s)",
+                                join ? "ADD" : "DROP", (unsigned)ifindex, b->fd, errno, strerror(errno));
+                    }
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_data_lock);
+}
+
+static void srl_fd_multicast_join_all_active(srl_binding_t *b) {
+    if (!b || b->fd < 0 || !b->eigrp) return;
+    bool is_v6 = (eigrp_instance_afi(b->eigrp) == EIGRP_AFI_IPV6);
+    pthread_mutex_lock(&g_data_lock);
+    for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+        if (strcmp(ci->netinst, b->netinst) != 0) continue;
+        if (!is_v6 && ci->active && ci->ifindex > 0) {
+            struct ip_mreqn mreq;
+            memset(&mreq, 0, sizeof(mreq));
+            mreq.imr_multiaddr.s_addr = htonl(EIGRP_MULTICAST_ADDRESS);
+            mreq.imr_ifindex = (int)ci->ifindex;
+            if (ci->address.address.afi == EIGRP_AFI_IPV4) {
+                memcpy(&mreq.imr_address, ci->address.address.bytes, 4);
+            }
+            int rc = setsockopt(b->fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
+            if (rc < 0 && errno != EADDRINUSE && errno != EADDRNOTAVAIL && srl_is_debug_enabled()) {
+                srl_log(1, "CSHIM: socket_open IP_ADD_MEMBERSHIP ifindex=%u fd=%d errno=%d (%s)",
+                        (unsigned)ci->ifindex, b->fd, errno, strerror(errno));
+            }
+        } else if (is_v6 && ci->active_v6 && ci->ifindex > 0) {
+            struct ipv6_mreq mreq6;
+            memset(&mreq6, 0, sizeof(mreq6));
+            inet_pton(AF_INET6, "ff02::a", &mreq6.ipv6mr_multiaddr);
+            mreq6.ipv6mr_interface = (int)ci->ifindex;
+            int rc = setsockopt(b->fd, IPPROTO_IPV6, IPV6_JOIN_GROUP, &mreq6, sizeof(mreq6));
+            if (rc < 0 && errno != EADDRINUSE && errno != EADDRNOTAVAIL && srl_is_debug_enabled()) {
+                srl_log(1, "CSHIM: socket_open IPV6_JOIN_GROUP ifindex=%u fd=%d errno=%d (%s)",
+                        (unsigned)ci->ifindex, b->fd, errno, strerror(errno));
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_data_lock);
+}
+
+static uint32_t srl_packet_hash(int afi, const void *src, const void *dst, const void *payload, size_t len) {
+    uint32_t h = 2166136261u; // FNV-1a
+    h ^= (uint32_t)afi; h *= 16777619u;
+    size_t addr_len = (afi == AF_INET6) ? 16 : 4;
+    const uint8_t *s = (const uint8_t *)src;
+    for (size_t i = 0; i < addr_len; i++) {
+        h ^= s[i]; h *= 16777619u;
+    }
+    const uint8_t *d = (const uint8_t *)dst;
+    for (size_t i = 0; i < addr_len; i++) {
+        h ^= d[i]; h *= 16777619u;
+    }
+    h ^= (uint32_t)len; h *= 16777619u;
+    const uint8_t *p = (const uint8_t *)payload;
+    size_t sample_len = len > 64 ? 64 : len;
+    for (size_t i = 0; i < sample_len; i++) {
+        h ^= p[i]; h *= 16777619u;
+    }
+    return h;
+}
+
+static bool srl_dedup_is_duplicate(srl_binding_t *b, uint8_t rx_src, uint8_t afi,
+                                   uint32_t hash, uint16_t len, uint16_t ip_id,
+                                   uint16_t eigrp_csum) {
+    if (!b) return false;
+    uint64_t now = srl_monotime_msec();
+    pthread_mutex_lock(&b->dedup.lock);
+
+    for (size_t i = 0; i < SRL_DEDUP_CACHE_SIZE; i++) {
+        srl_dedup_entry_t *e = &b->dedup.entries[i];
+        if (e->hash == 0 && e->timestamp_ms == 0) continue;
+        if (now >= e->timestamp_ms && (now - e->timestamp_ms) <= SRL_DEDUP_WINDOW_MS) {
+            if (e->rx_source != rx_src && e->afi == afi && e->hash == hash &&
+                e->len == len && e->eigrp_csum == eigrp_csum) {
+                if (afi == AF_INET && e->ip_id != 0 && ip_id != 0 && e->ip_id != ip_id) {
+                    continue;
+                }
+                pthread_mutex_unlock(&b->dedup.lock);
+                return true;
+            }
+        }
+    }
+
+    srl_dedup_entry_t *slot = &b->dedup.entries[b->dedup.next_idx];
+    slot->hash = hash;
+    slot->len = len;
+    slot->ip_id = ip_id;
+    slot->eigrp_csum = eigrp_csum;
+    slot->rx_source = rx_src;
+    slot->afi = afi;
+    slot->timestamp_ms = now;
+    b->dedup.next_idx = (b->dedup.next_idx + 1) % SRL_DEDUP_CACHE_SIZE;
+
+    pthread_mutex_unlock(&b->dedup.lock);
+    return false;
+}
+
+static srl_binding_t g_test_binding;
+static bool g_test_binding_init = false;
+
+uint32_t srlTestPacketHash(int afi, const void *src, const void *dst, const void *payload, size_t len) {
+    return srl_packet_hash(afi, src, dst, payload, len);
+}
+
+bool srlTestDedupCheck(uint8_t rx_src, uint8_t afi, uint32_t hash, uint16_t len, uint16_t ip_id, uint16_t eigrp_csum) {
+    if (!g_test_binding_init) {
+        memset(&g_test_binding, 0, sizeof(g_test_binding));
+        pthread_mutex_init(&g_test_binding.dedup.lock, NULL);
+        g_test_binding_init = true;
+    }
+    return srl_dedup_is_duplicate(&g_test_binding, rx_src, afi, hash, len, ip_id, eigrp_csum);
+}
+
+void srlTestDedupReset(void) {
+    if (g_test_binding_init) {
+        pthread_mutex_lock(&g_test_binding.dedup.lock);
+        memset(g_test_binding.dedup.entries, 0, sizeof(g_test_binding.dedup.entries));
+        g_test_binding.dedup.next_idx = 0;
+        pthread_mutex_unlock(&g_test_binding.dedup.lock);
+    }
+}
 
 static uint32_t srl_vrf_id_get(const char *netinst) {
     const char *ni = (netinst && netinst[0]) ? netinst : "default";
@@ -764,18 +1364,42 @@ eigrp_result_t eigrp_sys_socket_open(eigrp_instance_t *eigrp) {
     b->fd = fd;
     b->pkt_fd = -1;
     b->rx_fd = -1;
+    pthread_mutex_init(&b->dedup.lock, NULL);
 
-    // AF_PACKET raw socket in root namespace to capture unicast proto-88 packets
-    // that are discarded by SR Linux dataplane (sr_xdp_lc).
-    // Using ETH_P_ALL allows capturing both untagged frames and 802.1Q tagged frames.
-    srl_netns_restore_root();
-    b->pkt_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-    if (b->pkt_fd >= 0) {
-        fcntl(b->pkt_fd, F_SETFL, fcntl(b->pkt_fd, F_GETFL, 0) | O_NONBLOCK);
-        struct packet_mreq mr;
-        memset(&mr, 0, sizeof(mr));
-        mr.mr_type = PACKET_MR_PROMISC;
-        setsockopt(b->pkt_fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mr, sizeof(mr));
+    // Explicit multicast group join on all active interfaces for this netinst
+    srl_fd_multicast_join_all_active(b);
+
+    if (!srlShimGetPktFdDisabled()) {
+        // AF_PACKET raw socket in root namespace to capture proto-88 packets
+        // that are discarded by SR Linux dataplane (sr_xdp_lc).
+        // Using ETH_P_ALL allows capturing both untagged frames and 802.1Q tagged frames.
+        srl_netns_restore_root();
+        b->pkt_fd = socket(AF_PACKET, SOCK_RAW | SOCK_CLOEXEC, htons(ETH_P_ALL));
+        if (b->pkt_fd >= 0) {
+            fcntl(b->pkt_fd, F_SETFL, fcntl(b->pkt_fd, F_GETFL, 0) | O_NONBLOCK);
+            int one = 1;
+            setsockopt(b->pkt_fd, SOL_PACKET, PACKET_AUXDATA, &one, sizeof(one));
+            srl_update_bpf_filter(b);
+            pthread_mutex_lock(&g_data_lock);
+            for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+                if (strcmp(ci->netinst, b->netinst) == 0 && (ci->active || ci->active_v6)) {
+                    if (ci->root_ifindex == 0) {
+                        ci->root_ifindex = srl_resolve_root_ifindex(ci->ifname);
+                    }
+                    if (ci->root_ifindex > 0) {
+                        srl_pkt_multicast_membership(b->pkt_fd, (int)ci->root_ifindex, true);
+                    }
+                }
+            }
+            pthread_mutex_unlock(&g_data_lock);
+        } else if (srl_is_debug_enabled()) {
+            srl_log(1, "CSHIM WARN: Failed to open AF_PACKET socket: %s", strerror(errno));
+        }
+    } else {
+        if (srl_is_debug_enabled()) {
+            srl_log(0, "CSHIM: AF_PACKET socket disabled via SRL_EIGRP_DISABLE_PKT_FD");
+        }
+        b->pkt_fd = -1;
     }
 
     // Epoll fd to monitor both fd and pkt_fd
@@ -845,6 +1469,7 @@ void eigrp_sys_socket_close(eigrp_instance_t *eigrp) {
         if (del->fd >= 0) {
             close(del->fd);
         }
+        pthread_mutex_destroy(&del->dedup.lock);
         free(del);
         srl_runtime_wake();
     }
@@ -900,15 +1525,23 @@ int eigrp_sys_multicast_join(eigrp_instance_t *e, eigrp_intf_t *ei) {
         memset(&mreq6, 0, sizeof(mreq6));
         inet_pton(AF_INET6, "ff02::a", &mreq6.ipv6mr_multiaddr);
         mreq6.ipv6mr_interface = (int)eigrp_intf_ifindex(ei);
-        return setsockopt(fd, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP, &mreq6, sizeof(mreq6));
+        int rc = setsockopt(fd, IPPROTO_IPV6, IPV6_JOIN_GROUP, &mreq6, sizeof(mreq6));
+        if (rc < 0 && errno == EADDRINUSE) return 0;
+        return rc;
     }
 
     struct ip_mreqn mreq;
     memset(&mreq, 0, sizeof(mreq));
     mreq.imr_multiaddr.s_addr = htonl(EIGRP_MULTICAST_ADDRESS);
     mreq.imr_ifindex = (int)eigrp_intf_ifindex(ei);
+    eigrp_prefix_t local_addr;
+    if (eigrp_intf_address_read(ei, &local_addr) == EIGRP_RESULT_SUCCESS && local_addr.address.afi == EIGRP_AFI_IPV4) {
+        memcpy(&mreq.imr_address, local_addr.address.bytes, sizeof(struct in_addr));
+    }
 
-    return setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
+    int rc = setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
+    if (rc < 0 && errno == EADDRINUSE) return 0;
+    return rc;
 }
 
 int eigrp_sys_multicast_leave(eigrp_instance_t *e, eigrp_intf_t *ei) {
@@ -921,15 +1554,23 @@ int eigrp_sys_multicast_leave(eigrp_instance_t *e, eigrp_intf_t *ei) {
         memset(&mreq6, 0, sizeof(mreq6));
         inet_pton(AF_INET6, "ff02::a", &mreq6.ipv6mr_multiaddr);
         mreq6.ipv6mr_interface = (int)eigrp_intf_ifindex(ei);
-        return setsockopt(fd, IPPROTO_IPV6, IPV6_DROP_MEMBERSHIP, &mreq6, sizeof(mreq6));
+        int rc = setsockopt(fd, IPPROTO_IPV6, IPV6_DROP_MEMBERSHIP, &mreq6, sizeof(mreq6));
+        if (rc < 0 && (errno == EADDRNOTAVAIL || errno == ENOENT)) return 0;
+        return rc;
     }
 
     struct ip_mreqn mreq;
     memset(&mreq, 0, sizeof(mreq));
     mreq.imr_multiaddr.s_addr = htonl(EIGRP_MULTICAST_ADDRESS);
     mreq.imr_ifindex = (int)eigrp_intf_ifindex(ei);
+    eigrp_prefix_t local_addr;
+    if (eigrp_intf_address_read(ei, &local_addr) == EIGRP_RESULT_SUCCESS && local_addr.address.afi == EIGRP_AFI_IPV4) {
+        memcpy(&mreq.imr_address, local_addr.address.bytes, sizeof(struct in_addr));
+    }
 
-    return setsockopt(fd, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq, sizeof(mreq));
+    int rc = setsockopt(fd, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq, sizeof(mreq));
+    if (rc < 0 && (errno == EADDRNOTAVAIL || errno == ENOENT)) return 0;
+    return rc;
 }
 
 /* ------------------------------------------------------------------------
@@ -977,7 +1618,7 @@ int eigrp_sys_ipv4_packet_send(eigrp_instance_t *eigrp, eigrp_intf_t *ei,
     iph.ip_v = 4;
     iph.ip_tos = 0xC0; // Internetwork Control
     iph.ip_len = htons((uint16_t)(sizeof(struct ip) + length));
-    iph.ip_ttl = 64;
+    iph.ip_ttl = 1; // Align with native OSPF & EIGRP_IP_TTL (IP_MULTICAST_TTL=1)
     iph.ip_p = 88;
     iph.ip_dst = sin.sin_addr;
     memcpy(&iph.ip_src, local_addr.address.bytes, sizeof(iph.ip_src));
@@ -1017,11 +1658,358 @@ int eigrp_sys_ipv4_packet_send(eigrp_instance_t *eigrp, eigrp_intf_t *ei,
 
     ssize_t ret = sendmsg(fd, &msg, flags);
     if (ret < 0) {
-        fprintf(stderr, "CSHIM TX ERR: sendmsg fd=%d ifindex=%u dst=%s len=%zu errno=%d (%s)\n",
+        srl_log(1, "CSHIM TX ERR: sendmsg fd=%d ifindex=%u dst=%s len=%zu errno=%d (%s)",
                 fd, (unsigned)eigrp_intf_ifindex(ei),
                 inet_ntoa(sin.sin_addr), length, errno, strerror(errno));
     }
     return (int)ret;
+}
+
+static inline bool srl_intf_matches_vlan(const srl_intf_t *ci, uint16_t vlan_id, const char *vlan_suffix) {
+    if (vlan_id > 0) {
+        if (ci->vlan_id == vlan_id) return true;
+        if (ci->vlan_id == 0 && vlan_suffix && vlan_suffix[0]) {
+            const char *dot = strrchr(ci->ifname, '.');
+            if (dot && strcmp(dot, vlan_suffix) == 0) return true;
+        }
+        return false;
+    }
+    // Untagged frame (vlan_id == 0): MUST NOT match tagged interfaces
+    return (ci->vlan_id == 0);
+}
+
+static inline bool srl_intf_matches_vlan_candidate(const srl_intf_t *ci, uint16_t vlan_id) {
+    if (vlan_id > 0) {
+        if (ci->vlan_id == vlan_id) return true;
+        if (ci->vlan_id == 0) return true;
+        return false;
+    }
+    // Untagged frame (vlan_id == 0): MUST NOT match tagged interfaces
+    return (ci->vlan_id == 0);
+}
+
+static eigrp_ifindex_t srl_resolve_wire_interface_v4(const char *netinst, uint32_t sll_ifindex,
+                                                     uint16_t vlan_id, struct in_addr src_ip,
+                                                     struct in_addr dst_ip) {
+    char ifname_raw[IFNAMSIZ] = "";
+    if (sll_ifindex > 0) {
+        if_indextoname((unsigned)sll_ifindex, ifname_raw);
+    }
+    char mapped_name[64] = "";
+    if (ifname_raw[0]) {
+        strncpy(mapped_name, ifname_raw, sizeof(mapped_name) - 1);
+        char *first_dash = strchr(mapped_name, '-');
+        char *last_dash = strrchr(mapped_name, '-');
+        if (last_dash && last_dash != first_dash && isdigit((unsigned char)*(last_dash + 1))) {
+            *last_dash = '.';
+        }
+    }
+
+    eigrp_ifindex_t found_idx = 0;
+    pthread_mutex_lock(&g_data_lock);
+
+    char vlan_suffix[16] = "";
+    if (vlan_id > 0) {
+        snprintf(vlan_suffix, sizeof(vlan_suffix), ".%u", (unsigned)vlan_id);
+    }
+
+    // Phase 1: Match within subinterfaces on this root device (sll_ifindex)
+    if (sll_ifindex > 0) {
+        // 1a. If frame is VLAN-tagged, match subinterface on this device with matching VLAN ID
+        if (vlan_id > 0) {
+            for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+                if (strcmp(ci->netinst, netinst) != 0 || !ci->active) continue;
+                if (!srl_intf_matches_vlan(ci, vlan_id, vlan_suffix)) continue;
+                if (ci->root_ifindex == 0) ci->root_ifindex = srl_resolve_root_ifindex(ci->ifname);
+                if (ci->root_ifindex == (eigrp_ifindex_t)sll_ifindex) {
+                    found_idx = ci->ifindex;
+                    break;
+                }
+            }
+        }
+
+        // 1b. Match destination IP on this device (unicast to interface IP)
+        if (found_idx == 0) {
+            for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+                if (strcmp(ci->netinst, netinst) != 0 || !ci->active) continue;
+                if (!srl_intf_matches_vlan_candidate(ci, vlan_id)) continue;
+                if (ci->root_ifindex == 0) ci->root_ifindex = srl_resolve_root_ifindex(ci->ifname);
+                if (ci->root_ifindex == (eigrp_ifindex_t)sll_ifindex) {
+                    if (ci->address.prefix_length > 0 && memcmp(ci->address.address.bytes, &dst_ip, sizeof(dst_ip)) == 0) {
+                        found_idx = ci->ifindex;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 1c. Match subnet of source IP on this device
+        if (found_idx == 0) {
+            uint32_t s_ip = ntohl(src_ip.s_addr);
+            for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+                if (strcmp(ci->netinst, netinst) != 0 || !ci->active) continue;
+                if (!srl_intf_matches_vlan_candidate(ci, vlan_id)) continue;
+                if (ci->root_ifindex == 0) ci->root_ifindex = srl_resolve_root_ifindex(ci->ifname);
+                if (ci->root_ifindex == (eigrp_ifindex_t)sll_ifindex) {
+                    if (ci->address.prefix_length > 0 && ci->address.prefix_length <= 32) {
+                        uint32_t if_ip;
+                        memcpy(&if_ip, ci->address.address.bytes, sizeof(if_ip));
+                        if_ip = ntohl(if_ip);
+                        uint32_t mask = (ci->address.prefix_length == 0) ? 0 : (0xffffffffU << (32U - ci->address.prefix_length));
+                        if ((s_ip & mask) == (if_ip & mask)) {
+                            if (ci->vlan_id == 0 && vlan_id > 0) {
+                                ci->vlan_id = vlan_id;
+                            }
+                            found_idx = ci->ifindex;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 1d. Untagged frame fallback on this device (.0 or direct interface)
+        if (found_idx == 0 && vlan_id == 0) {
+            for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+                if (strcmp(ci->netinst, netinst) != 0 || !ci->active) continue;
+                if (!srl_intf_matches_vlan(ci, vlan_id, vlan_suffix)) continue;
+                if (ci->root_ifindex == 0) ci->root_ifindex = srl_resolve_root_ifindex(ci->ifname);
+                if (ci->root_ifindex == (eigrp_ifindex_t)sll_ifindex) {
+                    if (strstr(ci->ifname, ".0") || strchr(ci->ifname, '.') == NULL) {
+                        found_idx = ci->ifindex;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 1e. Fallback to any active interface on this root device matching VLAN
+        if (found_idx == 0) {
+            for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+                if (strcmp(ci->netinst, netinst) != 0 || !ci->active) continue;
+                if (!srl_intf_matches_vlan(ci, vlan_id, vlan_suffix)) continue;
+                if (ci->root_ifindex == 0) ci->root_ifindex = srl_resolve_root_ifindex(ci->ifname);
+                if (ci->root_ifindex == (eigrp_ifindex_t)sll_ifindex) {
+                    found_idx = ci->ifindex;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Phase 2: If root_ifindex did not match (e.g. root_ifindex unresolved or mapped device name)
+    if (found_idx == 0) {
+        for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+            if (strcmp(ci->netinst, netinst) != 0 || !ci->active) continue;
+            if (!srl_intf_matches_vlan(ci, vlan_id, vlan_suffix)) continue;
+            if (ifname_raw[0] && srl_match_ifname(ci->ifname, ifname_raw)) {
+                found_idx = ci->ifindex;
+                break;
+            }
+            if (mapped_name[0] && srl_match_ifname(ci->ifname, mapped_name)) {
+                found_idx = ci->ifindex;
+                break;
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&g_data_lock);
+    return found_idx;
+}
+
+static eigrp_ifindex_t srl_resolve_wire_interface_v6(const char *netinst, uint32_t sll_ifindex,
+                                                     uint16_t vlan_id, const struct in6_addr *src_ip6,
+                                                     const struct in6_addr *dst_ip6) {
+    char root_ifname[IFNAMSIZ] = "";
+    if (sll_ifindex > 0) {
+        if_indextoname((unsigned)sll_ifindex, root_ifname);
+    }
+    char mapped_name[IFNAMSIZ] = "";
+    if (root_ifname[0]) {
+        strncpy(mapped_name, root_ifname, sizeof(mapped_name) - 1);
+        char *first_dash = strchr(mapped_name, '-');
+        char *last_dash = strrchr(mapped_name, '-');
+        if (last_dash && last_dash != first_dash && isdigit((unsigned char)*(last_dash + 1))) {
+            *last_dash = '.';
+        }
+    }
+
+    eigrp_ifindex_t found_idx = 0;
+    pthread_mutex_lock(&g_data_lock);
+
+    char vlan_suffix[16] = "";
+    if (vlan_id > 0) {
+        snprintf(vlan_suffix, sizeof(vlan_suffix), ".%u", (unsigned)vlan_id);
+    }
+
+    // Phase 1: Match within interfaces on this wire device (sll_ifindex)
+    if (sll_ifindex > 0) {
+        // 1a. If frame has VLAN tag, match subinterface on this device with matching VLAN ID
+        if (vlan_id > 0) {
+            for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+                if (strcmp(ci->netinst, netinst) != 0 || !ci->active_v6) continue;
+                if (!srl_intf_matches_vlan(ci, vlan_id, vlan_suffix)) continue;
+                if (ci->root_ifindex == 0) ci->root_ifindex = srl_resolve_root_ifindex(ci->ifname);
+                if (ci->root_ifindex == (eigrp_ifindex_t)sll_ifindex) {
+                    found_idx = ci->ifindex;
+                    break;
+                }
+            }
+        }
+
+        // 1b. Match destination IP on this device (link-local or global)
+        if (found_idx == 0 && dst_ip6) {
+            for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+                if (strcmp(ci->netinst, netinst) != 0 || !ci->active_v6) continue;
+                if (!srl_intf_matches_vlan_candidate(ci, vlan_id)) continue;
+                if (ci->root_ifindex == 0) ci->root_ifindex = srl_resolve_root_ifindex(ci->ifname);
+                if (ci->root_ifindex == (eigrp_ifindex_t)sll_ifindex) {
+                    if (memcmp(ci->address_v6.address.bytes, dst_ip6, 16) == 0 ||
+                        memcmp(ci->global_v6.address.bytes, dst_ip6, 16) == 0) {
+                        if (ci->vlan_id == 0 && vlan_id > 0) {
+                            ci->vlan_id = vlan_id;
+                        }
+                        found_idx = ci->ifindex;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 1c. Untagged frame fallback on this device (.0 or direct interface)
+        if (found_idx == 0 && vlan_id == 0) {
+            for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+                if (strcmp(ci->netinst, netinst) != 0 || !ci->active_v6) continue;
+                if (!srl_intf_matches_vlan(ci, vlan_id, vlan_suffix)) continue;
+                if (ci->root_ifindex == 0) ci->root_ifindex = srl_resolve_root_ifindex(ci->ifname);
+                if (ci->root_ifindex == (eigrp_ifindex_t)sll_ifindex) {
+                    if (strstr(ci->ifname, ".0") || strchr(ci->ifname, '.') == NULL) {
+                        found_idx = ci->ifindex;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 1d. Fallback to any active IPv6 interface on this root device matching VLAN
+        if (found_idx == 0) {
+            for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+                if (strcmp(ci->netinst, netinst) != 0 || !ci->active_v6) continue;
+                if (!srl_intf_matches_vlan(ci, vlan_id, vlan_suffix)) continue;
+                if (ci->root_ifindex == 0) ci->root_ifindex = srl_resolve_root_ifindex(ci->ifname);
+                if (ci->root_ifindex == (eigrp_ifindex_t)sll_ifindex) {
+                    if (ci->vlan_id == 0 && vlan_id > 0) {
+                        ci->vlan_id = vlan_id;
+                    }
+                    found_idx = ci->ifindex;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Phase 2: If root_ifindex did not match, fallback to name matching
+    if (found_idx == 0) {
+        for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+            if (strcmp(ci->netinst, netinst) != 0 || !ci->active_v6) continue;
+            if (!srl_intf_matches_vlan(ci, vlan_id, vlan_suffix)) continue;
+            if (root_ifname[0] && srl_match_ifname(ci->ifname, root_ifname)) {
+                found_idx = ci->ifindex;
+                break;
+            }
+            if (mapped_name[0] && srl_match_ifname(ci->ifname, mapped_name)) {
+                found_idx = ci->ifindex;
+                break;
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&g_data_lock);
+    return found_idx;
+}
+
+eigrp_ifindex_t srlTestResolveInterfaceV4(const char *netinst, uint32_t sll_ifindex, uint16_t vlan_id,
+                                          const char *src_ip_str, const char *dst_ip_str) {
+    struct in_addr src = {0}, dst = {0};
+    if (src_ip_str) inet_pton(AF_INET, src_ip_str, &src);
+    if (dst_ip_str) inet_pton(AF_INET, dst_ip_str, &dst);
+    return srl_resolve_wire_interface_v4(netinst ? netinst : "default", sll_ifindex, vlan_id, src, dst);
+}
+
+eigrp_ifindex_t srlTestResolveInterfaceV6(const char *netinst, uint32_t sll_ifindex, uint16_t vlan_id,
+                                          const char *src_ip6_str, const char *dst_ip6_str) {
+    struct in6_addr src = {0}, dst = {0};
+    if (src_ip6_str) inet_pton(AF_INET6, src_ip6_str, &src);
+    if (dst_ip6_str) inet_pton(AF_INET6, dst_ip6_str, &dst);
+    return srl_resolve_wire_interface_v6(netinst ? netinst : "default", sll_ifindex, vlan_id, &src, &dst);
+}
+
+void srlTestRegisterInterfaceWithVlan(const char *netinst, const char *ifname, eigrp_ifindex_t ifidx,
+                                      eigrp_ifindex_t root_ifidx, uint16_t vlan_id, const char *ip_addr,
+                                      uint8_t prefixlen, bool is_v6, bool active) {
+    const char *ni = netinst ? netinst : "default";
+    pthread_mutex_lock(&g_data_lock);
+    srl_intf_t *ci = NULL;
+    for (srl_intf_t *cur = g_interfaces; cur; cur = cur->next) {
+        if (strcmp(cur->netinst, ni) == 0 && (strcmp(cur->ifname, ifname) == 0 || srl_match_ifname(cur->ifname, ifname))) {
+            ci = cur;
+            break;
+        }
+    }
+    if (!ci) {
+        ci = calloc(1, sizeof(*ci));
+        if (ci) {
+            strncpy(ci->netinst, ni, sizeof(ci->netinst) - 1);
+            strncpy(ci->ifname, ifname, sizeof(ci->ifname) - 1);
+            ci->next = g_interfaces;
+            g_interfaces = ci;
+        }
+    }
+    if (ci) {
+        ci->ifindex = ifidx;
+        ci->root_ifindex = root_ifidx;
+        if (vlan_id > 0 || ci->vlan_id == 0) {
+            ci->vlan_id = vlan_id;
+        }
+        if (!is_v6) {
+            ci->active = active;
+            ci->address.address.afi = EIGRP_AFI_IPV4;
+            ci->address.prefix_length = prefixlen;
+            if (ip_addr) inet_pton(AF_INET, ip_addr, ci->address.address.bytes);
+        } else {
+            ci->active_v6 = active;
+            struct in6_addr in6;
+            memset(&in6, 0, sizeof(in6));
+            if (ip_addr) inet_pton(AF_INET6, ip_addr, &in6);
+            if (IN6_IS_ADDR_LINKLOCAL(&in6)) {
+                ci->address_v6.address.afi = EIGRP_AFI_IPV6;
+                ci->address_v6.prefix_length = prefixlen;
+                memcpy(ci->address_v6.address.bytes, &in6, 16);
+            } else {
+                ci->global_v6.address.afi = EIGRP_AFI_IPV6;
+                ci->global_v6.prefix_length = prefixlen;
+                memcpy(ci->global_v6.address.bytes, &in6, 16);
+                ci->address_v6 = ci->global_v6;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_data_lock);
+}
+
+void srlTestRegisterInterface(const char *netinst, const char *ifname, eigrp_ifindex_t ifidx,
+                              eigrp_ifindex_t root_ifidx, const char *ip_addr, uint8_t prefixlen,
+                              bool is_v6, bool active) {
+    srlTestRegisterInterfaceWithVlan(netinst, ifname, ifidx, root_ifidx, 0, ip_addr, prefixlen, is_v6, active);
+}
+
+void srlTestClearInterfaces(void) {
+    pthread_mutex_lock(&g_data_lock);
+    while (g_interfaces) {
+        srl_intf_t *next = g_interfaces->next;
+        free(g_interfaces);
+        g_interfaces = next;
+    }
+    pthread_mutex_unlock(&g_data_lock);
 }
 
 bool eigrp_sys_ipv4_packet_receive(eigrp_instance_t *eigrp, uint8_t *buffer, size_t capacity,
@@ -1046,12 +2034,11 @@ bool eigrp_sys_ipv4_packet_receive(eigrp_instance_t *eigrp, uint8_t *buffer, siz
     if (n >= (ssize_t)sizeof(struct ip)) {
         struct ip *iph = (struct ip *)buffer;
         uint16_t hlen = (uint16_t)iph->ip_hl * 4U;
-        if (n < (ssize_t)hlen) return false;
-
-        uint16_t total_len = ntohs(iph->ip_len);
-        if (total_len >= hlen && (ssize_t)total_len <= n) {
-            n = (ssize_t)total_len;
-        }
+        if (n >= (ssize_t)hlen) {
+            uint16_t total_len = ntohs(iph->ip_len);
+            if (total_len >= hlen && (ssize_t)total_len <= n) {
+                n = (ssize_t)total_len;
+            }
 
         if (src) {
             src->afi = EIGRP_AFI_IPV4;
@@ -1135,25 +2122,50 @@ bool eigrp_sys_ipv4_packet_receive(eigrp_instance_t *eigrp, uint8_t *buffer, siz
         }
 
         if (is_active_v4) {
-            char s_str[INET_ADDRSTRLEN] = "", d_str[INET_ADDRSTRLEN] = "";
-            inet_ntop(AF_INET, &iph->ip_src, s_str, sizeof(s_str));
-            inet_ntop(AF_INET, &iph->ip_dst, d_str, sizeof(d_str));
-            fprintf(stderr, "CSHIM RX (fd %s): src=%s dst=%s len=%zd ifindex=%u mcast=%d\n",
-                    b->netinst, s_str, d_str, n, ifindex ? (unsigned)*ifindex : 0,
-                    meta ? (int)meta->destination_multicast : 0);
+            uint16_t eigrp_csum = 0;
+            if (n >= (ssize_t)(hlen + 4)) {
+                memcpy(&eigrp_csum, (uint8_t *)iph + hlen + 2, 2);
+            }
+            uint32_t p_hash = srl_packet_hash(AF_INET, &iph->ip_src, &iph->ip_dst,
+                                              (uint8_t *)iph + hlen, (size_t)(n - hlen));
+            if (srl_dedup_is_duplicate(b, 1 /* fd */, AF_INET, p_hash,
+                                       (uint16_t)(n - hlen), iph->ip_id, eigrp_csum)) {
+                if (srl_is_debug_enabled()) {
+                    srl_log(0, "CSHIM DEDUP DROP (fd %s): hash=0x%08x ip_id=%u len=%zd",
+                            b->netinst, p_hash, ntohs(iph->ip_id), n);
+                }
+            } else {
+                char s_str[INET_ADDRSTRLEN] = "", d_str[INET_ADDRSTRLEN] = "";
+                inet_ntop(AF_INET, &iph->ip_src, s_str, sizeof(s_str));
+                inet_ntop(AF_INET, &iph->ip_dst, d_str, sizeof(d_str));
+                if (srl_is_debug_enabled()) {
+                    srl_log(0, "CSHIM RX (fd %s): src=%s dst=%s len=%zd ifindex=%u mcast=%d",
+                            b->netinst, s_str, d_str, n, ifindex ? (unsigned)*ifindex : 0,
+                            meta ? (int)meta->destination_multicast : 0);
+                }
 
-            return true;
+                return true;
+            }
         }
     }
+}
 
     // Fallback: Check AF_PACKET raw socket for packets dropped by SR Linux DP
     if (b->pkt_fd >= 0) {
         while (1) {
             uint8_t eth_buf[2048];
+            char ctrl_buf[CMSG_SPACE(sizeof(struct tpacket_auxdata)) + 64];
             struct sockaddr_ll sll;
-            socklen_t sll_len = sizeof(sll);
-            ssize_t pn = recvfrom(b->pkt_fd, eth_buf, sizeof(eth_buf), MSG_DONTWAIT,
-                                  (struct sockaddr *)&sll, &sll_len);
+            struct iovec iov = {.iov_base = eth_buf, .iov_len = sizeof(eth_buf)};
+            struct msghdr msg = {
+                .msg_name = &sll,
+                .msg_namelen = sizeof(sll),
+                .msg_iov = &iov,
+                .msg_iovlen = 1,
+                .msg_control = ctrl_buf,
+                .msg_controllen = sizeof(ctrl_buf)
+            };
+            ssize_t pn = recvmsg(b->pkt_fd, &msg, MSG_DONTWAIT);
             size_t eth_hdr_len = 14;
             if (pn < (ssize_t)(eth_hdr_len + sizeof(struct ip))) {
                 break;
@@ -1162,11 +2174,22 @@ bool eigrp_sys_ipv4_packet_receive(eigrp_instance_t *eigrp, uint8_t *buffer, siz
                 continue;
             }
             uint16_t eth_type = ntohs(*(uint16_t *)(eth_buf + 12));
+            uint16_t vlan_id = 0;
+            for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
+                if (c->cmsg_level == SOL_PACKET && c->cmsg_type == PACKET_AUXDATA) {
+                    struct tpacket_auxdata *aux = (struct tpacket_auxdata *)CMSG_DATA(c);
+                    if (aux->tp_vlan_tci != 0 || (aux->tp_status & TP_STATUS_VLAN_VALID)) {
+                        vlan_id = (uint16_t)(aux->tp_vlan_tci & 0x0FFF);
+                        break;
+                    }
+                }
+            }
             while (eth_type == 0x8100 || eth_type == 0x88a8) {
-                eth_hdr_len += 4;
-                if (pn < (ssize_t)(eth_hdr_len + sizeof(struct ip))) {
+                if (pn < (ssize_t)(eth_hdr_len + 4 + sizeof(struct ip))) {
                     break;
                 }
+                vlan_id = ntohs(*(uint16_t *)(eth_buf + eth_hdr_len)) & 0x0FFF;
+                eth_hdr_len += 4;
                 eth_type = ntohs(*(uint16_t *)(eth_buf + eth_hdr_len - 2));
             }
             if (eth_type != 0x0800) {
@@ -1200,13 +2223,31 @@ bool eigrp_sys_ipv4_packet_receive(eigrp_instance_t *eigrp, uint8_t *buffer, siz
             uint16_t hlen = (uint16_t)iph->ip_hl * 4U;
             uint16_t total_ip_len = ntohs(iph->ip_len);
             if (total_ip_len < hlen || (ssize_t)total_ip_len > (pn - eth_hdr_len)) {
-                fprintf(stderr, "CSHIM DROP: len mismatch total_ip_len=%u hlen=%u pn=%zd\n",
-                        total_ip_len, hlen, pn);
-                fflush(stderr);
+                if (srl_is_debug_enabled()) {
+                    srl_log(0, "CSHIM DROP: len mismatch total_ip_len=%u hlen=%u pn=%zd",
+                            total_ip_len, hlen, pn);
+                }
                 continue;
             }
             size_t ip_len = total_ip_len;
             if (ip_len > capacity) ip_len = capacity;
+
+            // Check deduplication against packets received on b->fd
+            uint16_t eigrp_csum = 0;
+            if (ip_len >= (size_t)(hlen + 4)) {
+                memcpy(&eigrp_csum, (uint8_t *)iph + hlen + 2, 2);
+            }
+            uint32_t p_hash = srl_packet_hash(AF_INET, &iph->ip_src, &iph->ip_dst,
+                                              (uint8_t *)iph + hlen, ip_len - hlen);
+            if (srl_dedup_is_duplicate(b, 2 /* pkt_fd */, AF_INET, p_hash,
+                                       (uint16_t)(ip_len - hlen), iph->ip_id, eigrp_csum)) {
+                if (srl_is_debug_enabled()) {
+                    srl_log(0, "CSHIM DEDUP DROP (pkt_fd %s): hash=0x%08x ip_id=%u len=%zu",
+                            b->netinst, p_hash, ntohs(iph->ip_id), ip_len);
+                }
+                continue;
+            }
+
             memcpy(buffer, iph, ip_len);
 
             if (src) {
@@ -1219,57 +2260,7 @@ bool eigrp_sys_ipv4_packet_receive(eigrp_instance_t *eigrp, uint8_t *buffer, siz
             }
             if (rx_len) *rx_len = ip_len;
 
-            char ifname_raw[IFNAMSIZ] = "";
-            if_indextoname((unsigned)sll.sll_ifindex, ifname_raw);
-            char mapped_name[64] = "";
-            strncpy(mapped_name, ifname_raw, sizeof(mapped_name) - 1);
-            char *last_dash = strrchr(mapped_name, '-');
-            if (last_dash && isdigit((unsigned char)*(last_dash + 1))) {
-                *last_dash = '.';
-            }
-
-            // Match interface in g_interfaces:
-            // 1. Try destination IP match (for unicast to interface IP)
-            eigrp_ifindex_t found_idx = 0;
-            pthread_mutex_lock(&g_data_lock);
-            for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
-                if (strcmp(ci->netinst, b->netinst) != 0) continue;
-                if (!ci->active) continue;
-                if (ci->address.prefix_length > 0 && memcmp(ci->address.address.bytes, &iph->ip_dst, sizeof(iph->ip_dst)) == 0) {
-                    found_idx = ci->ifindex;
-                    break;
-                }
-            }
-            // 2. Try mapped interface name from packet socket
-            if (found_idx == 0 && mapped_name[0]) {
-                for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
-                    if (strcmp(ci->netinst, b->netinst) != 0) continue;
-                    if (!ci->active) continue;
-                    if (srl_match_ifname(ci->ifname, mapped_name)) {
-                        found_idx = ci->ifindex;
-                        break;
-                    }
-                }
-            }
-            // 3. Try subnet match on source IP (for multicast/broadcast or point-to-point)
-            if (found_idx == 0) {
-                uint32_t src_ip = ntohl(iph->ip_src.s_addr);
-                for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
-                    if (strcmp(ci->netinst, b->netinst) != 0) continue;
-                    if (!ci->active) continue;
-                    if (ci->address.prefix_length > 0 && ci->address.prefix_length <= 32) {
-                        uint32_t if_ip;
-                        memcpy(&if_ip, ci->address.address.bytes, sizeof(if_ip));
-                        if_ip = ntohl(if_ip);
-                        uint32_t mask = (0xffffffffU << (32U - ci->address.prefix_length));
-                        if ((src_ip & mask) == (if_ip & mask)) {
-                            found_idx = ci->ifindex;
-                            break;
-                        }
-                    }
-                }
-            }
-            pthread_mutex_unlock(&g_data_lock);
+            eigrp_ifindex_t found_idx = srl_resolve_wire_interface_v4(b->netinst, (uint32_t)sll.sll_ifindex, vlan_id, iph->ip_src, iph->ip_dst);
 
             if (found_idx == 0) {
                 // Not for this VRF instance
@@ -1285,9 +2276,10 @@ bool eigrp_sys_ipv4_packet_receive(eigrp_instance_t *eigrp, uint8_t *buffer, siz
                                               IN_MULTICAST(ntohl(iph->ip_dst.s_addr));
             }
 
-            fprintf(stderr, "CSHIM RX (pkt_fd %s): src=%s dst=%s len=%zu ifindex=%u mcast=%d\n",
-                    b->netinst, s_str, d_str, ip_len, (unsigned)found_idx, (int)meta->destination_multicast);
-            fflush(stderr);
+            if (srl_is_debug_enabled()) {
+                srl_log(0, "CSHIM RX (pkt_fd %s): src=%s dst=%s len=%zu ifindex=%u mcast=%d",
+                        b->netinst, s_str, d_str, ip_len, (unsigned)found_idx, (int)meta->destination_multicast);
+            }
 
             return true;
         }
@@ -1351,7 +2343,7 @@ int eigrp_sys_ipv6_packet_send(eigrp_instance_t *eigrp, eigrp_intf_t *ei,
     if (ret < 0) {
         char dst_str[INET6_ADDRSTRLEN] = "";
         inet_ntop(AF_INET6, &sin6.sin6_addr, dst_str, sizeof(dst_str));
-        fprintf(stderr, "CSHIM TX ERR V6: sendmsg fd=%d ifindex=%u dst=%s len=%zu errno=%d (%s)\n",
+        srl_log(1, "CSHIM TX ERR V6: sendmsg fd=%d ifindex=%u dst=%s len=%zu errno=%d (%s)",
                 fd, (unsigned)eigrp_intf_ifindex(ei), dst_str, length, errno, strerror(errno));
     }
     return (int)ret;
@@ -1427,19 +2419,32 @@ bool eigrp_sys_ipv6_packet_receive(eigrp_instance_t *eigrp, uint8_t *buffer, siz
                 pthread_mutex_unlock(&g_data_lock);
             }
             if (is_active_v6) {
-                if (dst) {
-                    dst->afi = EIGRP_AFI_IPV6;
-                    memcpy(dst->bytes, &dst_ip, 16);
+                uint16_t eigrp_csum = 0;
+                if (n >= 4) {
+                    memcpy(&eigrp_csum, buffer + 2, 2);
                 }
-                if (ifindex) *ifindex = rx_idx;
+                uint32_t p_hash = srl_packet_hash(AF_INET6, &from.sin6_addr, &dst_ip, buffer, (size_t)n);
+                if (srl_dedup_is_duplicate(b, 1 /* fd */, AF_INET6, p_hash,
+                                           (uint16_t)n, 0, eigrp_csum)) {
+                    if (srl_is_debug_enabled()) {
+                        srl_log(0, "CSHIM DEDUP DROP V6 (fd %s): hash=0x%08x len=%zd",
+                                b->netinst, p_hash, n);
+                    }
+                } else {
+                    if (dst) {
+                        dst->afi = EIGRP_AFI_IPV6;
+                        memcpy(dst->bytes, &dst_ip, 16);
+                    }
+                    if (ifindex) *ifindex = rx_idx;
 
-                if (meta) {
-                    meta->ingress_vrf_id = eigrp->vrf_id;
-                    meta->network_header_length = 0;
-                    meta->eigrp_length = (uint16_t)n;
-                    meta->destination_multicast = is_mcast;
+                    if (meta) {
+                        meta->ingress_vrf_id = eigrp->vrf_id;
+                        meta->network_header_length = 0;
+                        meta->eigrp_length = (uint16_t)n;
+                        meta->destination_multicast = is_mcast;
+                    }
+                    return true;
                 }
-                return true;
             }
         }
     }
@@ -1448,10 +2453,18 @@ bool eigrp_sys_ipv6_packet_receive(eigrp_instance_t *eigrp, uint8_t *buffer, siz
     if (b->pkt_fd >= 0) {
         while (1) {
             uint8_t eth_buf[2048];
+            char ctrl_buf[CMSG_SPACE(sizeof(struct tpacket_auxdata)) + 64];
             struct sockaddr_ll sll;
-            socklen_t sll_len = sizeof(sll);
-            ssize_t pn = recvfrom(b->pkt_fd, eth_buf, sizeof(eth_buf), MSG_DONTWAIT,
-                                  (struct sockaddr *)&sll, &sll_len);
+            struct iovec iov = {.iov_base = eth_buf, .iov_len = sizeof(eth_buf)};
+            struct msghdr msg = {
+                .msg_name = &sll,
+                .msg_namelen = sizeof(sll),
+                .msg_iov = &iov,
+                .msg_iovlen = 1,
+                .msg_control = ctrl_buf,
+                .msg_controllen = sizeof(ctrl_buf)
+            };
+            ssize_t pn = recvmsg(b->pkt_fd, &msg, MSG_DONTWAIT);
             size_t eth_hdr_len = 14;
             if (pn < (ssize_t)(eth_hdr_len + 40)) {
                 break;
@@ -1460,11 +2473,22 @@ bool eigrp_sys_ipv6_packet_receive(eigrp_instance_t *eigrp, uint8_t *buffer, siz
                 continue;
             }
             uint16_t eth_type = ntohs(*(uint16_t *)(eth_buf + 12));
+            uint16_t vlan_id = 0;
+            for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
+                if (c->cmsg_level == SOL_PACKET && c->cmsg_type == PACKET_AUXDATA) {
+                    struct tpacket_auxdata *aux = (struct tpacket_auxdata *)CMSG_DATA(c);
+                    if (aux->tp_vlan_tci != 0 || (aux->tp_status & TP_STATUS_VLAN_VALID)) {
+                        vlan_id = (uint16_t)(aux->tp_vlan_tci & 0x0FFF);
+                        break;
+                    }
+                }
+            }
             while (eth_type == 0x8100 || eth_type == 0x88a8) {
-                eth_hdr_len += 4;
-                if (pn < (ssize_t)(eth_hdr_len + 40)) {
+                if (pn < (ssize_t)(eth_hdr_len + 4 + 40)) {
                     break;
                 }
+                vlan_id = ntohs(*(uint16_t *)(eth_buf + eth_hdr_len)) & 0x0FFF;
+                eth_hdr_len += 4;
                 eth_type = ntohs(*(uint16_t *)(eth_buf + eth_hdr_len - 2));
             }
             if (eth_type != 0x86dd) continue;
@@ -1492,43 +2516,23 @@ bool eigrp_sys_ipv6_packet_receive(eigrp_instance_t *eigrp, uint8_t *buffer, siz
             pthread_mutex_unlock(&g_data_lock);
             if (is_local) continue;
 
-            char root_ifname[IFNAMSIZ] = "";
-            if_indextoname(sll.sll_ifindex, root_ifname);
-            char mapped_name[IFNAMSIZ] = "";
-            strncpy(mapped_name, root_ifname, sizeof(mapped_name) - 1);
-            char *last_dash = strrchr(mapped_name, '-');
-            if (last_dash && isdigit((unsigned char)*(last_dash + 1))) {
-                *last_dash = '.';
+            // Check deduplication against packets received on b->fd
+            uint16_t eigrp_csum = 0;
+            if (payload_len >= 4) {
+                memcpy(&eigrp_csum, eth_buf + eth_hdr_len + 40 + 2, 2);
+            }
+            uint32_t p_hash = srl_packet_hash(AF_INET6, src_ip6, dst_ip6,
+                                              eth_buf + eth_hdr_len + 40, payload_len);
+            if (srl_dedup_is_duplicate(b, 2 /* pkt_fd */, AF_INET6, p_hash,
+                                       payload_len, 0, eigrp_csum)) {
+                if (srl_is_debug_enabled()) {
+                    srl_log(0, "CSHIM DEDUP DROP V6 (pkt_fd %s): hash=0x%08x len=%u",
+                            b->netinst, p_hash, (unsigned)payload_len);
+                }
+                continue;
             }
 
-            eigrp_ifindex_t found_idx = 0;
-            pthread_mutex_lock(&g_data_lock);
-            for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
-                if (strcmp(ci->netinst, b->netinst) != 0) continue;
-                if (!ci->active_v6) continue;
-                if (memcmp(ci->address_v6.address.bytes, dst_ip6, 16) == 0 ||
-                    memcmp(ci->global_v6.address.bytes, dst_ip6, 16) == 0) {
-                    found_idx = ci->ifindex;
-                    break;
-                }
-                if (mapped_name[0] && srl_match_ifname(ci->ifname, mapped_name)) {
-                    found_idx = ci->ifindex;
-                    break;
-                }
-            }
-            if (found_idx == 0 && IN6_IS_ADDR_MULTICAST(dst_ip6)) {
-                for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
-                    if (strcmp(ci->netinst, b->netinst) != 0) continue;
-                    if (!ci->active_v6) continue;
-                    if (ci->address_v6.address.afi == EIGRP_AFI_IPV6 &&
-                        strcmp(ci->ifname, "system0.0") != 0 &&
-                        strncmp(ci->ifname, "lo", 2) != 0) {
-                        found_idx = ci->ifindex;
-                        break;
-                    }
-                }
-            }
-            pthread_mutex_unlock(&g_data_lock);
+            eigrp_ifindex_t found_idx = srl_resolve_wire_interface_v6(b->netinst, (uint32_t)sll.sll_ifindex, vlan_id, src_ip6, dst_ip6);
 
             if (found_idx == 0) continue;
 
@@ -1556,8 +2560,10 @@ bool eigrp_sys_ipv6_packet_receive(eigrp_instance_t *eigrp, uint8_t *buffer, siz
             char s_str6[INET6_ADDRSTRLEN] = "", d_str6[INET6_ADDRSTRLEN] = "";
             inet_ntop(AF_INET6, src_ip6, s_str6, sizeof(s_str6));
             inet_ntop(AF_INET6, dst_ip6, d_str6, sizeof(d_str6));
-            fprintf(stderr, "CSHIM RX V6 (pkt_fd %s): src=%s dst=%s len=%zu ifindex=%u mcast=%d\n",
-                    b->netinst, s_str6, d_str6, copy_len, (unsigned)found_idx, (int)IN6_IS_ADDR_MULTICAST(dst_ip6));
+            if (srl_is_debug_enabled()) {
+                srl_log(0, "CSHIM RX V6 (pkt_fd %s): src=%s dst=%s len=%zu ifindex=%u mcast=%d",
+                        b->netinst, s_str6, d_str6, copy_len, (unsigned)found_idx, (int)IN6_IS_ADDR_MULTICAST(dst_ip6));
+            }
 
             return true;
         }
@@ -1688,7 +2694,7 @@ void srl_resolve_v6_gateway(const char *netinst, eigrp_ifindex_t ifidx, char *nh
     bool in_ns = (srl_netns_enter(ni, &saved_ns) == 0);
 
     bool resolved = false;
-    int nl_fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    int nl_fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
     if (nl_fd >= 0) {
         struct {
             struct nlmsghdr n;
@@ -1853,7 +2859,7 @@ int srlShimInterfaceAdd(const char *netinst, const char *ifname, const char *ip_
     pthread_mutex_lock(&g_data_lock);
     srl_intf_t *found = NULL;
     for (srl_intf_t *cur = g_interfaces; cur; cur = cur->next) {
-        if (strcmp(cur->netinst, ni) == 0 && strcmp(cur->ifname, ifname) == 0) {
+        if (strcmp(cur->netinst, ni) == 0 && (strcmp(cur->ifname, ifname) == 0 || srl_match_ifname(cur->ifname, ifname))) {
             found = cur;
             break;
         }
@@ -1873,7 +2879,7 @@ int srlShimInterfaceAdd(const char *netinst, const char *ifname, const char *ip_
     found->mtu = 1500;
     found->bandwidth = 1000000; // default 1 Gbps (Kbps)
 
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    int sock = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (sock >= 0) {
         struct ifreq ifr;
         memset(&ifr, 0, sizeof(ifr));
@@ -1899,7 +2905,10 @@ int srlShimInterfaceAdd(const char *netinst, const char *ifname, const char *ip_
         }
         fclose(sf);
     }
-    pthread_mutex_unlock(&g_data_lock);
+    found->root_ifindex = srl_resolve_root_ifindex(found->ifname);
+    bool active = found->active;
+    eigrp_ifindex_t found_root_idx = found->root_ifindex;
+    eigrp_ifindex_t found_ifidx = found->ifindex;
 
     // Notify EIGRP about the interface
     eigrp_intf_runtime_state_t st;
@@ -1912,6 +2921,14 @@ int srlShimInterfaceAdd(const char *netinst, const char *ifname, const char *ip_
     st.operative = true;
     st.bandwidth = found->bandwidth;
     st.mtu = found->mtu;
+    pthread_mutex_unlock(&g_data_lock);
+
+    if (active) {
+        srl_intf_membership_update(ni, found_root_idx, true);
+        srl_update_bpf_filter_netinst(ni);
+        srl_fd_multicast_membership_update(ni, found_ifidx, false, true);
+    }
+
     eigrp_sys_intf_update((eigrp_vrf_id_t)srl_vrf_id_get(ni), &st);
 
     return 0;
@@ -1942,7 +2959,7 @@ int srlShimInterfaceAddV6(const char *netinst, const char *ifname, const char *i
     pthread_mutex_lock(&g_data_lock);
     srl_intf_t *found = NULL;
     for (srl_intf_t *cur = g_interfaces; cur; cur = cur->next) {
-        if (strcmp(cur->netinst, ni) == 0 && strcmp(cur->ifname, ifname) == 0) {
+        if (strcmp(cur->netinst, ni) == 0 && (strcmp(cur->ifname, ifname) == 0 || srl_match_ifname(cur->ifname, ifname))) {
             found = cur;
             break;
         }
@@ -1958,7 +2975,7 @@ int srlShimInterfaceAddV6(const char *netinst, const char *ifname, const char *i
     if (found->mtu == 0) found->mtu = 1500;
     if (found->bandwidth == 0) found->bandwidth = 1000000;
 
-    int sock = socket(AF_INET6, SOCK_DGRAM, 0);
+    int sock = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (sock >= 0) {
         struct ifreq ifr;
         memset(&ifr, 0, sizeof(ifr));
@@ -1997,6 +3014,10 @@ int srlShimInterfaceAddV6(const char *netinst, const char *ifname, const char *i
             found->address_v6 = found->global_v6;
         }
     }
+    found->root_ifindex = srl_resolve_root_ifindex(found->ifname);
+    bool active_v6 = found->active_v6;
+    eigrp_ifindex_t found_root_idx = found->root_ifindex;
+    eigrp_ifindex_t found_ifidx = found->ifindex;
 
     eigrp_intf_runtime_state_t st;
     memset(&st, 0, sizeof(st));
@@ -2009,6 +3030,12 @@ int srlShimInterfaceAddV6(const char *netinst, const char *ifname, const char *i
     st.bandwidth = found->bandwidth;
     st.mtu = found->mtu;
     pthread_mutex_unlock(&g_data_lock);
+
+    if (active_v6) {
+        srl_intf_membership_update(ni, found_root_idx, true);
+        srl_update_bpf_filter_netinst(ni);
+        srl_fd_multicast_membership_update(ni, found_ifidx, true, true);
+    }
 
     eigrp_sys_intf_update((eigrp_vrf_id_t)srl_vrf_id_get(ni), &st);
 
@@ -2085,8 +3112,6 @@ int srlShimInterfacesScan(const char *netinst) {
 
 int srlShimInit(void) {
     srl_netns_restore_root();
-    setvbuf(stderr, NULL, _IONBF, 0);
-    setvbuf(stdout, NULL, _IONBF, 0);
     eigrp_sys_runtime_init();
     eigrp_init();
     return 0;
@@ -2158,10 +3183,21 @@ int srlShimInstanceDelete(const char *netinst) {
     g_pending_netinst[0] = '\0';
     for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
         if (strcmp(ci->netinst, ni) == 0) {
+            if (ci->active && ci->ifindex > 0) {
+                srl_fd_multicast_membership_update(ni, ci->ifindex, false, false);
+            }
             ci->active = false;
+            if (!ci->active_v6 && ci->root_ifindex > 0) {
+                for (srl_binding_t *b = g_bindings; b; b = b->next) {
+                    if (strcmp(b->netinst, ni) == 0 && b->pkt_fd >= 0) {
+                        srl_pkt_multicast_membership(b->pkt_fd, (int)ci->root_ifindex, false);
+                    }
+                }
+            }
         }
     }
     pthread_mutex_unlock(&g_data_lock);
+    srl_update_bpf_filter_netinst(ni);
 
     eigrp_instance_t *runtime = srl_instance_get_afi(ni, EIGRP_AFI_IPV4);
     if (runtime) {
@@ -2217,32 +3253,63 @@ int srlShimNetworkAdd(const char *netinst, const char *prefix) {
     memcpy(&net_ip, pfx.address.bytes, 4);
     uint32_t mask = (plen == 0) ? 0 : htonl(~((1ULL << (32 - plen)) - 1));
     pthread_mutex_lock(&g_data_lock);
+    bool any_activated = false;
     for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
         if (strcmp(ci->netinst, ni) != 0) continue;
         uint32_t ci_ip = 0;
         memcpy(&ci_ip, ci->address.address.bytes, 4);
         if ((ci_ip & mask) == (net_ip & mask)) {
             ci->active = true;
+            if (ci->root_ifindex == 0) {
+                ci->root_ifindex = srl_resolve_root_ifindex(ci->ifname);
+            }
+            if (ci->root_ifindex > 0) {
+                srl_intf_membership_update(ni, ci->root_ifindex, true);
+            }
+            if (ci->ifindex > 0) {
+                srl_fd_multicast_membership_update(ni, ci->ifindex, false, true);
+            }
+            any_activated = true;
         }
     }
     pthread_mutex_unlock(&g_data_lock);
+    if (any_activated) {
+        srl_update_bpf_filter_netinst(ni);
+    }
 
     return 0;
 }
 
+typedef struct {
+    char ip_str[64];
+    char ifname[64];
+    char state[32];
+    uint16_t hold_time;
+    uint64_t uptime_seconds;
+    uint32_t srtt_msec;
+    uint32_t rto_msec;
+    char auth_mode[32];
+} srl_rep_nbr_t;
+
+typedef struct {
+    const char *ni;
+    srl_rep_nbr_t *reports;
+    int count;
+    int capacity;
+} srl_nbr_report_ctx_t;
+
 static eigrp_result_t srl_nbr_iter_cb(const eigrp_nbr_state_t *st, void *arg) {
-    const char *ni = (const char *)arg;
-    if (!ni) ni = "default";
-    if (!st) return EIGRP_RESULT_SUCCESS;
+    srl_nbr_report_ctx_t *ctx = (srl_nbr_report_ctx_t *)arg;
+    if (!ctx || !st || ctx->count >= ctx->capacity) return EIGRP_RESULT_SUCCESS;
     char ip_str[64] = "";
     int afi = (st->address.afi == EIGRP_AFI_IPV6) ? AF_INET6 : AF_INET;
     inet_ntop(afi, st->address.bytes, ip_str, sizeof(ip_str));
 
     char auth_mode[32] = "none";
     bool is_passive = false;
-    pthread_mutex_lock(&g_data_lock);
+    // Note: g_data_lock is held by caller srlShimNeighborsReport during iteration
     for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
-        if (strcmp(ci->netinst, ni) == 0 && ci->ifname[0] && st->interface_name &&
+        if (strcmp(ci->netinst, ctx->ni) == 0 && ci->ifname[0] && st->interface_name &&
             srl_match_ifname(ci->ifname, st->interface_name)) {
             if (st->address.afi == EIGRP_AFI_IPV6) {
                 if (ci->passive_v6) is_passive = true;
@@ -2269,22 +3336,28 @@ static eigrp_result_t srl_nbr_iter_cb(const eigrp_nbr_state_t *st, void *arg) {
             break;
         }
     }
-    pthread_mutex_unlock(&g_data_lock);
     if (is_passive) {
         return EIGRP_RESULT_SUCCESS;
     }
 
-    srlGoNeighborReport((char *)ni,
-                        ip_str,
-                        (char *)(st->interface_name ? st->interface_name : ""),
-                        (char *)(st->state_name ? st->state_name : "unknown"),
-                        st->hold_time,
-                        st->uptime_seconds,
-                        st->srtt_msec,
-                        st->rto_msec,
-                        (char *)"disabled",
-                        (char *)"normal",
-                        auth_mode);
+    srl_rep_nbr_t *r = &ctx->reports[ctx->count++];
+    strncpy(r->ip_str, ip_str, sizeof(r->ip_str) - 1);
+    r->ip_str[sizeof(r->ip_str) - 1] = '\0';
+    if (st->interface_name) {
+        strncpy(r->ifname, st->interface_name, sizeof(r->ifname) - 1);
+        r->ifname[sizeof(r->ifname) - 1] = '\0';
+    } else {
+        r->ifname[0] = '\0';
+    }
+    strncpy(r->state, st->state_name ? st->state_name : "unknown", sizeof(r->state) - 1);
+    r->state[sizeof(r->state) - 1] = '\0';
+    r->hold_time = st->hold_time;
+    r->uptime_seconds = st->uptime_seconds;
+    r->srtt_msec = st->srtt_msec;
+    r->rto_msec = st->rto_msec;
+    strncpy(r->auth_mode, auth_mode, sizeof(r->auth_mode) - 1);
+    r->auth_mode[sizeof(r->auth_mode) - 1] = '\0';
+
     return EIGRP_RESULT_SUCCESS;
 }
 
@@ -2292,6 +3365,14 @@ void srlShimNeighborsReport(const char *netinst) {
     const char *ni = (netinst && netinst[0]) ? netinst : "default";
     eigrp_instance_t *instances[32];
     int count = 0;
+    srl_rep_nbr_t reports[256];
+    srl_nbr_report_ctx_t ctx = {
+        .ni = ni,
+        .reports = reports,
+        .count = 0,
+        .capacity = 256
+    };
+
     pthread_mutex_lock(&g_data_lock);
     for (srl_binding_t *b = g_bindings; b && count < 32; b = b->next) {
         if (strcmp(b->netinst, ni) == 0 && b->eigrp) {
@@ -2300,9 +3381,23 @@ void srlShimNeighborsReport(const char *netinst) {
     }
 
     for (int i = 0; i < count; i++) {
-        eigrp_nbr_state_iterate(NULL, instances[i], NULL, false, srl_nbr_iter_cb, (void *)ni);
+        eigrp_nbr_state_iterate(NULL, instances[i], NULL, false, srl_nbr_iter_cb, &ctx);
     }
     pthread_mutex_unlock(&g_data_lock);
+
+    for (int i = 0; i < ctx.count; i++) {
+        srlGoNeighborReport((char *)ni,
+                            ctx.reports[i].ip_str,
+                            ctx.reports[i].ifname,
+                            ctx.reports[i].state,
+                            ctx.reports[i].hold_time,
+                            ctx.reports[i].uptime_seconds,
+                            ctx.reports[i].srtt_msec,
+                            ctx.reports[i].rto_msec,
+                            (char *)"disabled",
+                            (char *)"normal",
+                            ctx.reports[i].auth_mode);
+    }
 }
 
 void srlShimInterfacesReport(const char *netinst) {
@@ -2389,45 +3484,94 @@ int srlShimNeighborClear(const char *netinst, const char *neighbor_ip) {
     return (int)total_affected;
 }
 
+typedef enum {
+    SRL_TOPO_ENTRY_PREFIX,
+    SRL_TOPO_ENTRY_ROUTE
+} srl_topo_entry_type_t;
+
+typedef struct {
+    srl_topo_entry_type_t type;
+    union {
+        struct {
+            char prefix[80];
+            int active;
+            uint32_t fd;
+            uint64_t wide_fd;
+            uint32_t successor_count;
+        } pfx;
+        struct {
+            char nexthop[64];
+            char ifname[64];
+            int is_succ;
+            int is_feas_succ;
+            uint32_t dist;
+            uint64_t wide_dist;
+            uint32_t rd;
+            uint64_t wide_rd;
+        } route;
+    } u;
+} srl_rep_topo_t;
+
+typedef struct {
+    const char *ni;
+    srl_rep_topo_t *entries;
+    int count;
+    int capacity;
+} srl_topo_report_ctx_t;
+
 static eigrp_result_t srl_topo_prefix_cb(const eigrp_topology_prefix_state_t *st, void *arg) {
-    const char *ni = (const char *)arg;
-    if (!ni) ni = "default";
-    if (!st) return EIGRP_RESULT_SUCCESS;
+    srl_topo_report_ctx_t *ctx = (srl_topo_report_ctx_t *)arg;
+    if (!ctx || !st || ctx->count >= ctx->capacity) return EIGRP_RESULT_SUCCESS;
     if (st->successor_count == 0 && !st->active && (st->feasible_distance >= 4294967295ULL || st->feasible_distance == 0)) {
         return EIGRP_RESULT_SUCCESS;
     }
+    srl_rep_topo_t *e = &ctx->entries[ctx->count++];
+    e->type = SRL_TOPO_ENTRY_PREFIX;
+
     char pfx_str[64] = "";
     int afi = (st->destination.address.afi == EIGRP_AFI_IPV6) ? AF_INET6 : AF_INET;
     inet_ntop(afi, st->destination.address.bytes, pfx_str, sizeof(pfx_str));
-    char pfx_with_len[80];
-    snprintf(pfx_with_len, sizeof(pfx_with_len), "%s/%u", pfx_str, st->destination.prefix_length);
-    uint8_t rib_scale = srl_get_rib_scale(ni);
+    snprintf(e->u.pfx.prefix, sizeof(e->u.pfx.prefix), "%s/%u", pfx_str, st->destination.prefix_length);
+
+    uint8_t rib_scale = srl_get_rib_scale(ctx->ni);
     if (rib_scale == 0) rib_scale = 128;
-    uint64_t wide_fd = ((uint64_t)st->feasible_distance) * rib_scale;
-    srlGoTopologyPrefixReport((char *)ni, pfx_with_len, st->active ? 1 : 0, st->feasible_distance, wide_fd, st->successor_count);
+
+    e->u.pfx.active = st->active ? 1 : 0;
+    e->u.pfx.fd = st->feasible_distance;
+    e->u.pfx.wide_fd = ((uint64_t)st->feasible_distance) * rib_scale;
+    e->u.pfx.successor_count = st->successor_count;
     return EIGRP_RESULT_SUCCESS;
 }
 
 static eigrp_result_t srl_topo_route_cb(const eigrp_topology_route_state_t *st, void *arg) {
-    const char *ni = (const char *)arg;
-    if (!ni) ni = "default";
-    if (!st) return EIGRP_RESULT_SUCCESS;
+    srl_topo_report_ctx_t *ctx = (srl_topo_report_ctx_t *)arg;
+    if (!ctx || !st || ctx->count >= ctx->capacity) return EIGRP_RESULT_SUCCESS;
+
+    srl_rep_topo_t *e = &ctx->entries[ctx->count++];
+    e->type = SRL_TOPO_ENTRY_ROUTE;
+
     char nh_str[64] = "";
     int afi = (st->next_hop.afi == EIGRP_AFI_IPV6) ? AF_INET6 : AF_INET;
     inet_ntop(afi, st->next_hop.bytes, nh_str, sizeof(nh_str));
-    uint8_t rib_scale = srl_get_rib_scale(ni);
+    strncpy(e->u.route.nexthop, nh_str, sizeof(e->u.route.nexthop) - 1);
+    e->u.route.nexthop[sizeof(e->u.route.nexthop) - 1] = '\0';
+
+    if (st->interface_name) {
+        strncpy(e->u.route.ifname, st->interface_name, sizeof(e->u.route.ifname) - 1);
+        e->u.route.ifname[sizeof(e->u.route.ifname) - 1] = '\0';
+    } else {
+        e->u.route.ifname[0] = '\0';
+    }
+
+    uint8_t rib_scale = srl_get_rib_scale(ctx->ni);
     if (rib_scale == 0) rib_scale = 128;
-    uint64_t wide_dist = ((uint64_t)st->distance) * rib_scale;
-    uint64_t wide_rd = ((uint64_t)st->reported_distance) * rib_scale;
-    srlGoTopologyRouteReport((char *)ni,
-                             nh_str,
-                             (char *)(st->interface_name ? st->interface_name : ""),
-                             st->successor ? 1 : 0,
-                             st->feasible_successor ? 1 : 0,
-                             st->distance,
-                             wide_dist,
-                             st->reported_distance,
-                             wide_rd);
+
+    e->u.route.is_succ = st->successor ? 1 : 0;
+    e->u.route.is_feas_succ = st->feasible_successor ? 1 : 0;
+    e->u.route.dist = st->distance;
+    e->u.route.wide_dist = ((uint64_t)st->distance) * rib_scale;
+    e->u.route.rd = st->reported_distance;
+    e->u.route.wide_rd = ((uint64_t)st->reported_distance) * rib_scale;
     return EIGRP_RESULT_SUCCESS;
 }
 
@@ -2435,6 +3579,17 @@ void srlShimTopologyReport(const char *netinst) {
     const char *ni = (netinst && netinst[0]) ? netinst : "default";
     eigrp_instance_t *instances[32];
     int count = 0;
+    int capacity = 2048;
+    srl_rep_topo_t *entries = malloc(sizeof(srl_rep_topo_t) * capacity);
+    if (!entries) return;
+
+    srl_topo_report_ctx_t ctx = {
+        .ni = ni,
+        .entries = entries,
+        .count = 0,
+        .capacity = capacity
+    };
+
     pthread_mutex_lock(&g_data_lock);
     for (srl_binding_t *b = g_bindings; b && count < 32; b = b->next) {
         if (strcmp(b->netinst, ni) == 0 && b->eigrp) {
@@ -2443,23 +3598,65 @@ void srlShimTopologyReport(const char *netinst) {
     }
 
     for (int i = 0; i < count; i++) {
-        eigrp_topology_state_iterate(NULL, instances[i], NULL, true, srl_topo_prefix_cb, srl_topo_route_cb, (void *)ni);
+        eigrp_topology_state_iterate(NULL, instances[i], NULL, true, srl_topo_prefix_cb, srl_topo_route_cb, &ctx);
     }
     pthread_mutex_unlock(&g_data_lock);
+
+    for (int i = 0; i < ctx.count; i++) {
+        if (ctx.entries[i].type == SRL_TOPO_ENTRY_PREFIX) {
+            srlGoTopologyPrefixReport((char *)ni,
+                                      ctx.entries[i].u.pfx.prefix,
+                                      ctx.entries[i].u.pfx.active,
+                                      ctx.entries[i].u.pfx.fd,
+                                      ctx.entries[i].u.pfx.wide_fd,
+                                      ctx.entries[i].u.pfx.successor_count);
+        } else if (ctx.entries[i].type == SRL_TOPO_ENTRY_ROUTE) {
+            srlGoTopologyRouteReport((char *)ni,
+                                     ctx.entries[i].u.route.nexthop,
+                                     ctx.entries[i].u.route.ifname,
+                                     ctx.entries[i].u.route.is_succ,
+                                     ctx.entries[i].u.route.is_feas_succ,
+                                     ctx.entries[i].u.route.dist,
+                                     ctx.entries[i].u.route.wide_dist,
+                                     ctx.entries[i].u.route.rd,
+                                     ctx.entries[i].u.route.wide_rd);
+        }
+    }
+    free(entries);
 }
 
+typedef struct {
+    char ifname[64];
+    uint64_t reliable_multicast_sent;
+    uint64_t unreliable_multicast_sent;
+    uint64_t reliable_unicast_sent;
+    uint64_t unreliable_unicast_sent;
+    uint64_t retransmissions_sent;
+    uint64_t cr_packets_sent;
+} srl_rep_traffic_t;
+
+typedef struct {
+    const char *ni;
+    srl_rep_traffic_t *reports;
+    int count;
+    int capacity;
+} srl_traffic_report_ctx_t;
+
 static eigrp_result_t srl_intf_traffic_cb(const eigrp_intf_state_t *st, void *arg) {
-    const char *ni = (const char *)arg;
-    if (!ni) ni = "default";
-    if (!st) return EIGRP_RESULT_SUCCESS;
-    srlGoTrafficReport((char *)ni,
-                       (char *)(st->interface_name ? st->interface_name : ""),
-                       st->reliable_multicast_sent,
-                       st->unreliable_multicast_sent,
-                       st->reliable_unicast_sent,
-                       st->unreliable_unicast_sent,
-                       st->retransmissions_sent,
-                       st->cr_packets_sent);
+    srl_traffic_report_ctx_t *ctx = (srl_traffic_report_ctx_t *)arg;
+    if (!ctx || !st || ctx->count >= ctx->capacity) return EIGRP_RESULT_SUCCESS;
+    srl_rep_traffic_t *r = &ctx->reports[ctx->count++];
+    memset(r, 0, sizeof(*r));
+    if (st->interface_name) {
+        strncpy(r->ifname, st->interface_name, sizeof(r->ifname) - 1);
+        r->ifname[sizeof(r->ifname) - 1] = '\0';
+    }
+    r->reliable_multicast_sent = st->reliable_multicast_sent;
+    r->unreliable_multicast_sent = st->unreliable_multicast_sent;
+    r->reliable_unicast_sent = st->reliable_unicast_sent;
+    r->unreliable_unicast_sent = st->unreliable_unicast_sent;
+    r->retransmissions_sent = st->retransmissions_sent;
+    r->cr_packets_sent = st->cr_packets_sent;
     return EIGRP_RESULT_SUCCESS;
 }
 
@@ -2467,6 +3664,14 @@ void srlShimTrafficReport(const char *netinst) {
     const char *ni = (netinst && netinst[0]) ? netinst : "default";
     eigrp_instance_t *instances[32];
     int count = 0;
+    srl_rep_traffic_t reports[128];
+    srl_traffic_report_ctx_t ctx = {
+        .ni = ni,
+        .reports = reports,
+        .count = 0,
+        .capacity = 128
+    };
+
     pthread_mutex_lock(&g_data_lock);
     for (srl_binding_t *b = g_bindings; b && count < 32; b = b->next) {
         if (strcmp(b->netinst, ni) == 0 && b->eigrp) {
@@ -2475,9 +3680,20 @@ void srlShimTrafficReport(const char *netinst) {
     }
 
     for (int i = 0; i < count; i++) {
-        eigrp_intf_state_iterate(NULL, instances[i], NULL, srl_intf_traffic_cb, (void *)ni);
+        eigrp_intf_state_iterate(NULL, instances[i], NULL, srl_intf_traffic_cb, &ctx);
     }
     pthread_mutex_unlock(&g_data_lock);
+
+    for (int i = 0; i < ctx.count; i++) {
+        srlGoTrafficReport((char *)ni,
+                           ctx.reports[i].ifname,
+                           ctx.reports[i].reliable_multicast_sent,
+                           ctx.reports[i].unreliable_multicast_sent,
+                           ctx.reports[i].reliable_unicast_sent,
+                           ctx.reports[i].unreliable_unicast_sent,
+                           ctx.reports[i].retransmissions_sent,
+                           ctx.reports[i].cr_packets_sent);
+    }
 }
 
 int srlShimVarianceUpdate(const char *netinst, uint8_t variance) {
@@ -2687,6 +3903,13 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
 
     found->active = admin_up;
     found->passive = passive;
+    if (admin_up) {
+        if (found->root_ifindex == 0) {
+            found->root_ifindex = srl_resolve_root_ifindex(found->ifname);
+        }
+    }
+    eigrp_ifindex_t root_ifidx = found->root_ifindex;
+    bool active_v6 = found->active_v6;
     if (bandwidth > 0) {
         found->bandwidth = bandwidth;
     } else {
@@ -2722,6 +3945,16 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
     if (kc && kc[0]) strncpy(eff_kc, kc, sizeof(eff_kc) - 1);
 
     pthread_mutex_unlock(&g_data_lock);
+
+    if (admin_up) {
+        srl_intf_membership_update(ni, root_ifidx, true);
+    } else if (!active_v6) {
+        srl_intf_membership_update(ni, root_ifidx, false);
+    }
+    srl_update_bpf_filter_netinst(ni);
+    if (ifidx > 0) {
+        srl_fd_multicast_membership_update(ni, ifidx, false, admin_up);
+    }
 
     eigrp_instance_context_t ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -2787,15 +4020,6 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
                     req.interface_name = (ei->name && ei->name[0]) ? ei->name : actual_ifname;
                     size_t affected = 0;
                     (void)eigrp_nbr_clear(runtime, &req, NULL, NULL, &affected);
-                    if (ei->nbrs) {
-                        eigrp_list_item_t *nbr_node = NULL, *next_node = NULL;
-                        eigrp_nbr_t *nbr = NULL;
-                        for (EIGRP_LIST_ITERATE(ei->nbrs, nbr_node, next_node, nbr)) {
-                            if (nbr) {
-                                eigrp_nbr_delete(nbr);
-                            }
-                        }
-                    }
                 }
             } else if (was_passive && !strstr(actual_ifname, "system") && !strstr(actual_ifname, "lo")) {
                 eigrp_hello_send(ei, EIGRP_HELLO_NORMAL, NULL);
@@ -2809,7 +4033,10 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
             if (eff_mode[0] && strcasecmp(eff_mode, "none") != 0) {
                 ei->params.auth_type = (strcasecmp(eff_mode, "md5") == 0) ? EIGRP_AUTH_TYPE_MD5 : EIGRP_AUTH_TYPE_SHA256;
                 if (eff_key[0]) {
-                    if (ei->params.auth_password) free(ei->params.auth_password);
+                    if (ei->params.auth_password) {
+                        explicit_bzero(ei->params.auth_password, strlen(ei->params.auth_password));
+                        free(ei->params.auth_password);
+                    }
                     ei->params.auth_password = strdup(eff_key);
                 }
                 if (eff_kc[0]) {
@@ -2819,6 +4046,7 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
             } else {
                 ei->params.auth_type = EIGRP_AUTH_TYPE_NONE;
                 if (ei->params.auth_password) {
+                    explicit_bzero(ei->params.auth_password, strlen(ei->params.auth_password));
                     free(ei->params.auth_password);
                     ei->params.auth_password = NULL;
                 }
@@ -2845,20 +4073,12 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
                 req.interface_name = (ei->name && ei->name[0]) ? ei->name : actual_ifname;
                 size_t affected = 0;
                 (void)eigrp_nbr_clear(runtime, &req, NULL, NULL, &affected);
-                if (ei->nbrs) {
-                    eigrp_list_item_t *nbr_node = NULL, *next_node = NULL;
-                    eigrp_nbr_t *nbr = NULL;
-                    for (EIGRP_LIST_ITERATE(ei->nbrs, nbr_node, next_node, nbr)) {
-                        if (nbr) {
-                            eigrp_nbr_delete(nbr);
-                        }
-                    }
-                }
             }
             eigrp_intf_down(ei);
         }
     }
 
+    explicit_bzero(eff_key, sizeof(eff_key));
     return 0;
 }
 
@@ -2904,6 +4124,13 @@ int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passi
 
     found->active_v6 = admin_up;
     found->passive_v6 = passive;
+    if (admin_up) {
+        if (found->root_ifindex == 0) {
+            found->root_ifindex = srl_resolve_root_ifindex(found->ifname);
+        }
+    }
+    eigrp_ifindex_t root_ifidx = found->root_ifindex;
+    bool active_v4 = found->active;
     if (bandwidth > 0) {
         found->bandwidth = bandwidth;
     } else {
@@ -2936,6 +4163,16 @@ int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passi
     if (kc && kc[0]) strncpy(eff_kc, kc, sizeof(eff_kc) - 1);
 
     pthread_mutex_unlock(&g_data_lock);
+
+    if (admin_up) {
+        srl_intf_membership_update(ni, root_ifidx, true);
+    } else if (!active_v4) {
+        srl_intf_membership_update(ni, root_ifidx, false);
+    }
+    srl_update_bpf_filter_netinst(ni);
+    if (ifidx > 0) {
+        srl_fd_multicast_membership_update(ni, ifidx, true, admin_up);
+    }
 
     if (has_v6) {
         eigrp_intf_t *ei6 = eigrp_intf_lookup_by_name(runtime_v6, actual_ifname);
@@ -2992,15 +4229,6 @@ int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passi
                     req.interface_name = (ei6->name && ei6->name[0]) ? ei6->name : actual_ifname;
                     size_t affected = 0;
                     (void)eigrp_nbr_clear(runtime_v6, &req, NULL, NULL, &affected);
-                    if (ei6->nbrs) {
-                        eigrp_list_item_t *nbr_node = NULL, *next_node = NULL;
-                        eigrp_nbr_t *nbr = NULL;
-                        for (EIGRP_LIST_ITERATE(ei6->nbrs, nbr_node, next_node, nbr)) {
-                            if (nbr) {
-                                eigrp_nbr_delete(nbr);
-                            }
-                        }
-                    }
                 }
             } else if (was_passive && !strstr(actual_ifname, "system") && !strstr(actual_ifname, "lo")) {
                 eigrp_hello_send(ei6, EIGRP_HELLO_NORMAL, NULL);
@@ -3014,7 +4242,10 @@ int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passi
             if (eff_mode[0] && strcasecmp(eff_mode, "none") != 0) {
                 ei6->params.auth_type = (strcasecmp(eff_mode, "md5") == 0) ? EIGRP_AUTH_TYPE_MD5 : EIGRP_AUTH_TYPE_SHA256;
                 if (eff_key[0]) {
-                    if (ei6->params.auth_password) free(ei6->params.auth_password);
+                    if (ei6->params.auth_password) {
+                        explicit_bzero(ei6->params.auth_password, strlen(ei6->params.auth_password));
+                        free(ei6->params.auth_password);
+                    }
                     ei6->params.auth_password = strdup(eff_key);
                 }
                 if (eff_kc[0]) {
@@ -3024,6 +4255,7 @@ int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passi
             } else {
                 ei6->params.auth_type = EIGRP_AUTH_TYPE_NONE;
                 if (ei6->params.auth_password) {
+                    explicit_bzero(ei6->params.auth_password, strlen(ei6->params.auth_password));
                     free(ei6->params.auth_password);
                     ei6->params.auth_password = NULL;
                 }
@@ -3042,15 +4274,6 @@ int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passi
                     req.interface_name = (ei6->name && ei6->name[0]) ? ei6->name : actual_ifname;
                     size_t affected = 0;
                     (void)eigrp_nbr_clear(runtime_v6, &req, NULL, NULL, &affected);
-                    if (ei6->nbrs) {
-                        eigrp_list_item_t *nbr_node = NULL, *next_node = NULL;
-                        eigrp_nbr_t *nbr = NULL;
-                        for (EIGRP_LIST_ITERATE(ei6->nbrs, nbr_node, next_node, nbr)) {
-                            if (nbr) {
-                                eigrp_nbr_delete(nbr);
-                            }
-                        }
-                    }
                 }
                 eigrp_intf_down(ei6);
             }
@@ -3081,20 +4304,12 @@ int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passi
                 req.interface_name = (ei6->name && ei6->name[0]) ? ei6->name : actual_ifname;
                 size_t affected = 0;
                 (void)eigrp_nbr_clear(runtime_v6, &req, NULL, NULL, &affected);
-                if (ei6->nbrs) {
-                    eigrp_list_item_t *nbr_node = NULL, *next_node = NULL;
-                    eigrp_nbr_t *nbr = NULL;
-                    for (EIGRP_LIST_ITERATE(ei6->nbrs, nbr_node, next_node, nbr)) {
-                        if (nbr) {
-                            eigrp_nbr_delete(nbr);
-                        }
-                    }
-                }
             }
             eigrp_intf_down(ei6);
         }
     }
 
+    explicit_bzero(eff_key, sizeof(eff_key));
     return 0;
 }
 
@@ -3108,14 +4323,34 @@ int srlShimInstanceDeleteV6(const char *netinst, uint16_t asn) {
     g_pending_netinst[0] = '\0';
     for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
         if (strcmp(ci->netinst, ni) == 0) {
+            if (ci->active_v6 && ci->ifindex > 0) {
+                srl_fd_multicast_membership_update(ni, ci->ifindex, true, false);
+            }
             ci->active_v6 = false;
+            if (!ci->active && ci->root_ifindex > 0) {
+                for (srl_binding_t *b = g_bindings; b; b = b->next) {
+                    if (strcmp(b->netinst, ni) == 0 && b->pkt_fd >= 0) {
+                        srl_pkt_multicast_membership(b->pkt_fd, (int)ci->root_ifindex, false);
+                    }
+                }
+            }
         }
     }
     pthread_mutex_unlock(&g_data_lock);
+    srl_update_bpf_filter_netinst(ni);
 
-    char inst_name[128];
-    snprintf(inst_name, sizeof(inst_name), "srl-v6-%s-%u", ni, asn);
-    eigrp_af_config_delete(inst_name, EIGRP_AFI_IPV6, ni, asn);
+    if (asn == 0) {
+        eigrp_instance_t *cur_v6 = srl_instance_get_afi(ni, EIGRP_AFI_IPV6);
+        if (cur_v6) {
+            asn = cur_v6->AS;
+        }
+    }
+
+    if (asn > 0) {
+        char inst_name[128];
+        snprintf(inst_name, sizeof(inst_name), "srl-v6-%s-%u", ni, asn);
+        eigrp_af_config_delete(inst_name, EIGRP_AFI_IPV6, ni, asn);
+    }
 
     eigrp_instance_t *runtime_v6 = srl_instance_get_afi(ni, EIGRP_AFI_IPV6);
     if (runtime_v6) {
@@ -3442,7 +4677,7 @@ int srlShimInstanceCreateV6(const char *netinst, uint16_t asn, const char *route
             pthread_mutex_lock(&g_data_lock);
             g_pending_netinst[0] = '\0';
             pthread_mutex_unlock(&g_data_lock);
-            fprintf(stderr, "CSHIM V6: failed to create AF config %s: res=%d\n", inst_name, res);
+            srl_log(1, "CSHIM V6: failed to create AF config %s: res=%d", inst_name, res);
             return -1;
         }
     }
@@ -3452,7 +4687,7 @@ int srlShimInstanceCreateV6(const char *netinst, uint16_t asn, const char *route
         pthread_mutex_lock(&g_data_lock);
         g_pending_netinst[0] = '\0';
         pthread_mutex_unlock(&g_data_lock);
-        fprintf(stderr, "CSHIM V6: runtime not found after create\n");
+        srl_log(1, "CSHIM V6: runtime not found after create");
         return -1;
     }
 
@@ -3654,22 +4889,27 @@ int srlShimKeychainAdd(const char *name, uint32_t key_id, const char *key_string
     srl_keychain_entry_t *e = g_keychains;
     while (e) {
         if (strcmp(e->name, name) == 0 && e->key_id == key_id) {
+            explicit_bzero(e->key_string, sizeof(e->key_string));
             strncpy(e->key_string, plain_key, sizeof(e->key_string) - 1);
             if (algo) strncpy(e->algo, algo, sizeof(e->algo) - 1);
             pthread_mutex_unlock(&g_keychain_lock);
+            explicit_bzero(plain_key, sizeof(plain_key));
             return 0;
         }
         e = e->next;
     }
     e = calloc(1, sizeof(*e));
-    strncpy(e->name, name, sizeof(e->name) - 1);
-    e->key_id = key_id;
-    strncpy(e->key_string, plain_key, sizeof(e->key_string) - 1);
-    if (algo) strncpy(e->algo, algo, sizeof(e->algo) - 1);
-    e->next = g_keychains;
-    g_keychains = e;
+    if (e) {
+        strncpy(e->name, name, sizeof(e->name) - 1);
+        e->key_id = key_id;
+        strncpy(e->key_string, plain_key, sizeof(e->key_string) - 1);
+        if (algo) strncpy(e->algo, algo, sizeof(e->algo) - 1);
+        e->next = g_keychains;
+        g_keychains = e;
+    }
     pthread_mutex_unlock(&g_keychain_lock);
-    return 0;
+    explicit_bzero(plain_key, sizeof(plain_key));
+    return e ? 0 : -1;
 }
 
 int srlShimKeychainDel(const char *name) {
@@ -3680,6 +4920,7 @@ int srlShimKeychainDel(const char *name) {
         if (strcmp((*curr)->name, name) == 0) {
             srl_keychain_entry_t *to_free = *curr;
             *curr = (*curr)->next;
+            explicit_bzero(to_free, sizeof(*to_free));
             free(to_free);
         } else {
             curr = &(*curr)->next;
@@ -3794,7 +5035,7 @@ int srlShimInterfaceAuthSetAfi(const char *netinst, const char *ifname, const ch
             }
             if (ei) {
                 if (ei->params.auth_password) {
-                    memset(ei->params.auth_password, 0, strlen(ei->params.auth_password));
+                    explicit_bzero(ei->params.auth_password, strlen(ei->params.auth_password));
                     free(ei->params.auth_password);
                     ei->params.auth_password = NULL;
                 }
@@ -3813,6 +5054,7 @@ int srlShimInterfaceAuthSetAfi(const char *netinst, const char *ifname, const ch
         }
     }
     pthread_mutex_unlock(&g_data_lock);
+    explicit_bzero(decrypted_key, sizeof(decrypted_key));
     return 0;
 }
 
@@ -3843,21 +5085,21 @@ int srlShimInterfaceAuthClearAfi(const char *netinst, const char *ifname, const 
             if (target_afi == (int)EIGRP_AFI_IPV4) {
                 ci->auth_mode_v4[0] = '\0';
                 ci->keychain_v4[0] = '\0';
-                ci->auth_key_v4[0] = '\0';
+                explicit_bzero(ci->auth_key_v4, sizeof(ci->auth_key_v4));
             } else if (target_afi == (int)EIGRP_AFI_IPV6) {
                 ci->auth_mode_v6[0] = '\0';
                 ci->keychain_v6[0] = '\0';
-                ci->auth_key_v6[0] = '\0';
+                explicit_bzero(ci->auth_key_v6, sizeof(ci->auth_key_v6));
             } else {
                 ci->auth_mode[0] = '\0';
                 ci->keychain[0] = '\0';
-                ci->auth_key[0] = '\0';
+                explicit_bzero(ci->auth_key, sizeof(ci->auth_key));
                 ci->auth_mode_v4[0] = '\0';
                 ci->keychain_v4[0] = '\0';
-                ci->auth_key_v4[0] = '\0';
+                explicit_bzero(ci->auth_key_v4, sizeof(ci->auth_key_v4));
                 ci->auth_mode_v6[0] = '\0';
                 ci->keychain_v6[0] = '\0';
-                ci->auth_key_v6[0] = '\0';
+                explicit_bzero(ci->auth_key_v6, sizeof(ci->auth_key_v6));
             }
             break;
         }
@@ -3881,7 +5123,7 @@ int srlShimInterfaceAuthClearAfi(const char *netinst, const char *ifname, const 
             if (ei) {
                 ei->params.auth_type = EIGRP_AUTH_TYPE_NONE;
                 if (ei->params.auth_password) {
-                    memset(ei->params.auth_password, 0, strlen(ei->params.auth_password));
+                    explicit_bzero(ei->params.auth_password, strlen(ei->params.auth_password));
                     free(ei->params.auth_password);
                     ei->params.auth_password = NULL;
                 }
@@ -4216,3 +5458,132 @@ int srlShimDistanceUpdateAfi(const char *netinst, const char *afi_name, uint8_t 
     }
     return 0;
 }
+
+int srlShimInterfaceSetVlanId(const char *netinst, const char *ifname, uint16_t vlan_id) {
+    if (!ifname) return -1;
+    const char *ni = (netinst && netinst[0]) ? netinst : "default";
+    pthread_mutex_lock(&g_data_lock);
+    for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+        if (strcmp(ci->netinst, ni) == 0 && srl_match_ifname(ci->ifname, ifname)) {
+            ci->vlan_id = vlan_id;
+            pthread_mutex_unlock(&g_data_lock);
+            return 0;
+        }
+    }
+    // Interface not yet in g_interfaces: allocate a stub so vlan_id is preserved when scanned
+    srl_intf_t *ci = calloc(1, sizeof(*ci));
+    if (ci) {
+        strncpy(ci->netinst, ni, sizeof(ci->netinst) - 1);
+        strncpy(ci->ifname, ifname, sizeof(ci->ifname) - 1);
+        ci->vlan_id = vlan_id;
+        ci->next = g_interfaces;
+        g_interfaces = ci;
+        pthread_mutex_unlock(&g_data_lock);
+        return 0;
+    }
+    pthread_mutex_unlock(&g_data_lock);
+    return -1;
+}
+
+static bool srl_ipv6_prefix_matches_intf(const eigrp_prefix_t *intf_pfx, const eigrp_prefix_t *route_pfx) {
+    if (intf_pfx->address.afi != EIGRP_AFI_IPV6 || intf_pfx->prefix_length == 0) return false;
+    if (route_pfx->address.afi != EIGRP_AFI_IPV6 || route_pfx->prefix_length == 0) return false;
+
+    // Exact host route match (/128)
+    if (route_pfx->prefix_length == 128 && memcmp(intf_pfx->address.bytes, route_pfx->address.bytes, 16) == 0) {
+        return true;
+    }
+    // Subnet match: route prefix must match the connected interface subnet prefix length
+    if (route_pfx->prefix_length == intf_pfx->prefix_length && route_pfx->prefix_length <= 128) {
+        size_t full_bytes = route_pfx->prefix_length / 8;
+        size_t rem_bits = route_pfx->prefix_length % 8;
+        if (memcmp(intf_pfx->address.bytes, route_pfx->address.bytes, full_bytes) != 0) {
+            return false;
+        }
+        if (rem_bits > 0) {
+            uint8_t mask = (uint8_t)(0xffU << (8U - rem_bits));
+            if ((intf_pfx->address.bytes[full_bytes] & mask) != (route_pfx->address.bytes[full_bytes] & mask)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+bool srl_is_local_prefix(const char *netinst, const eigrp_prefix_t *prefix) {
+    if (!netinst || !prefix || prefix->prefix_length == 0) return false;
+
+    // Check standard loopback addresses
+    if (prefix->address.afi == EIGRP_AFI_IPV4) {
+        if (prefix->address.bytes[0] == 127) return true;
+    } else if (prefix->address.afi == EIGRP_AFI_IPV6) {
+        struct in6_addr in6;
+        memcpy(&in6, prefix->address.bytes, 16);
+        if (IN6_IS_ADDR_LOOPBACK(&in6)) return true;
+    }
+
+    pthread_mutex_lock(&g_data_lock);
+    for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+        if (strcmp(ci->netinst, netinst) != 0) continue;
+
+        if (prefix->address.afi == EIGRP_AFI_IPV4) {
+            if (ci->address.address.afi == EIGRP_AFI_IPV4 && ci->address.prefix_length > 0) {
+                // Exact match (e.g. /32 host route)
+                if (prefix->prefix_length == 32 && memcmp(ci->address.address.bytes, prefix->address.bytes, 4) == 0) {
+                    pthread_mutex_unlock(&g_data_lock);
+                    return true;
+                }
+                // Connected subnet match: route prefix length must match interface subnet prefix length
+                if (prefix->prefix_length == ci->address.prefix_length && prefix->prefix_length <= 32) {
+                    uint32_t if_ip, pfx_ip;
+                    memcpy(&if_ip, ci->address.address.bytes, 4);
+                    memcpy(&pfx_ip, prefix->address.bytes, 4);
+                    if_ip = ntohl(if_ip);
+                    pfx_ip = ntohl(pfx_ip);
+                    uint32_t mask = 0xffffffffU << (32U - prefix->prefix_length);
+                    if ((if_ip & mask) == (pfx_ip & mask)) {
+                        pthread_mutex_unlock(&g_data_lock);
+                        return true;
+                    }
+                }
+            }
+        } else if (prefix->address.afi == EIGRP_AFI_IPV6) {
+            if (srl_ipv6_prefix_matches_intf(&ci->global_v6, prefix) ||
+                srl_ipv6_prefix_matches_intf(&ci->address_v6, prefix)) {
+                pthread_mutex_unlock(&g_data_lock);
+                return true;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_data_lock);
+    return false;
+}
+
+bool srlTestMatchRootWireIfname(const char *dev_name, const char *base_name) {
+    return srl_match_root_wire_ifname(dev_name, base_name);
+}
+
+bool srlTestIsLocalPrefix(const char *netinst, const char *prefix_str, bool is_v6) {
+    if (!netinst || !prefix_str) return false;
+    eigrp_prefix_t pfx;
+    memset(&pfx, 0, sizeof(pfx));
+    char pfx_copy[128];
+    strncpy(pfx_copy, prefix_str, sizeof(pfx_copy) - 1);
+    pfx_copy[sizeof(pfx_copy) - 1] = '\0';
+    char *slash = strchr(pfx_copy, '/');
+    if (!slash) return false;
+    *slash = '\0';
+    uint32_t plen = (uint32_t)atoi(slash + 1);
+    pfx.prefix_length = (uint8_t)plen;
+    if (is_v6) {
+        pfx.address.afi = EIGRP_AFI_IPV6;
+        if (inet_pton(AF_INET6, pfx_copy, pfx.address.bytes) != 1) return false;
+    } else {
+        pfx.address.afi = EIGRP_AFI_IPV4;
+        if (inet_pton(AF_INET, pfx_copy, pfx.address.bytes) != 1) return false;
+    }
+    return srl_is_local_prefix(netinst, &pfx);
+}
+
+

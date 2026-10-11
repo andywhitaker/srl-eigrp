@@ -82,6 +82,21 @@ int srlShimSummaryAddressAdd(const char *netinst, const char *ifname, const char
 int srlShimSummaryAddressDelete(const char *netinst, const char *ifname, const char *prefix_str);
 int srlShimDistanceUpdate(const char *netinst, uint8_t internal_dist, uint8_t external_dist);
 int srlShimDistanceUpdateAfi(const char *netinst, const char *afi_name, uint8_t internal_dist, uint8_t external_dist);
+void srlShimSetPktFdDisabled(bool disabled);
+bool srlShimGetPktFdDisabled(void);
+uint32_t srlTestPacketHash(int afi, const void *src, const void *dst, const void *payload, size_t len);
+bool srlTestDedupCheck(uint8_t rx_src, uint8_t afi, uint32_t hash, uint16_t len, uint16_t ip_id, uint16_t eigrp_csum);
+void srlTestDedupReset(void);
+eigrp_ifindex_t srlTestResolveInterfaceV4(const char *netinst, uint32_t sll_ifindex, uint16_t vlan_id, const char *src_ip_str, const char *dst_ip_str);
+eigrp_ifindex_t srlTestResolveInterfaceV6(const char *netinst, uint32_t sll_ifindex, uint16_t vlan_id, const char *src_ip6_str, const char *dst_ip6_str);
+void srlTestRegisterInterface(const char *netinst, const char *ifname, eigrp_ifindex_t ifidx, eigrp_ifindex_t root_ifidx, const char *ip_addr, uint8_t prefixlen, bool is_v6, bool active);
+void srlTestRegisterInterfaceWithVlan(const char *netinst, const char *ifname, eigrp_ifindex_t ifidx, eigrp_ifindex_t root_ifidx, uint16_t vlan_id, const char *ip_addr, uint8_t prefixlen, bool is_v6, bool active);
+int srlShimInterfaceSetVlanId(const char *netinst, const char *ifname, uint16_t vlan_id);
+bool srl_is_local_prefix(const char *netinst, const eigrp_prefix_t *prefix);
+bool srlTestMatchRootWireIfname(const char *dev_name, const char *base_name);
+bool srlTestIsLocalPrefix(const char *netinst, const char *prefix_str, bool is_v6);
+void srlTestClearInterfaces(void);
+uint32_t srlTestRunBPFFilter(const uint32_t *ifindexes, size_t num_if, const uint8_t *pkt, size_t pkt_len, uint32_t ifindex);
 
 
 #ifdef __cplusplus

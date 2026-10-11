@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -764,11 +765,11 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 
 	for _, item := range allInstData {
 		instSnapshot := map[string]interface{}{
-			"network-instance":  item.ni,
-			"autonomous-system": item.asn,
-			"router-id":         item.routerId,
-			"admin-state":       item.adminState,
-			"oper-state":        item.operState,
+			"network-instance":    item.ni,
+			"autonomous-system":   item.asn,
+			"router-id":           item.routerId,
+			"admin-state":         item.adminState,
+			"oper-state":          item.operState,
 			"variance":            item.variance,
 			"maximum-paths":       item.maximumPaths,
 			"maximum-hops":        item.maximumHops,
@@ -776,23 +777,23 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 			"preference":          item.preference,
 			"external-preference": item.externalPreference,
 			"wide-metrics":        item.wideMetrics,
-			"export-policy":     item.exportPolicy,
-			"import-policy":     item.importPolicy,
-			"graceful-restart":  item.gracefulRestart,
-			"default-interface": item.defaultIntf,
-			"timers":            item.timers,
-			"metrics":           item.metrics,
-			"networks":          item.networks,
-			"static-neighbors":  item.staticNeighbors,
-			"static-neighbor":   item.staticNeighbors,
-			"interfaces":        item.intfList,
-			"interface":         item.intfList,
-			"neighbors":         item.nbrList,
-			"neighbor":          item.nbrList,
-			"routes":            item.routeList,
-			"route":             item.routeList,
-			"topology":          item.topoList,
-			"traffic":           item.trafficList,
+			"export-policy":       item.exportPolicy,
+			"import-policy":       item.importPolicy,
+			"graceful-restart":    item.gracefulRestart,
+			"default-interface":   item.defaultIntf,
+			"timers":              item.timers,
+			"metrics":             item.metrics,
+			"networks":            item.networks,
+			"static-neighbors":    item.staticNeighbors,
+			"static-neighbor":     item.staticNeighbors,
+			"interfaces":          item.intfList,
+			"interface":           item.intfList,
+			"neighbors":           item.nbrList,
+			"neighbor":            item.nbrList,
+			"routes":              item.routeList,
+			"route":               item.routeList,
+			"topology":            item.topoList,
+			"traffic":             item.trafficList,
 		}
 		instancesState[item.ni] = instSnapshot
 		if item.ni == "default" {
@@ -810,8 +811,8 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 	stateSnapshot["updated-at"] = time.Now().Format(time.RFC3339)
 
 	if b, err := json.MarshalIndent(stateSnapshot, "", "  "); err == nil {
-		_ = os.WriteFile("/var/run/srl_eigrp_state.json", b, 0644)
-		_ = os.WriteFile("/tmp/srl_eigrp_state.json", b, 0644)
+		_ = atomicWriteFile("/var/run/srl_eigrp_state.json", b, 0644)
+		_ = atomicWriteFile("/tmp/srl_eigrp_state.json", b, 0644)
 	}
 
 	// 2. Publish to NDK Telemetry State DB across all network instances
@@ -1054,8 +1055,8 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 		topKey := fmt.Sprintf(".network_instance{.name==\"%s\"}.protocols.eigrp", ni)
 		currentKeys[topKey] = struct{}{}
 		topData := map[string]interface{}{
-			"admin-state":       item.adminState,
-			"oper-state":        item.operState,
+			"admin-state":         item.adminState,
+			"oper-state":          item.operState,
 			"variance":            item.variance,
 			"maximum-paths":       item.maximumPaths,
 			"maximum-hops":        item.maximumHops,
@@ -1063,13 +1064,13 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 			"preference":          item.preference,
 			"external-preference": item.externalPreference,
 			"wide-metrics":        item.wideMetrics,
-			"total-neighbors":   len(item.nbrList),
-			"total-routes":      len(item.routeList),
-			"total-interfaces":  len(item.intfList),
-			"graceful-restart":  grData,
-			"default-interface": defIntfData,
-			"timers":            timersData,
-			"metrics":           metricsData,
+			"total-neighbors":     len(item.nbrList),
+			"total-routes":        len(item.routeList),
+			"total-interfaces":    len(item.intfList),
+			"graceful-restart":    grData,
+			"default-interface":   defIntfData,
+			"timers":              timersData,
+			"metrics":             metricsData,
 		}
 		if item.operState != "up" {
 			if item.adminState == "disable" {
@@ -1512,4 +1513,33 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 			log.Info().Int("count", len(states)).Msg("TelemetryAddOrUpdate succeeded")
 		}
 	}
+}
+
+func atomicWriteFile(filename string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(filename)
+	tmpFile, err := os.CreateTemp(dir, filepath.Base(filename)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmpFile.Name()
+	defer func() {
+		_ = os.Remove(tmpName)
+	}()
+
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Chmod(perm); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, filename)
 }

@@ -1032,9 +1032,12 @@ try:
                 saved_path = self.path
                 self.path = wildcard_path
                 try:
-                    return _orig_info_get_data(self)
+                    data = _orig_info_get_data(self)
                 finally:
                     self.path = saved_path
+                if hasattr(self, "_move_to_info_root"):
+                    return self._move_to_info_root(data)
+                return data
         return _orig_info_get_data(self)
 
     InfoPrinter.get_data = _eigrp_info_get_data

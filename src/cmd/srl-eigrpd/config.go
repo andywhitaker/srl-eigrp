@@ -91,6 +91,7 @@ type InterfaceConfig struct {
 	InterfaceName  string                         `json:"interface-name"`
 	AdminState     string                         `json:"admin-state,omitempty"`
 	Passive        *bool                          `json:"passive,omitempty"`
+	VlanID         *uint16                        `json:"vlan-id,omitempty"`
 	HelloInterval  *uint16                        `json:"hello-interval,omitempty"`
 	HoldTime       *uint16                        `json:"hold-time,omitempty"`
 	SplitHorizon   *bool                          `json:"split-horizon,omitempty"`
@@ -625,16 +626,16 @@ type EigrpConfig struct {
 	Preference         uint8                   `json:"preference,omitempty"`
 	ExternalPreference uint8                   `json:"external-preference,omitempty"`
 	WideMetrics        *bool                   `json:"wide-metrics,omitempty"`
-	GracefulRestart  *GracefulRestartConfig  `json:"graceful-restart,omitempty"`
-	Authentication   *AuthConfig             `json:"authentication,omitempty"`
-	Timers           *TimersConfig           `json:"timers,omitempty"`
-	Metrics          *MetricsConfig          `json:"metrics,omitempty"`
-	MetricWeights    *MetricsConfig          `json:"metric-weights,omitempty"`
-	DefaultInterface *DefaultInterfaceConfig `json:"default-interface,omitempty"`
-	Interface        []InterfaceConfig       `json:"interface,omitempty"`
-	AddressFamily    []AddressFamilyConfig   `json:"address-family,omitempty"`
-	Network          []string                `json:"network,omitempty"`
-	StaticNeighbor   []StaticNeighborConfig  `json:"static-neighbor,omitempty"`
+	GracefulRestart    *GracefulRestartConfig  `json:"graceful-restart,omitempty"`
+	Authentication     *AuthConfig             `json:"authentication,omitempty"`
+	Timers             *TimersConfig           `json:"timers,omitempty"`
+	Metrics            *MetricsConfig          `json:"metrics,omitempty"`
+	MetricWeights      *MetricsConfig          `json:"metric-weights,omitempty"`
+	DefaultInterface   *DefaultInterfaceConfig `json:"default-interface,omitempty"`
+	Interface          []InterfaceConfig       `json:"interface,omitempty"`
+	AddressFamily      []AddressFamilyConfig   `json:"address-family,omitempty"`
+	Network            []string                `json:"network,omitempty"`
+	StaticNeighbor     []StaticNeighborConfig  `json:"static-neighbor,omitempty"`
 }
 
 var (
@@ -823,8 +824,34 @@ func (d *EigrpDaemon) applyInterface(inst *EigrpInstance, ifcfg *InterfaceConfig
 		delay = *inst.defaultIntf.Delay
 	}
 
+	var vlanID uint16
+	if ifcfg.VlanID != nil {
+		vlanID = *ifcfg.VlanID
+	} else {
+		d.mu.RLock()
+		if d.learnedVlans != nil {
+			if v, ok := d.learnedVlans[ifcfg.InterfaceName]; ok && v > 0 {
+				vlanID = v
+			} else if v, ok := d.learnedVlans[normalizeIfName(ifcfg.InterfaceName)]; ok && v > 0 {
+				vlanID = v
+			}
+		}
+		d.mu.RUnlock()
+		if vlanID > 0 {
+			vlanCopy := vlanID
+			ifcfg.VlanID = &vlanCopy
+		}
+	}
+	if vlanID > 0 {
+		C.srlShimInterfaceSetVlanId(cNetinst, cIfname, C.uint16_t(vlanID))
+	}
+
 	C.srlShimInterfaceEnable(cNetinst, cIfname, C.bool(passive4), C.uint16_t(hello4), C.uint16_t(hold4), C.bool(adminUp4), C.bool(sh4), C.bool(nhs4), C.uint32_t(bandwidth), C.uint32_t(delay))
 	C.srlShimInterfaceEnableV6(cNetinst, cIfname, C.bool(passive6), C.uint16_t(hello6), C.uint16_t(hold6), C.bool(adminUp6), C.bool(sh6), C.bool(nhs6), C.uint32_t(bandwidth), C.uint32_t(delay))
+
+	if vlanID > 0 {
+		C.srlShimInterfaceSetVlanId(cNetinst, cIfname, C.uint16_t(vlanID))
+	}
 
 	// IPv4 authentication
 	cAfi4 := C.CString("ipv4-unicast")
@@ -897,13 +924,28 @@ func (d *EigrpDaemon) applyInterface(inst *EigrpInstance, ifcfg *InterfaceConfig
 		}
 	}
 
+	type nbrBfdInfo struct {
+		ip   string
+		isV6 bool
+	}
+	var matchingNbrs []nbrBfdInfo
+	d.mu.RLock()
+	normIf := normalizeIfName(ifcfg.InterfaceName)
 	for nbrIP, nbr := range inst.neighbors {
-		if normalizeIfName(nbr.Interface) == normalizeIfName(ifcfg.InterfaceName) {
-			if strings.Contains(nbrIP, ":") {
-				_ = d.BfdSessionAddOrUpdate(inst.netinst, nbrIP, ifcfg.InterfaceName, bfdAdmin6, bfdTx6, bfdRx6, bfdMult6)
-			} else {
-				_ = d.BfdSessionAddOrUpdate(inst.netinst, nbrIP, ifcfg.InterfaceName, bfdAdmin4, bfdTx4, bfdRx4, bfdMult4)
-			}
+		if normalizeIfName(nbr.Interface) == normIf {
+			matchingNbrs = append(matchingNbrs, nbrBfdInfo{
+				ip:   nbrIP,
+				isV6: strings.Contains(nbrIP, ":"),
+			})
+		}
+	}
+	d.mu.RUnlock()
+
+	for _, n := range matchingNbrs {
+		if n.isV6 {
+			_ = d.BfdSessionAddOrUpdate(inst.netinst, n.ip, ifcfg.InterfaceName, bfdAdmin6, bfdTx6, bfdRx6, bfdMult6)
+		} else {
+			_ = d.BfdSessionAddOrUpdate(inst.netinst, n.ip, ifcfg.InterfaceName, bfdAdmin4, bfdTx4, bfdRx4, bfdMult4)
 		}
 	}
 
@@ -1273,6 +1315,155 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 	}
 
 	if !strings.Contains(jsPath, ".protocols.eigrp") {
+		// Handle SR Linux subinterface VLAN configuration
+		// e.g. .interface{.name=="ethernet-1/1"}.subinterface{.index==1}...
+		if strings.Contains(jsPath, ".interface") && strings.Contains(jsPath, ".subinterface") {
+			subifRegex := regexp.MustCompile(`\.interface\{(?:\.name==)?["']?([^}"']+)["']?\}\.subinterface\{(?:\.index==)?["']?([^}"']+)["']?\}`)
+			for _, s := range []string{jsPathKeys, jsPath} {
+				matches := subifRegex.FindStringSubmatch(s)
+				if len(matches) > 2 {
+					baseDev := matches[1]
+					subIdx := matches[2]
+					fullIntfName := baseDev + "." + subIdx
+					normIntf := normalizeIfName(fullIntfName)
+
+					var vlanData struct {
+						VlanID  *uint16 `json:"vlan-id"`
+						EncapID *uint16 `json:"encap-id"`
+						Vlan    struct {
+							VlanID  *uint16 `json:"vlan-id"`
+							EncapID *uint16 `json:"encap-id"`
+							Encap   struct {
+								SingleTagged struct {
+									VlanID  *uint16 `json:"vlan-id"`
+									EncapID *uint16 `json:"encap-id"`
+								} `json:"single-tagged"`
+							} `json:"encap"`
+						} `json:"vlan"`
+						Encap struct {
+							SingleTagged struct {
+								VlanID  *uint16 `json:"vlan-id"`
+								EncapID *uint16 `json:"encap-id"`
+							} `json:"single-tagged"`
+						} `json:"encap"`
+					}
+					if err := json.Unmarshal([]byte(jsonStr), &vlanData); err == nil {
+						var learnedVlan uint16
+						if vlanData.VlanID != nil {
+							learnedVlan = *vlanData.VlanID
+						} else if vlanData.EncapID != nil {
+							learnedVlan = *vlanData.EncapID
+						} else if vlanData.Vlan.VlanID != nil {
+							learnedVlan = *vlanData.Vlan.VlanID
+						} else if vlanData.Vlan.EncapID != nil {
+							learnedVlan = *vlanData.Vlan.EncapID
+						} else if vlanData.Vlan.Encap.SingleTagged.VlanID != nil {
+							learnedVlan = *vlanData.Vlan.Encap.SingleTagged.VlanID
+						} else if vlanData.Vlan.Encap.SingleTagged.EncapID != nil {
+							learnedVlan = *vlanData.Vlan.Encap.SingleTagged.EncapID
+						} else if vlanData.Encap.SingleTagged.VlanID != nil {
+							learnedVlan = *vlanData.Encap.SingleTagged.VlanID
+						} else if vlanData.Encap.SingleTagged.EncapID != nil {
+							learnedVlan = *vlanData.Encap.SingleTagged.EncapID
+						}
+						if learnedVlan > 0 {
+							d.mu.Lock()
+							if d.learnedVlans == nil {
+								d.learnedVlans = make(map[string]uint16)
+							}
+							d.learnedVlans[fullIntfName] = learnedVlan
+							d.learnedVlans[normIntf] = learnedVlan
+							for _, inst := range d.instances {
+								if ic, ok := inst.configuredInterfaces[fullIntfName]; ok {
+									ic.VlanID = &learnedVlan
+								} else if ic, ok := inst.configuredInterfaces[normIntf]; ok {
+									ic.VlanID = &learnedVlan
+								}
+							}
+							instanceNames := make([]string, 0, len(d.instances))
+							for ni := range d.instances {
+								instanceNames = append(instanceNames, ni)
+							}
+							if len(instanceNames) == 0 {
+								instanceNames = append(instanceNames, "default")
+							}
+							d.mu.Unlock()
+
+							cIntf := C.CString(fullIntfName)
+							cNorm := C.CString(normIntf)
+							for _, ni := range instanceNames {
+								cNi := C.CString(ni)
+								C.srlShimInterfaceSetVlanId(cNi, cIntf, C.uint16_t(learnedVlan))
+								C.srlShimInterfaceSetVlanId(cNi, cNorm, C.uint16_t(learnedVlan))
+								C.free(unsafe.Pointer(cNi))
+							}
+							C.free(unsafe.Pointer(cIntf))
+							C.free(unsafe.Pointer(cNorm))
+							log.Info().Str("interface", fullIntfName).Uint16("vlan_id", learnedVlan).Msg("Learned explicit subinterface VLAN ID from configuration")
+						}
+					}
+					break
+				}
+			}
+		}
+
+		// Check if this is a DELETE of the entire network-instance (VRF deletion)
+		cleanPath := strings.TrimPrefix(strings.TrimPrefix(jsPath, ".network_instance"), ".network-instance")
+		if idx := strings.Index(cleanPath, "}"); idx != -1 && strings.HasPrefix(cleanPath, "{") {
+			cleanPath = cleanPath[idx+1:]
+		}
+		isNetinstSelf := (cleanPath == "") && (strings.HasPrefix(jsPath, ".network_instance") || strings.HasPrefix(jsPath, ".network-instance"))
+
+		if isNetinstSelf && op == ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE {
+			netinst := ""
+			if cfg != nil && cfg.GetKey() != nil {
+				keys := cfg.GetKey().GetKeys()
+				if len(keys) > 0 && keys[0] != "" && keys[0] != "*" {
+					netinst = keys[0]
+				}
+			}
+			if netinst == "" {
+				for _, s := range []string{jsPathKeys, jsPath} {
+					if s == "" {
+						continue
+					}
+					matches := netinstRegex.FindStringSubmatch(s)
+					if len(matches) > 1 && matches[1] != "" && matches[1] != "*" {
+						netinst = matches[1]
+						break
+					}
+					if start := strings.Index(s, `name=="`); start != -1 {
+						sub := s[start+7:]
+						if end := strings.Index(sub, `"`); end != -1 {
+							netinst = sub[:end]
+							break
+						}
+					}
+				}
+			}
+			if netinst == "" {
+				netinst = extractNetinst(cfg)
+			}
+			if netinst != "" && d.GetInstance(netinst) != nil {
+				log.Info().Str("netinst", netinst).Msg("Deleting EIGRP protocol instance due to network-instance deletion")
+				inst := d.GetInstance(netinst)
+				asn := uint16(0)
+				if inst != nil {
+					d.mu.RLock()
+					asn = inst.asn
+					d.mu.RUnlock()
+				}
+				cNetinst := C.CString(netinst)
+				C.srlShimInstanceDelete(cNetinst)
+				C.srlShimInstanceDeleteV6(cNetinst, C.uint16_t(asn))
+				C.free(unsafe.Pointer(cNetinst))
+				d.WithdrawAfRoutes(netinst, "ipv4-unicast")
+				d.WithdrawAfRoutes(netinst, "ipv6-unicast")
+				d.withdrawAllRedistributed(netinst)
+				d.DeleteInstance(netinst)
+				go d.CollectAndPublish(context.Background())
+			}
+		}
 		return
 	}
 
@@ -1281,9 +1472,20 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 	// Check if this is a DELETE of the entire EIGRP protocol on this network-instance
 	if strings.HasSuffix(jsPath, ".protocols.eigrp") && op == ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE {
 		log.Info().Str("netinst", netinst).Msg("Deleting EIGRP protocol instance")
+		inst := d.GetInstance(netinst)
+		asn := uint16(0)
+		if inst != nil {
+			d.mu.RLock()
+			asn = inst.asn
+			d.mu.RUnlock()
+		}
 		cNetinst := C.CString(netinst)
 		C.srlShimInstanceDelete(cNetinst)
+		C.srlShimInstanceDeleteV6(cNetinst, C.uint16_t(asn))
 		C.free(unsafe.Pointer(cNetinst))
+		d.WithdrawAfRoutes(netinst, "ipv4-unicast")
+		d.WithdrawAfRoutes(netinst, "ipv6-unicast")
+		d.withdrawAllRedistributed(netinst)
 		d.DeleteInstance(netinst)
 		go d.CollectAndPublish(context.Background())
 		return
@@ -2550,88 +2752,120 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			}
 			if strings.Contains(jsPath, ".admin-state") {
 				d.mu.Lock()
-				if ic, exists := inst.configuredInterfaces[ifName]; exists {
-					ic.AdminState = "enable"
-					d.applyInterface(inst, ic)
+				var ic *InterfaceConfig
+				if c, exists := inst.configuredInterfaces[ifName]; exists {
+					c.AdminState = "enable"
+					ic = c
 				}
 				d.mu.Unlock()
+				if ic != nil {
+					d.applyInterface(inst, ic)
+				}
 				log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Reset admin-state on interface to default enable")
 				go d.CollectAndPublish(context.Background())
 				return
 			}
 			if strings.Contains(jsPath, ".delay") {
 				d.mu.Lock()
-				if ic, exists := inst.configuredInterfaces[ifName]; exists {
-					ic.Delay = nil
-					d.applyInterface(inst, ic)
+				var ic *InterfaceConfig
+				if c, exists := inst.configuredInterfaces[ifName]; exists {
+					c.Delay = nil
+					ic = c
 				}
 				d.mu.Unlock()
+				if ic != nil {
+					d.applyInterface(inst, ic)
+				}
 				log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Reset delay on interface to default")
 				go d.CollectAndPublish(context.Background())
 				return
 			}
 			if strings.Contains(jsPath, ".bandwidth") {
 				d.mu.Lock()
-				if ic, exists := inst.configuredInterfaces[ifName]; exists {
-					ic.Bandwidth = nil
-					d.applyInterface(inst, ic)
+				var ic *InterfaceConfig
+				if c, exists := inst.configuredInterfaces[ifName]; exists {
+					c.Bandwidth = nil
+					ic = c
 				}
 				d.mu.Unlock()
+				if ic != nil {
+					d.applyInterface(inst, ic)
+				}
 				log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Reset bandwidth on interface to default")
 				go d.CollectAndPublish(context.Background())
 				return
 			}
 			if strings.Contains(jsPath, ".passive") {
 				d.mu.Lock()
-				if ic, exists := inst.configuredInterfaces[ifName]; exists {
-					ic.Passive = nil
-					d.applyInterface(inst, ic)
+				var ic *InterfaceConfig
+				if c, exists := inst.configuredInterfaces[ifName]; exists {
+					c.Passive = nil
+					ic = c
 				}
 				d.mu.Unlock()
+				if ic != nil {
+					d.applyInterface(inst, ic)
+				}
 				log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Reset passive on interface to default")
 				go d.CollectAndPublish(context.Background())
 				return
 			}
 			if strings.Contains(jsPath, ".hello-interval") {
 				d.mu.Lock()
-				if ic, exists := inst.configuredInterfaces[ifName]; exists {
-					ic.HelloInterval = nil
-					d.applyInterface(inst, ic)
+				var ic *InterfaceConfig
+				if c, exists := inst.configuredInterfaces[ifName]; exists {
+					c.HelloInterval = nil
+					ic = c
 				}
 				d.mu.Unlock()
+				if ic != nil {
+					d.applyInterface(inst, ic)
+				}
 				log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Reset hello-interval on interface to default")
 				go d.CollectAndPublish(context.Background())
 				return
 			}
 			if strings.Contains(jsPath, ".hold-time") {
 				d.mu.Lock()
-				if ic, exists := inst.configuredInterfaces[ifName]; exists {
-					ic.HoldTime = nil
-					d.applyInterface(inst, ic)
+				var ic *InterfaceConfig
+				if c, exists := inst.configuredInterfaces[ifName]; exists {
+					c.HoldTime = nil
+					ic = c
 				}
 				d.mu.Unlock()
+				if ic != nil {
+					d.applyInterface(inst, ic)
+				}
 				log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Reset hold-time on interface to default")
 				go d.CollectAndPublish(context.Background())
 				return
 			}
 			if strings.Contains(jsPath, ".split-horizon") {
 				d.mu.Lock()
-				if ic, exists := inst.configuredInterfaces[ifName]; exists {
-					ic.SplitHorizon = nil
-					d.applyInterface(inst, ic)
+				var ic *InterfaceConfig
+				if c, exists := inst.configuredInterfaces[ifName]; exists {
+					c.SplitHorizon = nil
+					ic = c
 				}
 				d.mu.Unlock()
+				if ic != nil {
+					d.applyInterface(inst, ic)
+				}
 				log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Reset split-horizon on interface to default")
 				go d.CollectAndPublish(context.Background())
 				return
 			}
 			if strings.Contains(jsPath, ".next-hop-self") {
 				d.mu.Lock()
-				if ic, exists := inst.configuredInterfaces[ifName]; exists {
-					ic.NextHopSelf = nil
-					d.applyInterface(inst, ic)
+				var ic *InterfaceConfig
+				if c, exists := inst.configuredInterfaces[ifName]; exists {
+					c.NextHopSelf = nil
+					ic = c
 				}
 				d.mu.Unlock()
+				if ic != nil {
+					d.applyInterface(inst, ic)
+				}
 				log.Info().Str("netinst", netinst).Str("interface", ifName).Msg("Reset next-hop-self on interface to default")
 				go d.CollectAndPublish(context.Background())
 				return

@@ -1308,6 +1308,8 @@ EOF"""
         cfg_srl2 = """sr_cli << 'EOF'
 enter candidate
 discard stay
+/ interface lo0 admin-state enable
+/ interface lo0 subinterface 10 admin-state enable
 / interface lo0 subinterface 10 ipv4 admin-state enable
 / interface lo0 subinterface 10 ipv4 address 172.20.20.1/32
 / network-instance default interface lo0.10
@@ -1385,6 +1387,8 @@ EOF"""
         cfg_srl2 = """sr_cli << 'EOF'
 enter candidate
 discard stay
+/ interface lo0 admin-state enable
+/ interface lo0 subinterface 20 admin-state enable
 / interface lo0 subinterface 20 ipv6 admin-state enable
 / interface lo0 subinterface 20 ipv6 address 2001:db8:77::1/128
 / network-instance default interface lo0.20
@@ -1546,6 +1550,8 @@ EOF"""
         cfg_srl2 = """sr_cli << 'EOF'
 enter candidate
 discard stay
+/ interface lo0 admin-state enable
+/ interface lo0 subinterface 30 admin-state enable
 / interface lo0 subinterface 30 ipv4 admin-state enable
 / interface lo0 subinterface 30 ipv4 address 172.30.30.1/32
 / network-instance default interface lo0.30

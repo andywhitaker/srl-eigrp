@@ -3,10 +3,15 @@ package main
 /*
 #cgo CFLAGS: -I../../upstream/eigrp/eigrp/code -I../../cshim
 #cgo LDFLAGS: -rdynamic -L../../cshim -L../../upstream/eigrp/eigrp/code -Wl,--wrap=eigrp_sys_intf_update -Wl,--wrap=eigrp_check_md5_digest -Wl,--wrap=eigrp_check_sha256_digest -Wl,--wrap=eigrp_auth_tlv_md5_encode -Wl,--wrap=eigrp_auth_tlv_sha256_encode -Wl,--wrap=eigrp_make_md5_digest -Wl,--wrap=eigrp_make_sha256_digest -Wl,--start-group -leigrp-core -lsrl-cshim -Wl,--end-group -lpthread -ldl -lstdc++
+#include <stdlib.h>
 #include "srl_cshim.h"
 */
 import "C"
-import "time"
+import (
+	"sync"
+	"time"
+	"unsafe"
+)
 
 type routeEventType int
 
@@ -27,9 +32,33 @@ type routeEvent struct {
 }
 
 type routeQueueWorker struct {
-	queue chan routeEvent
-	stop  chan struct{}
-	done  chan struct{}
+	mu       sync.Mutex
+	overflow []routeEvent
+	queue    chan routeEvent
+	stop     chan struct{}
+	done     chan struct{}
+}
+
+func (w *routeQueueWorker) enqueue(ev routeEvent) {
+	select {
+	case <-w.stop:
+		return
+	default:
+	}
+
+	w.mu.Lock()
+	if len(w.overflow) > 0 {
+		w.overflow = append(w.overflow, ev)
+		w.mu.Unlock()
+		return
+	}
+	select {
+	case w.queue <- ev:
+		w.mu.Unlock()
+	default:
+		w.overflow = append(w.overflow, ev)
+		w.mu.Unlock()
+	}
 }
 
 func (d *EigrpDaemon) getOrCreateRouteWorker(netinst string) *routeQueueWorker {
@@ -44,7 +73,7 @@ func (d *EigrpDaemon) getOrCreateRouteWorker(netinst string) *routeQueueWorker {
 	w, exists := d.routeWorkers[netinst]
 	if !exists {
 		w = &routeQueueWorker{
-			queue: make(chan routeEvent, 1024),
+			queue: make(chan routeEvent, 16384),
 			stop:  make(chan struct{}),
 			done:  make(chan struct{}),
 		}
@@ -57,13 +86,48 @@ func (d *EigrpDaemon) getOrCreateRouteWorker(netinst string) *routeQueueWorker {
 func (d *EigrpDaemon) runRouteWorker(w *routeQueueWorker) {
 	defer close(w.done)
 	for {
+		// First flush any items in overflow into queue
+		w.mu.Lock()
+	overflowLoop:
+		for len(w.overflow) > 0 {
+			select {
+			case w.queue <- w.overflow[0]:
+				w.overflow[0] = routeEvent{}
+				w.overflow = w.overflow[1:]
+			default:
+				break overflowLoop
+			}
+		}
+		w.mu.Unlock()
+
 		select {
 		case <-w.stop:
 			for {
+				w.mu.Lock()
+				if len(w.overflow) > 0 {
+					select {
+					case w.queue <- w.overflow[0]:
+						w.overflow[0] = routeEvent{}
+						w.overflow = w.overflow[1:]
+					default:
+					}
+				}
+				w.mu.Unlock()
+
 				select {
 				case ev := <-w.queue:
 					d.processRouteEvent(ev)
 				default:
+					w.mu.Lock()
+					if len(w.overflow) > 0 {
+						ev := w.overflow[0]
+						w.overflow[0] = routeEvent{}
+						w.overflow = w.overflow[1:]
+						w.mu.Unlock()
+						d.processRouteEvent(ev)
+						continue
+					}
+					w.mu.Unlock()
 					return
 				}
 			}
@@ -84,13 +148,7 @@ func (d *EigrpDaemon) processRouteEvent(ev routeEvent) {
 
 func (d *EigrpDaemon) EnqueueRouteAdd(netinst, prefix, nexthop string, metric uint32, wideMetric uint64, isExt bool, preference uint32) {
 	w := d.getOrCreateRouteWorker(netinst)
-	select {
-	case <-w.stop:
-		return
-	default:
-	}
-	select {
-	case w.queue <- routeEvent{
+	w.enqueue(routeEvent{
 		eventType:  routeEventAdd,
 		netinst:    netinst,
 		prefix:     prefix,
@@ -99,26 +157,16 @@ func (d *EigrpDaemon) EnqueueRouteAdd(netinst, prefix, nexthop string, metric ui
 		wideMetric: wideMetric,
 		isExt:      isExt,
 		preference: preference,
-	}:
-	case <-w.stop:
-	}
+	})
 }
 
 func (d *EigrpDaemon) EnqueueRouteDel(netinst, prefix string) {
 	w := d.getOrCreateRouteWorker(netinst)
-	select {
-	case <-w.stop:
-		return
-	default:
-	}
-	select {
-	case w.queue <- routeEvent{
+	w.enqueue(routeEvent{
 		eventType: routeEventDel,
 		netinst:   netinst,
 		prefix:    prefix,
-	}:
-	case <-w.stop:
-	}
+	})
 }
 
 func (d *EigrpDaemon) StopRouteWorker(netinst string) {
@@ -228,4 +276,182 @@ func srlGoTrafficReport(netinst *C.char, ifname *C.char, rmcast C.uint64_t, umca
 	if daemonApp != nil {
 		daemonApp.OnTrafficReport(C.GoString(netinst), C.GoString(ifname), uint64(rmcast), uint64(umcast), uint64(rucast), uint64(uucast), uint64(rexmits), uint64(cr))
 	}
+}
+
+// ShimSetPktFdDisabled sets whether AF_PACKET packet sockets are disabled.
+func ShimSetPktFdDisabled(disabled bool) {
+	C.srlShimSetPktFdDisabled(C.bool(disabled))
+}
+
+// ShimGetPktFdDisabled returns whether AF_PACKET packet sockets are disabled.
+func ShimGetPktFdDisabled() bool {
+	return bool(C.srlShimGetPktFdDisabled())
+}
+
+// ShimPacketHash computes the FNV-1a packet hash for deduplication.
+func ShimPacketHash(afi int, src, dst, payload []byte) uint32 {
+	if len(src) == 0 || len(dst) == 0 {
+		return 0
+	}
+	var pPayload unsafe.Pointer
+	if len(payload) > 0 {
+		pPayload = unsafe.Pointer(&payload[0])
+	}
+	return uint32(C.srlTestPacketHash(
+		C.int(afi),
+		unsafe.Pointer(&src[0]),
+		unsafe.Pointer(&dst[0]),
+		pPayload,
+		C.size_t(len(payload)),
+	))
+}
+
+// ShimDedupCheck checks and records packet deduplication across receive sockets.
+func ShimDedupCheck(rxSrc, afi uint8, hash uint32, length, ipID, eigrpCsum uint16) bool {
+	return bool(C.srlTestDedupCheck(
+		C.uint8_t(rxSrc),
+		C.uint8_t(afi),
+		C.uint32_t(hash),
+		C.uint16_t(length),
+		C.uint16_t(ipID),
+		C.uint16_t(eigrpCsum),
+	))
+}
+
+// ShimDedupReset clears test deduplication cache entries.
+func ShimDedupReset() {
+	C.srlTestDedupReset()
+}
+
+// ShimTestResolveInterfaceV4 tests wire interface resolution for IPv4 packets.
+func ShimTestResolveInterfaceV4(netinst string, sllIfindex uint32, vlanID uint16, srcIP, dstIP string) uint32 {
+	cNetinst := C.CString(netinst)
+	defer C.free(unsafe.Pointer(cNetinst))
+	var cSrc, cDst *C.char
+	if srcIP != "" {
+		cSrc = C.CString(srcIP)
+		defer C.free(unsafe.Pointer(cSrc))
+	}
+	if dstIP != "" {
+		cDst = C.CString(dstIP)
+		defer C.free(unsafe.Pointer(cDst))
+	}
+	return uint32(C.srlTestResolveInterfaceV4(cNetinst, C.uint32_t(sllIfindex), C.uint16_t(vlanID), cSrc, cDst))
+}
+
+// ShimTestResolveInterfaceV6 tests wire interface resolution for IPv6 packets.
+func ShimTestResolveInterfaceV6(netinst string, sllIfindex uint32, vlanID uint16, srcIP, dstIP string) uint32 {
+	cNetinst := C.CString(netinst)
+	defer C.free(unsafe.Pointer(cNetinst))
+	var cSrc, cDst *C.char
+	if srcIP != "" {
+		cSrc = C.CString(srcIP)
+		defer C.free(unsafe.Pointer(cSrc))
+	}
+	if dstIP != "" {
+		cDst = C.CString(dstIP)
+		defer C.free(unsafe.Pointer(cDst))
+	}
+	return uint32(C.srlTestResolveInterfaceV6(cNetinst, C.uint32_t(sllIfindex), C.uint16_t(vlanID), cSrc, cDst))
+}
+
+// ShimTestRegisterInterface registers a mock interface in the C shim for testing.
+func ShimTestRegisterInterface(netinst, ifname string, ifidx, rootIfidx uint32, ipAddr string, prefixlen uint8, isV6, active bool) {
+	cNetinst := C.CString(netinst)
+	defer C.free(unsafe.Pointer(cNetinst))
+	cIfname := C.CString(ifname)
+	defer C.free(unsafe.Pointer(cIfname))
+	var cIP *C.char
+	if ipAddr != "" {
+		cIP = C.CString(ipAddr)
+		defer C.free(unsafe.Pointer(cIP))
+	}
+	C.srlTestRegisterInterface(cNetinst, cIfname, C.eigrp_ifindex_t(ifidx), C.eigrp_ifindex_t(rootIfidx), cIP, C.uint8_t(prefixlen), C.bool(isV6), C.bool(active))
+}
+
+// ShimTestRegisterInterfaceWithVlan registers a mock interface with an explicit VLAN ID in the C shim.
+func ShimTestRegisterInterfaceWithVlan(netinst, ifname string, ifidx, rootIfidx uint32, vlanID uint16, ipAddr string, prefixlen uint8, isV6, active bool) {
+	cNetinst := C.CString(netinst)
+	defer C.free(unsafe.Pointer(cNetinst))
+	cIfname := C.CString(ifname)
+	defer C.free(unsafe.Pointer(cIfname))
+	var cIP *C.char
+	if ipAddr != "" {
+		cIP = C.CString(ipAddr)
+		defer C.free(unsafe.Pointer(cIP))
+	}
+	C.srlTestRegisterInterfaceWithVlan(cNetinst, cIfname, C.eigrp_ifindex_t(ifidx), C.eigrp_ifindex_t(rootIfidx), C.uint16_t(vlanID), cIP, C.uint8_t(prefixlen), C.bool(isV6), C.bool(active))
+}
+
+// ShimInterfaceSetVlanID sets the explicit VLAN ID on a registered interface.
+func ShimInterfaceSetVlanID(netinst, ifname string, vlanID uint16) int {
+	cNetinst := C.CString(netinst)
+	defer C.free(unsafe.Pointer(cNetinst))
+	cIfname := C.CString(ifname)
+	defer C.free(unsafe.Pointer(cIfname))
+	return int(C.srlShimInterfaceSetVlanId(cNetinst, cIfname, C.uint16_t(vlanID)))
+}
+
+// ShimTestClearInterfaces clears registered interfaces in the C shim.
+func ShimTestClearInterfaces() {
+	C.srlTestClearInterfaces()
+}
+
+// ShimTestRunBPFFilter runs the generated cBPF filter against a packet buffer and ifindex.
+func ShimTestRunBPFFilter(ifindexes []uint32, pkt []byte, ifindex uint32) uint32 {
+	var pIfindexes *C.uint32_t
+	if len(ifindexes) > 0 {
+		pIfindexes = (*C.uint32_t)(unsafe.Pointer(&ifindexes[0]))
+	}
+	var pPkt *C.uint8_t
+	if len(pkt) > 0 {
+		pPkt = (*C.uint8_t)(unsafe.Pointer(&pkt[0]))
+	}
+	return uint32(C.srlTestRunBPFFilter(pIfindexes, C.size_t(len(ifindexes)), pPkt, C.size_t(len(pkt)), C.uint32_t(ifindex)))
+}
+
+// ShimTestMatchRootWireIfname tests root wire interface name matching logic.
+func ShimTestMatchRootWireIfname(devName, baseName string) bool {
+	cDev := C.CString(devName)
+	defer C.free(unsafe.Pointer(cDev))
+	cBase := C.CString(baseName)
+	defer C.free(unsafe.Pointer(cBase))
+	return bool(C.srlTestMatchRootWireIfname(cDev, cBase))
+}
+
+// ShimTestIsLocalPrefix tests whether a prefix belongs to local connected interfaces or loopbacks.
+func ShimTestIsLocalPrefix(netinst, prefix string, isV6 bool) bool {
+	cNetinst := C.CString(netinst)
+	defer C.free(unsafe.Pointer(cNetinst))
+	cPfx := C.CString(prefix)
+	defer C.free(unsafe.Pointer(cPfx))
+	return bool(C.srlTestIsLocalPrefix(cNetinst, cPfx, C.bool(isV6)))
+}
+
+// ShimNeighborsReport triggers neighbor reporting for a network instance.
+func ShimNeighborsReport(netinst string) {
+	cNetinst := C.CString(netinst)
+	defer C.free(unsafe.Pointer(cNetinst))
+	C.srlShimNeighborsReport(cNetinst)
+}
+
+// ShimTopologyReport triggers topology reporting for a network instance.
+func ShimTopologyReport(netinst string) {
+	cNetinst := C.CString(netinst)
+	defer C.free(unsafe.Pointer(cNetinst))
+	C.srlShimTopologyReport(cNetinst)
+}
+
+// ShimTrafficReport triggers traffic reporting for a network instance.
+func ShimTrafficReport(netinst string) {
+	cNetinst := C.CString(netinst)
+	defer C.free(unsafe.Pointer(cNetinst))
+	C.srlShimTrafficReport(cNetinst)
+}
+
+// ShimInterfacesReport triggers interface reporting for a network instance.
+func ShimInterfacesReport(netinst string) {
+	cNetinst := C.CString(netinst)
+	defer C.free(unsafe.Pointer(cNetinst))
+	C.srlShimInterfacesReport(cNetinst)
 }

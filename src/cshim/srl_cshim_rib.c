@@ -71,10 +71,12 @@ eigrp_result_t eigrp_rib_route_add(eigrp_instance_t *eigrp, const eigrp_rib_rout
     }
     uint8_t rib_scale = srl_get_rib_scale(netinst);
     if (rib_scale == 0) rib_scale = 128;
-    if (route->metric >= EIGRP_64BIT_METRIC_INFINITY ||
-        route->metric >= 0xffffffffffffULL ||
-        route->metric == 4294967295ULL ||
-        route->nexthop_count == 0) {
+    bool is_unreachable = (route->metric >= EIGRP_64BIT_METRIC_INFINITY ||
+                           route->metric >= 0xffffffffffffULL ||
+                           route->metric == 4294967295ULL);
+    bool is_local = srl_is_local_prefix(netinst, &route->prefix);
+
+    if (is_unreachable || (route->nexthop_count == 0 && !is_local)) {
         srlGoRouteDel((char *)netinst, pfx_str);
         return EIGRP_RESULT_SUCCESS;
     }

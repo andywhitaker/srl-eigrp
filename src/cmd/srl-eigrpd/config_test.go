@@ -409,5 +409,3 @@ func TestConfig_SummaryAddressSubPath(t *testing.T) {
 		t.Fatalf("expected summary address to be deleted, got %+v", saList)
 	}
 }
-
-

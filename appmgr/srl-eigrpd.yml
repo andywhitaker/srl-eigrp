@@ -20,6 +20,7 @@ srl_eigrpd:
       - "/opt/srlinux/models/iana"
       - "/opt/srlinux/models/ietf"
       - "/opt/srlinux/models/srl_nokia/models"
+      - "/opt/srlinux/models/srl_nokia/models/interfaces"
       - "/opt/srlinux/models/srl_nokia/models/network-instance"
       - "/opt/srlinux/models/srl_nokia/models/system"
       - "/opt/srlinux/models/srl_nokia/models/routing-policy"

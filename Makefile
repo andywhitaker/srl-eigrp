@@ -1,5 +1,5 @@
 SHELL := /bin/bash
-.PHONY: all core cshim build package deploy-srl deploy-frr test test-srl test-frr clean
+.PHONY: all core cshim build package deploy-srl deploy-frr test test-srl test-frr test-unit clean
 
 all: core cshim build package
 
@@ -11,7 +11,7 @@ cshim: core
 
 build: cshim
 	mkdir -p bin
-	cd src/cmd/srl-eigrpd && go build -a -v -o ../../../bin/srl-eigrpd .
+	cd src/cmd/srl-eigrpd && go build -ldflags="-s -w" -a -v -o ../../../bin/srl-eigrpd .
 
 package: build
 	mkdir -p dist
@@ -29,7 +29,10 @@ test-srl:
 test-frr:
 	python3 -m pytest -v tests/test_srl_frr_interop.py
 
-test: test-srl test-frr
+test-unit: cshim
+	cd src/cmd/srl-eigrpd && go test -race ./...
+
+test: test-unit test-srl test-frr
 
 clean:
 	sudo clab destroy -t topologies/srl-srl.clab.yml --cleanup || true

@@ -43,8 +43,10 @@ extern "C" int srl_decrypt_password(const char *in, char *out, size_t out_len) {
         std::string plain;
         to_plain(&plain, sk_buf);
         if (dtor) dtor(sk_buf);
+        explicit_bzero(sk_buf, sizeof(sk_buf));
         strncpy(out, plain.c_str(), out_len - 1);
         out[out_len - 1] = '\0';
+        if (!plain.empty()) explicit_bzero(&plain[0], plain.size());
         return 0;
     } catch (...) {
         strncpy(out, in, out_len - 1);

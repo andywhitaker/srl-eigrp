@@ -7,6 +7,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"os/user"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -357,6 +359,7 @@ type EigrpDaemon struct {
 	streamId       uint64
 	mu             sync.RWMutex
 	instances      map[string]*EigrpInstance
+	learnedVlans   map[string]uint16
 	prevTeleKeys   map[string]struct{}
 	policies       map[string]*PolicyMetricConfig
 	policyDefs     map[string]*PolicyDef
@@ -436,17 +439,6 @@ func (d *EigrpDaemon) CollectAndPublish(ctx context.Context) {
 
 		if !adminDisabled {
 			C.srlShimInterfacesScan(cNetinst)
-
-			d.mu.RLock()
-			configuredIntfs := make([]*InterfaceConfig, 0, len(inst.configuredInterfaces))
-			for _, ic := range inst.configuredInterfaces {
-				configuredIntfs = append(configuredIntfs, ic)
-			}
-			d.mu.RUnlock()
-			for _, ic := range configuredIntfs {
-				d.applyInterface(inst, ic)
-			}
-
 			C.srlShimInterfacesReport(cNetinst)
 			C.srlShimNeighborsReport(cNetinst)
 			C.srlShimTopologyReport(cNetinst)
@@ -788,7 +780,20 @@ func (d *EigrpDaemon) StartIPCServer(ctx context.Context) {
 		log.Warn().Err(err).Msg("Failed to start IPC listener")
 		return
 	}
-	_ = os.Chmod(sockPath, 0666)
+	_ = os.Chmod(sockPath, 0660)
+	targetGid := -1
+	if grp, err := user.LookupGroup("srlinux"); err == nil {
+		if gid, err := strconv.Atoi(grp.Gid); err == nil {
+			targetGid = gid
+		}
+	} else if grp, err := user.LookupGroup("root"); err == nil {
+		if gid, err := strconv.Atoi(grp.Gid); err == nil {
+			targetGid = gid
+		}
+	}
+	if targetGid != -1 {
+		_ = os.Chown(sockPath, -1, targetGid)
+	}
 
 	go func() {
 		<-ctx.Done()
@@ -814,6 +819,7 @@ func (d *EigrpDaemon) StartIPCServer(ctx context.Context) {
 
 func (d *EigrpDaemon) handleIPC(conn net.Conn) {
 	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 	decoder := json.NewDecoder(conn)
 	var req IPCRequest
 	if err := decoder.Decode(&req); err != nil {
@@ -1002,6 +1008,11 @@ func main() {
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339})
 	log.Info().Str("version", version).Msg("Starting Nokia SR Linux EIGRP NDK Daemon...")
 
+	if v := os.Getenv("SRL_EIGRP_DISABLE_PKT_FD"); v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes") {
+		log.Info().Msg("AF_PACKET packet socket disabled by SRL_EIGRP_DISABLE_PKT_FD environment variable")
+		C.srlShimSetPktFdDisabled(C.bool(true))
+	}
+
 	C.srlShimInit()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1048,6 +1059,7 @@ func main() {
 		teleClient:   ndk.NewSdkMgrTelemetryServiceClient(conn),
 		notifClient:  ndk.NewSdkNotificationServiceClient(conn),
 		instances:    make(map[string]*EigrpInstance),
+		learnedVlans: make(map[string]uint16),
 		prevTeleKeys: make(map[string]struct{}),
 		policies:     make(map[string]*PolicyMetricConfig),
 		policyDefs:   make(map[string]*PolicyDef),
@@ -1233,6 +1245,12 @@ func (d *EigrpDaemon) HandleBfdNotification(bfd *ndk.BfdSessionNotification) {
 		statusStr = "init"
 	}
 
+	type nbrToClear struct {
+		netinst string
+		destIp  string
+	}
+	var toClear []nbrToClear
+
 	d.mu.Lock()
 	for _, inst := range d.instances {
 		if _, ok := inst.neighbors[destIp]; !ok {
@@ -1244,13 +1262,17 @@ func (d *EigrpDaemon) HandleBfdNotification(bfd *ndk.BfdSessionNotification) {
 		}
 		if status == ndk.BfdSessionStatus_BFD_SESSION_STATUS_DOWN || status == ndk.BfdSessionStatus_BFD_SESSION_STATUS_ADMIN_DOWN {
 			log.Warn().Str("neighbor", destIp).Str("netinst", inst.netinst).Msg("BFD down transition: tearing down neighbor immediately")
-			cNetinst := C.CString(inst.netinst)
-			cNbr := C.CString(destIp)
-			C.srlShimNeighborClear(cNetinst, cNbr)
-			C.free(unsafe.Pointer(cNetinst))
-			C.free(unsafe.Pointer(cNbr))
+			toClear = append(toClear, nbrToClear{netinst: inst.netinst, destIp: destIp})
 		}
 	}
 	d.mu.Unlock()
+
+	for _, item := range toClear {
+		cNetinst := C.CString(item.netinst)
+		cNbr := C.CString(item.destIp)
+		C.srlShimNeighborClear(cNetinst, cNbr)
+		C.free(unsafe.Pointer(cNetinst))
+		C.free(unsafe.Pointer(cNbr))
+	}
 	go d.CollectAndPublish(context.Background())
 }
