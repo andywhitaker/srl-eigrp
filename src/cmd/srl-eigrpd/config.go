@@ -604,23 +604,27 @@ type CandidateRoute struct {
 }
 
 type AddressFamilyConfig struct {
-	Name         string `json:"name"`
-	AdminState   string `json:"admin-state,omitempty"`
-	ExportPolicy string `json:"export-policy,omitempty"`
-	ImportPolicy string `json:"import-policy,omitempty"`
+	Name               string `json:"name"`
+	AdminState         string `json:"admin-state,omitempty"`
+	ExportPolicy       string `json:"export-policy,omitempty"`
+	ImportPolicy       string `json:"import-policy,omitempty"`
+	Preference         uint8  `json:"preference,omitempty"`
+	ExternalPreference uint8  `json:"external-preference,omitempty"`
 }
 
 type EigrpConfig struct {
-	AdminState       string                  `json:"admin-state"`
-	AutonomousSystem uint16                  `json:"autonomous-system"`
-	RouterId         string                  `json:"router-id"`
-	ExportPolicy     string                  `json:"export-policy"`
-	ImportPolicy     string                  `json:"import-policy"`
-	Variance         uint8                   `json:"variance"`
-	MaximumPaths     uint8                   `json:"maximum-paths"`
-	MaximumHops      uint8                   `json:"maximum-hops"`
-	RibScale         *uint8                  `json:"rib-scale,omitempty"`
-	WideMetrics      *bool                   `json:"wide-metrics,omitempty"`
+	AdminState         string                  `json:"admin-state"`
+	AutonomousSystem   uint16                  `json:"autonomous-system"`
+	RouterId           string                  `json:"router-id"`
+	ExportPolicy       string                  `json:"export-policy"`
+	ImportPolicy       string                  `json:"import-policy"`
+	Variance           uint8                   `json:"variance"`
+	MaximumPaths       uint8                   `json:"maximum-paths"`
+	MaximumHops        uint8                   `json:"maximum-hops"`
+	RibScale           *uint8                  `json:"rib-scale,omitempty"`
+	Preference         uint8                   `json:"preference,omitempty"`
+	ExternalPreference uint8                   `json:"external-preference,omitempty"`
+	WideMetrics        *bool                   `json:"wide-metrics,omitempty"`
 	GracefulRestart  *GracefulRestartConfig  `json:"graceful-restart,omitempty"`
 	Authentication   *AuthConfig             `json:"authentication,omitempty"`
 	Timers           *TimersConfig           `json:"timers,omitempty"`
@@ -749,9 +753,17 @@ func extractPolicyName(cfg *ndk.ConfigNotification) string {
 }
 
 func (d *EigrpDaemon) applyInterface(inst *EigrpInstance, ifcfg *InterfaceConfig) {
-	if ifcfg == nil || ifcfg.InterfaceName == "" {
+	if ifcfg == nil || ifcfg.InterfaceName == "" || inst == nil {
 		return
 	}
+	d.mu.RLock()
+	asn := inst.asn
+	admin := inst.adminState
+	d.mu.RUnlock()
+	if asn == 0 || admin == "disable" {
+		return
+	}
+
 	d.mu.RLock()
 	_, exists := inst.configuredInterfaces[ifcfg.InterfaceName]
 	if !exists {
@@ -894,6 +906,64 @@ func (d *EigrpDaemon) applyInterface(inst *EigrpInstance, ifcfg *InterfaceConfig
 			}
 		}
 	}
+
+	// Apply summary addresses
+	sa4 := ifcfg.GetAfiSummaryAddresses("ipv4-unicast")
+	for _, sa := range sa4 {
+		if sa.Prefix != "" {
+			cPfx := C.CString(sa.Prefix)
+			dist := sa.Distance
+			if dist == 0 {
+				dist = 5
+			}
+			C.srlShimSummaryAddressAdd(cNetinst, cIfname, cPfx, C.uint8_t(dist))
+			C.free(unsafe.Pointer(cPfx))
+		}
+	}
+	sa6 := ifcfg.GetAfiSummaryAddresses("ipv6-unicast")
+	for _, sa := range sa6 {
+		if sa.Prefix != "" {
+			cPfx := C.CString(sa.Prefix)
+			dist := sa.Distance
+			if dist == 0 {
+				dist = 5
+			}
+			C.srlShimSummaryAddressAdd(cNetinst, cIfname, cPfx, C.uint8_t(dist))
+			C.free(unsafe.Pointer(cPfx))
+		}
+	}
+}
+
+func (d *EigrpDaemon) applyStaticNeighbor(netinst string, sn *StaticNeighborConfig) {
+	if sn == nil || sn.IPAddress == "" {
+		return
+	}
+	if netinst == "" {
+		netinst = "default"
+	}
+	cNetinst := C.CString(netinst)
+	defer C.free(unsafe.Pointer(cNetinst))
+	cIp := C.CString(sn.IPAddress)
+	defer C.free(unsafe.Pointer(cIp))
+	cIf := C.CString(sn.Interface)
+	defer C.free(unsafe.Pointer(cIf))
+	C.srlShimStaticNeighborAdd(cNetinst, cIp, cIf)
+}
+
+func (d *EigrpDaemon) deleteStaticNeighbor(netinst string, ip string, ifname string) {
+	if ip == "" {
+		return
+	}
+	if netinst == "" {
+		netinst = "default"
+	}
+	cNetinst := C.CString(netinst)
+	defer C.free(unsafe.Pointer(cNetinst))
+	cIp := C.CString(ip)
+	defer C.free(unsafe.Pointer(cIp))
+	cIf := C.CString(ifname)
+	defer C.free(unsafe.Pointer(cIf))
+	C.srlShimStaticNeighborDel(cNetinst, cIp, cIf)
 }
 
 func (d *EigrpDaemon) applyInterfaceV6(inst *EigrpInstance, ifcfg *InterfaceConfig) {
@@ -1320,13 +1390,23 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			snIP = m[1]
 		}
 		if op == ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE {
+			var prevIf string
 			d.mu.Lock()
 			if snIP != "" {
+				if prev := inst.staticNeighbors[snIP]; prev != nil {
+					prevIf = prev.Interface
+				}
 				delete(inst.staticNeighbors, snIP)
 			} else {
+				for _, sn := range inst.staticNeighbors {
+					d.deleteStaticNeighbor(netinst, sn.IPAddress, sn.Interface)
+				}
 				inst.staticNeighbors = make(map[string]*StaticNeighborConfig)
 			}
 			d.mu.Unlock()
+			if snIP != "" {
+				d.deleteStaticNeighbor(netinst, snIP, prevIf)
+			}
 			log.Info().Str("netinst", netinst).Str("ip", snIP).Msg("Deleted static-neighbor via sub-path")
 			go d.CollectAndPublish(context.Background())
 			return
@@ -1340,6 +1420,7 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 				d.mu.Lock()
 				inst.staticNeighbors[sn.IPAddress] = &sn
 				d.mu.Unlock()
+				d.applyStaticNeighbor(netinst, &sn)
 				log.Info().Str("netinst", netinst).Interface("static_neighbor", sn).Msg("Updated static-neighbor via sub-path")
 				go d.CollectAndPublish(context.Background())
 			}
@@ -1501,13 +1582,75 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 				}
 			} else if strings.Contains(jsPath, ".authentication") {
 				var auth AuthConfig
-				if err := json.Unmarshal([]byte(jsonStr), &auth); err == nil {
+				if err := json.Unmarshal([]byte(jsonStr), &auth); err == nil && (auth.Mode != "" || auth.Keychain != "" || auth.AuthenticationKey != "" || auth.AdminState != "") {
 					inst.defaultIntf.SetAfiAuthentication(afName, &auth)
+				} else {
+					cur := inst.defaultIntf.GetAfiAuthentication(afName)
+					var newAuth AuthConfig
+					if cur != nil {
+						newAuth = *cur
+					}
+					if strings.Contains(jsPath, ".mode") {
+						var m string
+						if err := json.Unmarshal([]byte(jsonStr), &m); err == nil {
+							newAuth.Mode = m
+							inst.defaultIntf.SetAfiAuthentication(afName, &newAuth)
+						}
+					} else if strings.Contains(jsPath, ".keychain") {
+						var kc string
+						if err := json.Unmarshal([]byte(jsonStr), &kc); err == nil {
+							newAuth.Keychain = kc
+							inst.defaultIntf.SetAfiAuthentication(afName, &newAuth)
+						}
+					} else if strings.Contains(jsPath, ".authentication-key") || strings.Contains(jsPath, ".authentication_key") {
+						var k string
+						if err := json.Unmarshal([]byte(jsonStr), &k); err == nil {
+							newAuth.AuthenticationKey = k
+							inst.defaultIntf.SetAfiAuthentication(afName, &newAuth)
+						}
+					} else if strings.Contains(jsPath, ".admin-state") {
+						var s string
+						if err := json.Unmarshal([]byte(jsonStr), &s); err == nil {
+							newAuth.AdminState = s
+							inst.defaultIntf.SetAfiAuthentication(afName, &newAuth)
+						}
+					}
 				}
 			} else if strings.Contains(jsPath, ".bfd") {
 				var bfd BfdConfig
-				if err := json.Unmarshal([]byte(jsonStr), &bfd); err == nil {
+				if err := json.Unmarshal([]byte(jsonStr), &bfd); err == nil && (bfd.AdminState != "" || bfd.DesiredMinimumTxInterval != nil || bfd.RequiredMinimumReceive != nil || bfd.DetectionMultiplier != nil) {
 					inst.defaultIntf.SetAfiBfd(afName, &bfd)
+				} else {
+					cur := inst.defaultIntf.GetAfiBfd(afName)
+					var newBfd BfdConfig
+					if cur != nil {
+						newBfd = *cur
+					}
+					if strings.Contains(jsPath, ".admin-state") {
+						var s string
+						if err := json.Unmarshal([]byte(jsonStr), &s); err == nil {
+							newBfd.AdminState = s
+							inst.defaultIntf.SetAfiBfd(afName, &newBfd)
+						}
+					} else if strings.Contains(jsPath, ".desired-minimum-tx-interval") {
+						var v uint32
+						if err := json.Unmarshal([]byte(jsonStr), &v); err == nil {
+							newBfd.DesiredMinimumTxInterval = &v
+							inst.defaultIntf.SetAfiBfd(afName, &newBfd)
+						}
+					} else if strings.Contains(jsPath, ".required-minimum-receive") {
+						var v uint32
+						if err := json.Unmarshal([]byte(jsonStr), &v); err == nil {
+							newBfd.RequiredMinimumReceive = &v
+							inst.defaultIntf.SetAfiBfd(afName, &newBfd)
+						}
+					} else if strings.Contains(jsPath, ".detection-multiplier") {
+						var v uint8
+						if err := json.Unmarshal([]byte(jsonStr), &v); err == nil {
+							newBfd.DetectionMultiplier = &v
+							inst.defaultIntf.SetAfiBfd(afName, &newBfd)
+						}
+					}
 				}
 			}
 		}
@@ -1600,7 +1743,9 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			if err := json.Unmarshal([]byte(jsonStr), &s); err == nil && s != "" {
 				inst.defaultIntf.AdminState = s
 			} else {
-				var leaf struct { AdminState string `json:"admin-state"` }
+				var leaf struct {
+					AdminState string `json:"admin-state"`
+				}
 				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil && leaf.AdminState != "" {
 					inst.defaultIntf.AdminState = leaf.AdminState
 				}
@@ -1610,7 +1755,9 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			if err := json.Unmarshal([]byte(jsonStr), &pVal); err == nil {
 				inst.defaultIntf.Passive = pVal
 			} else {
-				var leaf struct { Passive bool `json:"passive"` }
+				var leaf struct {
+					Passive bool `json:"passive"`
+				}
 				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
 					inst.defaultIntf.Passive = leaf.Passive
 				}
@@ -1620,7 +1767,9 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			if err := json.Unmarshal([]byte(jsonStr), &dVal); err == nil {
 				inst.defaultIntf.Delay = &dVal
 			} else {
-				var leaf struct { Delay uint32 `json:"delay"` }
+				var leaf struct {
+					Delay uint32 `json:"delay"`
+				}
 				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
 					inst.defaultIntf.Delay = &leaf.Delay
 				}
@@ -1630,7 +1779,9 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			if err := json.Unmarshal([]byte(jsonStr), &bVal); err == nil {
 				inst.defaultIntf.Bandwidth = &bVal
 			} else {
-				var leaf struct { Bandwidth uint32 `json:"bandwidth"` }
+				var leaf struct {
+					Bandwidth uint32 `json:"bandwidth"`
+				}
 				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
 					inst.defaultIntf.Bandwidth = &leaf.Bandwidth
 				}
@@ -1640,7 +1791,9 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			if err := json.Unmarshal([]byte(jsonStr), &hVal); err == nil {
 				inst.defaultIntf.HelloInterval = hVal
 			} else {
-				var leaf struct { HelloInterval uint16 `json:"hello-interval"` }
+				var leaf struct {
+					HelloInterval uint16 `json:"hello-interval"`
+				}
 				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
 					inst.defaultIntf.HelloInterval = leaf.HelloInterval
 				}
@@ -1650,7 +1803,9 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			if err := json.Unmarshal([]byte(jsonStr), &hVal); err == nil {
 				inst.defaultIntf.HoldTime = hVal
 			} else {
-				var leaf struct { HoldTime uint16 `json:"hold-time"` }
+				var leaf struct {
+					HoldTime uint16 `json:"hold-time"`
+				}
 				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
 					inst.defaultIntf.HoldTime = leaf.HoldTime
 				}
@@ -1660,7 +1815,9 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			if err := json.Unmarshal([]byte(jsonStr), &shVal); err == nil {
 				inst.defaultIntf.SplitHorizon = &shVal
 			} else {
-				var leaf struct { SplitHorizon bool `json:"split-horizon"` }
+				var leaf struct {
+					SplitHorizon bool `json:"split-horizon"`
+				}
 				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
 					inst.defaultIntf.SplitHorizon = &leaf.SplitHorizon
 				}
@@ -1670,20 +1827,84 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			if err := json.Unmarshal([]byte(jsonStr), &nhsVal); err == nil {
 				inst.defaultIntf.NextHopSelf = &nhsVal
 			} else {
-				var leaf struct { NextHopSelf bool `json:"next-hop-self"` }
+				var leaf struct {
+					NextHopSelf bool `json:"next-hop-self"`
+				}
 				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
 					inst.defaultIntf.NextHopSelf = &leaf.NextHopSelf
 				}
 			}
 		} else if strings.Contains(jsPath, ".authentication") {
 			var authCfg AuthConfig
-			if err := json.Unmarshal([]byte(jsonStr), &authCfg); err == nil {
+			if err := json.Unmarshal([]byte(jsonStr), &authCfg); err == nil && (authCfg.Mode != "" || authCfg.Keychain != "" || authCfg.AuthenticationKey != "" || authCfg.AdminState != "") {
 				inst.defaultIntf.Authentication = &authCfg
+			} else {
+				cur := inst.defaultIntf.Authentication
+				var newAuth AuthConfig
+				if cur != nil {
+					newAuth = *cur
+				}
+				if strings.Contains(jsPath, ".mode") {
+					var m string
+					if err := json.Unmarshal([]byte(jsonStr), &m); err == nil {
+						newAuth.Mode = m
+						inst.defaultIntf.Authentication = &newAuth
+					}
+				} else if strings.Contains(jsPath, ".keychain") {
+					var kc string
+					if err := json.Unmarshal([]byte(jsonStr), &kc); err == nil {
+						newAuth.Keychain = kc
+						inst.defaultIntf.Authentication = &newAuth
+					}
+				} else if strings.Contains(jsPath, ".authentication-key") || strings.Contains(jsPath, ".authentication_key") {
+					var k string
+					if err := json.Unmarshal([]byte(jsonStr), &k); err == nil {
+						newAuth.AuthenticationKey = k
+						inst.defaultIntf.Authentication = &newAuth
+					}
+				} else if strings.Contains(jsPath, ".admin-state") {
+					var s string
+					if err := json.Unmarshal([]byte(jsonStr), &s); err == nil {
+						newAuth.AdminState = s
+						inst.defaultIntf.Authentication = &newAuth
+					}
+				}
 			}
 		} else if strings.Contains(jsPath, ".bfd") {
 			var bfdCfg BfdConfig
-			if err := json.Unmarshal([]byte(jsonStr), &bfdCfg); err == nil {
+			if err := json.Unmarshal([]byte(jsonStr), &bfdCfg); err == nil && (bfdCfg.AdminState != "" || bfdCfg.DesiredMinimumTxInterval != nil || bfdCfg.RequiredMinimumReceive != nil || bfdCfg.DetectionMultiplier != nil) {
 				inst.defaultIntf.Bfd = &bfdCfg
+			} else {
+				cur := inst.defaultIntf.Bfd
+				var newBfd BfdConfig
+				if cur != nil {
+					newBfd = *cur
+				}
+				if strings.Contains(jsPath, ".admin-state") {
+					var s string
+					if err := json.Unmarshal([]byte(jsonStr), &s); err == nil {
+						newBfd.AdminState = s
+						inst.defaultIntf.Bfd = &newBfd
+					}
+				} else if strings.Contains(jsPath, ".desired-minimum-tx-interval") {
+					var v uint32
+					if err := json.Unmarshal([]byte(jsonStr), &v); err == nil {
+						newBfd.DesiredMinimumTxInterval = &v
+						inst.defaultIntf.Bfd = &newBfd
+					}
+				} else if strings.Contains(jsPath, ".required-minimum-receive") {
+					var v uint32
+					if err := json.Unmarshal([]byte(jsonStr), &v); err == nil {
+						newBfd.RequiredMinimumReceive = &v
+						inst.defaultIntf.Bfd = &newBfd
+					}
+				} else if strings.Contains(jsPath, ".detection-multiplier") {
+					var v uint8
+					if err := json.Unmarshal([]byte(jsonStr), &v); err == nil {
+						newBfd.DetectionMultiplier = &v
+						inst.defaultIntf.Bfd = &newBfd
+					}
+				}
 			}
 		} else {
 			var defCfg DefaultInterfaceConfig
@@ -1754,52 +1975,91 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 
 	// 4. Handle sub-path variance notification
 	if strings.Contains(jsPath, ".protocols.eigrp.variance") {
-		var v uint8
-		if err := json.Unmarshal([]byte(jsonStr), &v); err == nil && v > 0 {
-			cNetinst := C.CString(netinst)
-			C.srlShimVarianceUpdate(cNetinst, C.uint8_t(v))
-			C.free(unsafe.Pointer(cNetinst))
-			inst := d.GetOrCreateInstance(netinst)
-			d.mu.Lock()
-			inst.variance = v
-			d.mu.Unlock()
-			log.Info().Str("netinst", netinst).Uint8("variance", v).Msg("Updated EIGRP variance via sub-path notification")
-			go d.CollectAndPublish(context.Background())
+		v := uint8(1)
+		if op == ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE {
+			v = 1
+		} else {
+			if err := json.Unmarshal([]byte(jsonStr), &v); err != nil || v == 0 {
+				var leaf struct {
+					Variance uint8 `json:"variance"`
+				}
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil && leaf.Variance > 0 {
+					v = leaf.Variance
+				} else {
+					v = 1
+				}
+			}
 		}
+		cNetinst := C.CString(netinst)
+		C.srlShimVarianceUpdate(cNetinst, C.uint8_t(v))
+		C.free(unsafe.Pointer(cNetinst))
+		inst := d.GetOrCreateInstance(netinst)
+		d.mu.Lock()
+		inst.variance = v
+		d.mu.Unlock()
+		log.Info().Str("netinst", netinst).Uint8("variance", v).Msg("Updated EIGRP variance via sub-path notification")
+		if v > 1 {
+			log.Info().Str("netinst", netinst).Uint8("variance", v).Msg("EIGRP variance > 1 configured: feasible successor routes within variance window are installed into FIB as uniform ECMP multipath due to NDK schema boundaries")
+		}
+		go d.CollectAndPublish(context.Background())
 		return
 	}
 
 	// 5. Handle sub-path maximum-paths notification
 	if strings.Contains(jsPath, ".protocols.eigrp.maximum-paths") {
-		var mp uint8
-		if err := json.Unmarshal([]byte(jsonStr), &mp); err == nil && mp > 0 {
-			cNetinst := C.CString(netinst)
-			C.srlShimMaxPathsUpdate(cNetinst, C.uint8_t(mp))
-			C.free(unsafe.Pointer(cNetinst))
-			inst := d.GetOrCreateInstance(netinst)
-			d.mu.Lock()
-			inst.maximumPaths = mp
-			d.mu.Unlock()
-			log.Info().Str("netinst", netinst).Uint8("maximum_paths", mp).Msg("Updated EIGRP maximum-paths via sub-path notification")
-			go d.CollectAndPublish(context.Background())
+		mp := uint8(4)
+		if op == ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE {
+			mp = 4
+		} else {
+			if err := json.Unmarshal([]byte(jsonStr), &mp); err != nil || mp == 0 {
+				var leaf struct {
+					MaximumPaths uint8 `json:"maximum-paths"`
+				}
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil && leaf.MaximumPaths > 0 {
+					mp = leaf.MaximumPaths
+				} else {
+					mp = 4
+				}
+			}
 		}
+		cNetinst := C.CString(netinst)
+		C.srlShimMaxPathsUpdate(cNetinst, C.uint8_t(mp))
+		C.free(unsafe.Pointer(cNetinst))
+		inst := d.GetOrCreateInstance(netinst)
+		d.mu.Lock()
+		inst.maximumPaths = mp
+		d.mu.Unlock()
+		log.Info().Str("netinst", netinst).Uint8("maximum_paths", mp).Msg("Updated EIGRP maximum-paths via sub-path notification")
+		go d.CollectAndPublish(context.Background())
 		return
 	}
 
 	// 6. Handle sub-path maximum-hops notification
 	if strings.Contains(jsPath, ".protocols.eigrp.maximum-hops") {
-		var mh uint8
-		if err := json.Unmarshal([]byte(jsonStr), &mh); err == nil && mh > 0 {
-			cNetinst := C.CString(netinst)
-			C.srlShimMaxHopsUpdate(cNetinst, C.uint8_t(mh))
-			C.free(unsafe.Pointer(cNetinst))
-			inst := d.GetOrCreateInstance(netinst)
-			d.mu.Lock()
-			inst.maximumHops = mh
-			d.mu.Unlock()
-			log.Info().Str("netinst", netinst).Uint8("maximum_hops", mh).Msg("Updated EIGRP maximum-hops via sub-path notification")
-			go d.CollectAndPublish(context.Background())
+		mh := uint8(100)
+		if op == ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE {
+			mh = 100
+		} else {
+			if err := json.Unmarshal([]byte(jsonStr), &mh); err != nil || mh == 0 {
+				var leaf struct {
+					MaximumHops uint8 `json:"maximum-hops"`
+				}
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil && leaf.MaximumHops > 0 {
+					mh = leaf.MaximumHops
+				} else {
+					mh = 100
+				}
+			}
 		}
+		cNetinst := C.CString(netinst)
+		C.srlShimMaxHopsUpdate(cNetinst, C.uint8_t(mh))
+		C.free(unsafe.Pointer(cNetinst))
+		inst := d.GetOrCreateInstance(netinst)
+		d.mu.Lock()
+		inst.maximumHops = mh
+		d.mu.Unlock()
+		log.Info().Str("netinst", netinst).Uint8("maximum_hops", mh).Msg("Updated EIGRP maximum-hops via sub-path notification")
+		go d.CollectAndPublish(context.Background())
 		return
 	}
 
@@ -1868,6 +2128,68 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 		return
 	}
 
+	// 6d. Handle sub-path preference notification
+	if strings.Contains(jsPath, ".protocols.eigrp.preference") && !strings.Contains(jsPath, ".address-family") {
+		var pref uint8 = 90
+		if op != ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE {
+			if err := json.Unmarshal([]byte(jsonStr), &pref); err != nil || pref == 0 {
+				var leaf struct {
+					Preference uint8 `json:"preference"`
+				}
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil && leaf.Preference > 0 {
+					pref = leaf.Preference
+				} else {
+					pref = 90
+				}
+			}
+		}
+		inst := d.GetOrCreateInstance(netinst)
+		d.mu.Lock()
+		inst.preference = pref
+		extPref := inst.externalPreference
+		if extPref == 0 {
+			extPref = 170
+		}
+		d.mu.Unlock()
+		cNetinst := C.CString(netinst)
+		C.srlShimDistanceUpdate(cNetinst, C.uint8_t(pref), C.uint8_t(extPref))
+		C.free(unsafe.Pointer(cNetinst))
+		log.Info().Str("netinst", netinst).Uint8("preference", pref).Msg("Updated EIGRP preference via sub-path notification")
+		go d.CollectAndPublish(context.Background())
+		return
+	}
+
+	// 6e. Handle sub-path external-preference notification
+	if (strings.Contains(jsPath, ".protocols.eigrp.external-preference") || strings.Contains(jsPath, ".protocols.eigrp.external_preference")) && !strings.Contains(jsPath, ".address-family") {
+		var extPref uint8 = 170
+		if op != ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE {
+			if err := json.Unmarshal([]byte(jsonStr), &extPref); err != nil || extPref == 0 {
+				var leaf struct {
+					ExternalPreference uint8 `json:"external-preference"`
+				}
+				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil && leaf.ExternalPreference > 0 {
+					extPref = leaf.ExternalPreference
+				} else {
+					extPref = 170
+				}
+			}
+		}
+		inst := d.GetOrCreateInstance(netinst)
+		d.mu.Lock()
+		inst.externalPreference = extPref
+		intPref := inst.preference
+		if intPref == 0 {
+			intPref = 90
+		}
+		d.mu.Unlock()
+		cNetinst := C.CString(netinst)
+		C.srlShimDistanceUpdate(cNetinst, C.uint8_t(intPref), C.uint8_t(extPref))
+		C.free(unsafe.Pointer(cNetinst))
+		log.Info().Str("netinst", netinst).Uint8("external_preference", extPref).Msg("Updated EIGRP external-preference via sub-path notification")
+		go d.CollectAndPublish(context.Background())
+		return
+	}
+
 	// 7. Handle sub-path metrics notification
 	if strings.Contains(jsPath, ".protocols.eigrp.metrics") || strings.Contains(jsPath, ".protocols.eigrp.metric-weights") {
 		var m MetricsConfig
@@ -1912,6 +2234,20 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			if strings.Contains(jsPath, ".summary-address") {
 				pfx := extractSummaryPrefix(cfg)
 				ic.DeleteAfiSummaryAddress(afName, pfx)
+				d.mu.Unlock()
+				if pfx != "" {
+					cNetinst := C.CString(netinst)
+					cIfname := C.CString(ifName)
+					cPfx := C.CString(pfx)
+					C.srlShimSummaryAddressDelete(cNetinst, cIfname, cPfx)
+					C.free(unsafe.Pointer(cNetinst))
+					C.free(unsafe.Pointer(cIfname))
+					C.free(unsafe.Pointer(cPfx))
+				}
+				d.applyInterface(inst, ic)
+				log.Info().Str("netinst", netinst).Str("interface", ifName).Str("af", afName).Str("prefix", pfx).Msg("Deleted summary-address on interface AF")
+				go d.CollectAndPublish(context.Background())
+				return
 			} else if strings.Contains(jsPath, ".passive") {
 				ic.SetAfiPassive(afName, nil)
 			} else if strings.Contains(jsPath, ".hello-interval") {
@@ -2035,13 +2371,75 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			}
 		} else if strings.Contains(jsPath, ".authentication") {
 			var auth AuthConfig
-			if err := json.Unmarshal([]byte(jsonStr), &auth); err == nil {
+			if err := json.Unmarshal([]byte(jsonStr), &auth); err == nil && (auth.Mode != "" || auth.Keychain != "" || auth.AuthenticationKey != "" || auth.AdminState != "") {
 				ic.SetAfiAuthentication(afName, &auth)
+			} else {
+				cur := ic.GetAfiAuthentication(afName, inst.defaultIntf, inst.authentication)
+				var newAuth AuthConfig
+				if cur != nil {
+					newAuth = *cur
+				}
+				if strings.Contains(jsPath, ".mode") {
+					var m string
+					if err := json.Unmarshal([]byte(jsonStr), &m); err == nil {
+						newAuth.Mode = m
+						ic.SetAfiAuthentication(afName, &newAuth)
+					}
+				} else if strings.Contains(jsPath, ".keychain") {
+					var kc string
+					if err := json.Unmarshal([]byte(jsonStr), &kc); err == nil {
+						newAuth.Keychain = kc
+						ic.SetAfiAuthentication(afName, &newAuth)
+					}
+				} else if strings.Contains(jsPath, ".authentication-key") || strings.Contains(jsPath, ".authentication_key") {
+					var k string
+					if err := json.Unmarshal([]byte(jsonStr), &k); err == nil {
+						newAuth.AuthenticationKey = k
+						ic.SetAfiAuthentication(afName, &newAuth)
+					}
+				} else if strings.Contains(jsPath, ".admin-state") {
+					var s string
+					if err := json.Unmarshal([]byte(jsonStr), &s); err == nil {
+						newAuth.AdminState = s
+						ic.SetAfiAuthentication(afName, &newAuth)
+					}
+				}
 			}
 		} else if strings.Contains(jsPath, ".bfd") {
 			var bfd BfdConfig
-			if err := json.Unmarshal([]byte(jsonStr), &bfd); err == nil {
+			if err := json.Unmarshal([]byte(jsonStr), &bfd); err == nil && (bfd.AdminState != "" || bfd.DesiredMinimumTxInterval != nil || bfd.RequiredMinimumReceive != nil || bfd.DetectionMultiplier != nil) {
 				ic.SetAfiBfd(afName, &bfd)
+			} else {
+				cur := ic.GetAfiBfd(afName, inst.defaultIntf)
+				var newBfd BfdConfig
+				if cur != nil {
+					newBfd = *cur
+				}
+				if strings.Contains(jsPath, ".admin-state") {
+					var s string
+					if err := json.Unmarshal([]byte(jsonStr), &s); err == nil {
+						newBfd.AdminState = s
+						ic.SetAfiBfd(afName, &newBfd)
+					}
+				} else if strings.Contains(jsPath, ".desired-minimum-tx-interval") {
+					var v uint32
+					if err := json.Unmarshal([]byte(jsonStr), &v); err == nil {
+						newBfd.DesiredMinimumTxInterval = &v
+						ic.SetAfiBfd(afName, &newBfd)
+					}
+				} else if strings.Contains(jsPath, ".required-minimum-receive") {
+					var v uint32
+					if err := json.Unmarshal([]byte(jsonStr), &v); err == nil {
+						newBfd.RequiredMinimumReceive = &v
+						ic.SetAfiBfd(afName, &newBfd)
+					}
+				} else if strings.Contains(jsPath, ".detection-multiplier") {
+					var v uint8
+					if err := json.Unmarshal([]byte(jsonStr), &v); err == nil {
+						newBfd.DetectionMultiplier = &v
+						ic.SetAfiBfd(afName, &newBfd)
+					}
+				}
 			}
 		} else {
 			var afCfg InterfaceAddressFamilyConfig
@@ -2103,7 +2501,9 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			if strings.Contains(jsPath, ".summary-address") {
 				pfx := extractSummaryPrefix(cfg)
 				d.mu.Lock()
-				if ic, exists := inst.configuredInterfaces[ifName]; exists {
+				var ic *InterfaceConfig
+				if c, exists := inst.configuredInterfaces[ifName]; exists {
+					ic = c
 					var updatedSA []SummaryAddressConfig
 					if pfx != "" {
 						for _, sa := range ic.SummaryAddress {
@@ -2115,6 +2515,14 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 					ic.SummaryAddress = updatedSA
 				}
 				d.mu.Unlock()
+				if pfx != "" {
+					cPfx := C.CString(pfx)
+					C.srlShimSummaryAddressDelete(cNetinst, cIfname, cPfx)
+					C.free(unsafe.Pointer(cPfx))
+				}
+				if ic != nil {
+					d.applyInterface(inst, ic)
+				}
 				log.Info().Str("netinst", netinst).Str("interface", ifName).Str("prefix", pfx).Msg("Deleted summary-address on interface")
 				go d.CollectAndPublish(context.Background())
 				return
@@ -2307,7 +2715,9 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			if err := json.Unmarshal([]byte(jsonStr), &s); err == nil && s != "" {
 				ic.AdminState = s
 			} else {
-				var leaf struct { AdminState string `json:"admin-state"` }
+				var leaf struct {
+					AdminState string `json:"admin-state"`
+				}
 				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil && leaf.AdminState != "" {
 					ic.AdminState = leaf.AdminState
 				}
@@ -2317,7 +2727,9 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			if err := json.Unmarshal([]byte(jsonStr), &dVal); err == nil {
 				ic.Delay = &dVal
 			} else {
-				var leaf struct { Delay uint32 `json:"delay"` }
+				var leaf struct {
+					Delay uint32 `json:"delay"`
+				}
 				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
 					ic.Delay = &leaf.Delay
 				}
@@ -2327,7 +2739,9 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			if err := json.Unmarshal([]byte(jsonStr), &bVal); err == nil {
 				ic.Bandwidth = &bVal
 			} else {
-				var leaf struct { Bandwidth uint32 `json:"bandwidth"` }
+				var leaf struct {
+					Bandwidth uint32 `json:"bandwidth"`
+				}
 				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
 					ic.Bandwidth = &leaf.Bandwidth
 				}
@@ -2337,7 +2751,9 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			if err := json.Unmarshal([]byte(jsonStr), &pVal); err == nil {
 				ic.Passive = &pVal
 			} else {
-				var leaf struct { Passive bool `json:"passive"` }
+				var leaf struct {
+					Passive bool `json:"passive"`
+				}
 				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
 					ic.Passive = &leaf.Passive
 				}
@@ -2347,7 +2763,9 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			if err := json.Unmarshal([]byte(jsonStr), &hVal); err == nil {
 				ic.HelloInterval = &hVal
 			} else {
-				var leaf struct { HelloInterval uint16 `json:"hello-interval"` }
+				var leaf struct {
+					HelloInterval uint16 `json:"hello-interval"`
+				}
 				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
 					ic.HelloInterval = &leaf.HelloInterval
 				}
@@ -2357,7 +2775,9 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			if err := json.Unmarshal([]byte(jsonStr), &hVal); err == nil {
 				ic.HoldTime = &hVal
 			} else {
-				var leaf struct { HoldTime uint16 `json:"hold-time"` }
+				var leaf struct {
+					HoldTime uint16 `json:"hold-time"`
+				}
 				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
 					ic.HoldTime = &leaf.HoldTime
 				}
@@ -2367,7 +2787,9 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			if err := json.Unmarshal([]byte(jsonStr), &shVal); err == nil {
 				ic.SplitHorizon = &shVal
 			} else {
-				var leaf struct { SplitHorizon bool `json:"split-horizon"` }
+				var leaf struct {
+					SplitHorizon bool `json:"split-horizon"`
+				}
 				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
 					ic.SplitHorizon = &leaf.SplitHorizon
 				}
@@ -2377,20 +2799,84 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			if err := json.Unmarshal([]byte(jsonStr), &nhsVal); err == nil {
 				ic.NextHopSelf = &nhsVal
 			} else {
-				var leaf struct { NextHopSelf bool `json:"next-hop-self"` }
+				var leaf struct {
+					NextHopSelf bool `json:"next-hop-self"`
+				}
 				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil {
 					ic.NextHopSelf = &leaf.NextHopSelf
 				}
 			}
 		} else if strings.Contains(jsPath, ".authentication") {
 			var authCfg AuthConfig
-			if err := json.Unmarshal([]byte(jsonStr), &authCfg); err == nil {
+			if err := json.Unmarshal([]byte(jsonStr), &authCfg); err == nil && (authCfg.Mode != "" || authCfg.Keychain != "" || authCfg.AuthenticationKey != "" || authCfg.AdminState != "") {
 				ic.Authentication = &authCfg
+			} else {
+				cur := ic.Authentication
+				var newAuth AuthConfig
+				if cur != nil {
+					newAuth = *cur
+				}
+				if strings.Contains(jsPath, ".mode") {
+					var m string
+					if err := json.Unmarshal([]byte(jsonStr), &m); err == nil {
+						newAuth.Mode = m
+						ic.Authentication = &newAuth
+					}
+				} else if strings.Contains(jsPath, ".keychain") {
+					var kc string
+					if err := json.Unmarshal([]byte(jsonStr), &kc); err == nil {
+						newAuth.Keychain = kc
+						ic.Authentication = &newAuth
+					}
+				} else if strings.Contains(jsPath, ".authentication-key") || strings.Contains(jsPath, ".authentication_key") {
+					var k string
+					if err := json.Unmarshal([]byte(jsonStr), &k); err == nil {
+						newAuth.AuthenticationKey = k
+						ic.Authentication = &newAuth
+					}
+				} else if strings.Contains(jsPath, ".admin-state") {
+					var s string
+					if err := json.Unmarshal([]byte(jsonStr), &s); err == nil {
+						newAuth.AdminState = s
+						ic.Authentication = &newAuth
+					}
+				}
 			}
 		} else if strings.Contains(jsPath, ".bfd") {
 			var bfdCfg BfdConfig
-			if err := json.Unmarshal([]byte(jsonStr), &bfdCfg); err == nil {
+			if err := json.Unmarshal([]byte(jsonStr), &bfdCfg); err == nil && (bfdCfg.AdminState != "" || bfdCfg.DesiredMinimumTxInterval != nil || bfdCfg.RequiredMinimumReceive != nil || bfdCfg.DetectionMultiplier != nil) {
 				ic.Bfd = &bfdCfg
+			} else {
+				cur := ic.Bfd
+				var newBfd BfdConfig
+				if cur != nil {
+					newBfd = *cur
+				}
+				if strings.Contains(jsPath, ".admin-state") {
+					var s string
+					if err := json.Unmarshal([]byte(jsonStr), &s); err == nil {
+						newBfd.AdminState = s
+						ic.Bfd = &newBfd
+					}
+				} else if strings.Contains(jsPath, ".desired-minimum-tx-interval") {
+					var v uint32
+					if err := json.Unmarshal([]byte(jsonStr), &v); err == nil {
+						newBfd.DesiredMinimumTxInterval = &v
+						ic.Bfd = &newBfd
+					}
+				} else if strings.Contains(jsPath, ".required-minimum-receive") {
+					var v uint32
+					if err := json.Unmarshal([]byte(jsonStr), &v); err == nil {
+						newBfd.RequiredMinimumReceive = &v
+						ic.Bfd = &newBfd
+					}
+				} else if strings.Contains(jsPath, ".detection-multiplier") {
+					var v uint8
+					if err := json.Unmarshal([]byte(jsonStr), &v); err == nil {
+						newBfd.DetectionMultiplier = &v
+						ic.Bfd = &newBfd
+					}
+				}
 			}
 		} else {
 			var parsed InterfaceConfig
@@ -2447,6 +2933,30 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 				d.mu.Lock()
 				inst.SetAfiImportPolicy(afName, "")
 				d.mu.Unlock()
+			} else if strings.Contains(jsPath, ".preference") {
+				d.mu.Lock()
+				inst.SetAfiPreference(afName, 0)
+				intPref := inst.preference
+				if intPref == 0 {
+					intPref = 90
+				}
+				extPref := inst.GetAfiExternalPreference(afName)
+				d.mu.Unlock()
+				cAfName := C.CString(afName)
+				C.srlShimDistanceUpdateAfi(cNetinst, cAfName, C.uint8_t(intPref), C.uint8_t(extPref))
+				C.free(unsafe.Pointer(cAfName))
+			} else if strings.Contains(jsPath, ".external-preference") || strings.Contains(jsPath, ".external_preference") {
+				d.mu.Lock()
+				inst.SetAfiExternalPreference(afName, 0)
+				extPref := inst.externalPreference
+				if extPref == 0 {
+					extPref = 170
+				}
+				intPref := inst.GetAfiPreference(afName)
+				d.mu.Unlock()
+				cAfName := C.CString(afName)
+				C.srlShimDistanceUpdateAfi(cNetinst, cAfName, C.uint8_t(intPref), C.uint8_t(extPref))
+				C.free(unsafe.Pointer(cAfName))
 			} else if strings.Contains(jsPath, ".admin-state") {
 				d.mu.Lock()
 				inst.SetAfiAdminState(afName, "enable")
@@ -2493,10 +3003,43 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 		}
 
 		var afCfg AddressFamilyConfig
-		if err := json.Unmarshal([]byte(jsonStr), &afCfg); err == nil {
-			if afCfg.Name == "" {
-				afCfg.Name = afName
+		if err := json.Unmarshal([]byte(jsonStr), &afCfg); err != nil {
+			if strings.Contains(jsPath, ".admin-state") {
+				var s string
+				if err2 := json.Unmarshal([]byte(jsonStr), &s); err2 == nil {
+					afCfg.Name = afName
+					afCfg.AdminState = s
+				}
+			} else if strings.Contains(jsPath, ".preference") {
+				var p uint8
+				if err2 := json.Unmarshal([]byte(jsonStr), &p); err2 == nil {
+					afCfg.Name = afName
+					afCfg.Preference = p
+				}
+			} else if strings.Contains(jsPath, ".external-preference") || strings.Contains(jsPath, ".external_preference") {
+				var p uint8
+				if err2 := json.Unmarshal([]byte(jsonStr), &p); err2 == nil {
+					afCfg.Name = afName
+					afCfg.ExternalPreference = p
+				}
+			} else if strings.Contains(jsPath, ".export-policy") {
+				var s string
+				if err2 := json.Unmarshal([]byte(jsonStr), &s); err2 == nil {
+					afCfg.Name = afName
+					afCfg.ExportPolicy = s
+				}
+			} else if strings.Contains(jsPath, ".import-policy") {
+				var s string
+				if err2 := json.Unmarshal([]byte(jsonStr), &s); err2 == nil {
+					afCfg.Name = afName
+					afCfg.ImportPolicy = s
+				}
 			}
+		}
+		if afCfg.Name == "" {
+			afCfg.Name = afName
+		}
+		if afCfg.AdminState != "" || afCfg.ExportPolicy != "" || afCfg.ImportPolicy != "" || afCfg.Preference > 0 || afCfg.ExternalPreference > 0 {
 			d.mu.Lock()
 			if afCfg.AdminState != "" {
 				inst.SetAfiAdminState(afCfg.Name, afCfg.AdminState)
@@ -2507,7 +3050,34 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			if afCfg.ImportPolicy != "" {
 				inst.SetAfiImportPolicy(afCfg.Name, afCfg.ImportPolicy)
 			}
+			intPref := uint8(0)
+			extPref := uint8(0)
+			shouldUpdateDist := false
+			if afCfg.Preference > 0 || afCfg.ExternalPreference > 0 {
+				inst.SetAfiPreferences(afCfg.Name, afCfg.Preference, afCfg.ExternalPreference)
+				intPref = afCfg.Preference
+				if intPref == 0 {
+					intPref = inst.preference
+					if intPref == 0 {
+						intPref = 90
+					}
+				}
+				extPref = afCfg.ExternalPreference
+				if extPref == 0 {
+					extPref = inst.externalPreference
+					if extPref == 0 {
+						extPref = 170
+					}
+				}
+				shouldUpdateDist = true
+			}
 			d.mu.Unlock()
+
+			if shouldUpdateDist {
+				cAfName := C.CString(afCfg.Name)
+				C.srlShimDistanceUpdateAfi(cNetinst, cAfName, C.uint8_t(intPref), C.uint8_t(extPref))
+				C.free(unsafe.Pointer(cAfName))
+			}
 
 			if afCfg.AdminState == "disable" {
 				if afCfg.Name == "ipv6-unicast" {
@@ -2570,6 +3140,28 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 					for _, ic := range allIntfs {
 						d.applyInterface(inst, ic)
 					}
+				}
+			} else if strings.Contains(jsPath, ".preference") {
+				var pref uint8
+				if err := json.Unmarshal([]byte(jsonStr), &pref); err == nil {
+					d.mu.Lock()
+					inst.SetAfiPreference(afName, pref)
+					extPref := inst.GetAfiExternalPreference(afName)
+					d.mu.Unlock()
+					cAfName := C.CString(afName)
+					C.srlShimDistanceUpdateAfi(cNetinst, cAfName, C.uint8_t(pref), C.uint8_t(extPref))
+					C.free(unsafe.Pointer(cAfName))
+				}
+			} else if strings.Contains(jsPath, ".external-preference") || strings.Contains(jsPath, ".external_preference") {
+				var extPref uint8
+				if err := json.Unmarshal([]byte(jsonStr), &extPref); err == nil {
+					d.mu.Lock()
+					inst.SetAfiExternalPreference(afName, extPref)
+					intPref := inst.GetAfiPreference(afName)
+					d.mu.Unlock()
+					cAfName := C.CString(afName)
+					C.srlShimDistanceUpdateAfi(cNetinst, cAfName, C.uint8_t(intPref), C.uint8_t(extPref))
+					C.free(unsafe.Pointer(cAfName))
 				}
 			}
 		}
@@ -2649,18 +3241,28 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 	}
 	if conf.Variance > 0 {
 		inst.variance = conf.Variance
-	} else if inst.variance == 0 {
+	} else {
 		inst.variance = 1
 	}
 	if conf.MaximumPaths > 0 {
 		inst.maximumPaths = conf.MaximumPaths
-	} else if inst.maximumPaths == 0 {
+	} else {
 		inst.maximumPaths = 4
 	}
 	if conf.MaximumHops > 0 {
 		inst.maximumHops = conf.MaximumHops
-	} else if inst.maximumHops == 0 {
+	} else {
 		inst.maximumHops = 100
+	}
+	if conf.Preference > 0 {
+		inst.preference = conf.Preference
+	} else {
+		inst.preference = 90
+	}
+	if conf.ExternalPreference > 0 {
+		inst.externalPreference = conf.ExternalPreference
+	} else {
+		inst.externalPreference = 170
 	}
 	if conf.Timers != nil {
 		inst.timers = conf.Timers
@@ -2815,6 +3417,7 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 				if sn.IPAddress != "" {
 					cfgCopy := sn
 					inst.staticNeighbors[sn.IPAddress] = &cfgCopy
+					d.applyStaticNeighbor(netinst, &cfgCopy)
 				}
 			}
 			d.mu.Unlock()
@@ -2870,17 +3473,52 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 		// Apply redistribution policy
 		d.applyRedistribute(netinst, inst.exportPolicy)
 
-		if conf.Variance > 0 {
-			C.srlShimVarianceUpdate(cNetinst, C.uint8_t(conf.Variance))
+		varVar := conf.Variance
+		if varVar == 0 {
+			varVar = 1
 		}
-		if conf.MaximumPaths > 0 {
-			C.srlShimMaxPathsUpdate(cNetinst, C.uint8_t(conf.MaximumPaths))
+		C.srlShimVarianceUpdate(cNetinst, C.uint8_t(varVar))
+		if varVar > 1 {
+			log.Info().Str("netinst", netinst).Uint8("variance", varVar).Msg("EIGRP variance > 1 configured: feasible successor routes within variance window are installed into FIB as uniform ECMP multipath due to NDK schema boundaries")
 		}
-		if conf.MaximumHops > 0 {
-			C.srlShimMaxHopsUpdate(cNetinst, C.uint8_t(conf.MaximumHops))
+
+		maxPaths := conf.MaximumPaths
+		if maxPaths == 0 {
+			maxPaths = 4
 		}
+		C.srlShimMaxPathsUpdate(cNetinst, C.uint8_t(maxPaths))
+
+		maxHops := conf.MaximumHops
+		if maxHops == 0 {
+			maxHops = 100
+		}
+		C.srlShimMaxHopsUpdate(cNetinst, C.uint8_t(maxHops))
 		if conf.Timers != nil {
 			d.applyTimers(netinst, conf.Timers)
+		}
+
+		// Apply distance / preference
+		intDist := inst.preference
+		if intDist == 0 {
+			intDist = 90
+		}
+		extDist := inst.externalPreference
+		if extDist == 0 {
+			extDist = 170
+		}
+		C.srlShimDistanceUpdate(cNetinst, C.uint8_t(intDist), C.uint8_t(extDist))
+		for _, af := range inst.addressFamily {
+			afInt := af.Preference
+			if afInt == 0 {
+				afInt = intDist
+			}
+			afExt := af.ExternalPreference
+			if afExt == 0 {
+				afExt = extDist
+			}
+			cAfName := C.CString(af.Name)
+			C.srlShimDistanceUpdateAfi(cNetinst, cAfName, C.uint8_t(afInt), C.uint8_t(afExt))
+			C.free(unsafe.Pointer(cAfName))
 		}
 
 		go d.CollectAndPublish(context.Background())
@@ -2980,7 +3618,84 @@ func normalizeRedistProtocol(routeType, routeOwner string, isV6 bool) string {
 	return "static"
 }
 
-func getCandidateRoutes(netinst string, afi string) ([]CandidateRoute, error) {
+type candidateRouteCacheEntry struct {
+	routes    []CandidateRoute
+	timestamp time.Time
+	dirty     bool
+}
+
+const candidateRouteCacheTTL = 3 * time.Second
+
+func (d *EigrpDaemon) InvalidateCandidateRouteCache(netinst string) {
+	d.routeCacheMu.Lock()
+	defer d.routeCacheMu.Unlock()
+	if d.routeCache == nil {
+		return
+	}
+	if netinst == "" || netinst == "*" || netinst == "all" {
+		for _, entry := range d.routeCache {
+			entry.dirty = true
+		}
+		return
+	}
+	prefix := netinst + ":"
+	for k, entry := range d.routeCache {
+		if strings.HasPrefix(k, prefix) {
+			entry.dirty = true
+		}
+	}
+}
+
+func (d *EigrpDaemon) GetCandidateRoutes(netinst string, afi string) ([]CandidateRoute, error) {
+	if netinst == "" {
+		netinst = "default"
+	}
+	cacheKey := netinst + ":" + afi
+
+	d.routeCacheMu.RLock()
+	var entry *candidateRouteCacheEntry
+	var exists bool
+	if d.routeCache != nil {
+		entry, exists = d.routeCache[cacheKey]
+	}
+	if exists && entry != nil && !entry.dirty && time.Since(entry.timestamp) < candidateRouteCacheTTL {
+		routes := make([]CandidateRoute, len(entry.routes))
+		copy(routes, entry.routes)
+		d.routeCacheMu.RUnlock()
+		return routes, nil
+	}
+	d.routeCacheMu.RUnlock()
+
+	routes, err := queryRoutingStateCLI(netinst, afi)
+	if err != nil {
+		d.routeCacheMu.RLock()
+		if exists && entry != nil {
+			cached := make([]CandidateRoute, len(entry.routes))
+			copy(cached, entry.routes)
+			d.routeCacheMu.RUnlock()
+			return cached, nil
+		}
+		d.routeCacheMu.RUnlock()
+		return nil, err
+	}
+
+	d.routeCacheMu.Lock()
+	if d.routeCache == nil {
+		d.routeCache = make(map[string]*candidateRouteCacheEntry)
+	}
+	d.routeCache[cacheKey] = &candidateRouteCacheEntry{
+		routes:    routes,
+		timestamp: time.Now(),
+		dirty:     false,
+	}
+	d.routeCacheMu.Unlock()
+
+	result := make([]CandidateRoute, len(routes))
+	copy(result, routes)
+	return result, nil
+}
+
+func queryRoutingStateCLI(netinst string, afi string) ([]CandidateRoute, error) {
 	if netinst == "" {
 		netinst = "default"
 	}
@@ -3027,6 +3742,16 @@ func getCandidateRoutes(netinst string, afi string) ([]CandidateRoute, error) {
 		}
 	}
 	return candidates, nil
+}
+
+func getCandidateRoutes(netinst string, afi string) ([]CandidateRoute, error) {
+	if netinst == "" {
+		netinst = "default"
+	}
+	if daemonApp != nil {
+		return daemonApp.GetCandidateRoutes(netinst, afi)
+	}
+	return queryRoutingStateCLI(netinst, afi)
 }
 
 func (d *EigrpDaemon) getPolicyDef(policyName string) (*PolicyDef, error) {
@@ -3145,6 +3870,7 @@ func (d *EigrpDaemon) TriggerRedistSync(netinst string) {
 	if netinst == "" {
 		netinst = "default"
 	}
+	d.InvalidateCandidateRouteCache(netinst)
 	if d.redistChan != nil {
 		select {
 		case d.redistChan <- netinst:
@@ -3154,7 +3880,9 @@ func (d *EigrpDaemon) TriggerRedistSync(netinst string) {
 }
 
 func (d *EigrpDaemon) RedistributionWorker(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Second)
+	// Reconcile periodically at a rapid 3-second cadence for swift convergence.
+	// Subprocess churn is eliminated via candidate route caching.
+	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
 	var debounceTimer *time.Timer

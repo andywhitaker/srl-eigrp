@@ -39,11 +39,13 @@ int srl_netns_enter(const char *netinst, int *saved_ns) {
 
     int target_ns = open(path, O_RDONLY | O_CLOEXEC);
     if (target_ns < 0) {
-        // Wait up to 5 seconds if network-instance netns is being created
-        for (int i = 0; i < 50; i++) {
-            usleep(100000); // 100ms
-            target_ns = open(path, O_RDONLY | O_CLOEXEC);
-            if (target_ns >= 0) break;
+        // Wait briefly if running in SR Linux and network-instance netns is being created
+        if (access("/etc/opt/srlinux", F_OK) == 0) {
+            for (int i = 0; i < 5; i++) {
+                usleep(20000); // 20ms
+                target_ns = open(path, O_RDONLY | O_CLOEXEC);
+                if (target_ns >= 0) break;
+            }
         }
     }
     if (target_ns < 0) {

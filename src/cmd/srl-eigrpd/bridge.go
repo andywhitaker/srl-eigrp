@@ -6,9 +6,169 @@ package main
 #include "srl_cshim.h"
 */
 import "C"
+import "time"
+
+type routeEventType int
+
+const (
+	routeEventAdd routeEventType = iota
+	routeEventDel
+)
+
+type routeEvent struct {
+	eventType  routeEventType
+	netinst    string
+	prefix     string
+	nexthop    string
+	metric     uint32
+	wideMetric uint64
+	isExt      bool
+	preference uint32
+}
+
+type routeQueueWorker struct {
+	queue chan routeEvent
+	stop  chan struct{}
+	done  chan struct{}
+}
+
+func (d *EigrpDaemon) getOrCreateRouteWorker(netinst string) *routeQueueWorker {
+	if netinst == "" {
+		netinst = "default"
+	}
+	d.routeWorkersMu.Lock()
+	defer d.routeWorkersMu.Unlock()
+	if d.routeWorkers == nil {
+		d.routeWorkers = make(map[string]*routeQueueWorker)
+	}
+	w, exists := d.routeWorkers[netinst]
+	if !exists {
+		w = &routeQueueWorker{
+			queue: make(chan routeEvent, 1024),
+			stop:  make(chan struct{}),
+			done:  make(chan struct{}),
+		}
+		d.routeWorkers[netinst] = w
+		go d.runRouteWorker(w)
+	}
+	return w
+}
+
+func (d *EigrpDaemon) runRouteWorker(w *routeQueueWorker) {
+	defer close(w.done)
+	for {
+		select {
+		case <-w.stop:
+			for {
+				select {
+				case ev := <-w.queue:
+					d.processRouteEvent(ev)
+				default:
+					return
+				}
+			}
+		case ev := <-w.queue:
+			d.processRouteEvent(ev)
+		}
+	}
+}
+
+func (d *EigrpDaemon) processRouteEvent(ev routeEvent) {
+	switch ev.eventType {
+	case routeEventAdd:
+		d.OnRouteAdd(ev.netinst, ev.prefix, ev.nexthop, ev.metric, ev.wideMetric, ev.isExt, ev.preference)
+	case routeEventDel:
+		d.OnRouteDel(ev.netinst, ev.prefix)
+	}
+}
+
+func (d *EigrpDaemon) EnqueueRouteAdd(netinst, prefix, nexthop string, metric uint32, wideMetric uint64, isExt bool, preference uint32) {
+	w := d.getOrCreateRouteWorker(netinst)
+	select {
+	case <-w.stop:
+		return
+	default:
+	}
+	select {
+	case w.queue <- routeEvent{
+		eventType:  routeEventAdd,
+		netinst:    netinst,
+		prefix:     prefix,
+		nexthop:    nexthop,
+		metric:     metric,
+		wideMetric: wideMetric,
+		isExt:      isExt,
+		preference: preference,
+	}:
+	case <-w.stop:
+	}
+}
+
+func (d *EigrpDaemon) EnqueueRouteDel(netinst, prefix string) {
+	w := d.getOrCreateRouteWorker(netinst)
+	select {
+	case <-w.stop:
+		return
+	default:
+	}
+	select {
+	case w.queue <- routeEvent{
+		eventType: routeEventDel,
+		netinst:   netinst,
+		prefix:    prefix,
+	}:
+	case <-w.stop:
+	}
+}
+
+func (d *EigrpDaemon) StopRouteWorker(netinst string) {
+	if netinst == "" {
+		netinst = "default"
+	}
+	d.routeWorkersMu.Lock()
+	if d.routeWorkers == nil {
+		d.routeWorkersMu.Unlock()
+		return
+	}
+	w, exists := d.routeWorkers[netinst]
+	if exists {
+		delete(d.routeWorkers, netinst)
+		close(w.stop)
+	}
+	d.routeWorkersMu.Unlock()
+
+	if exists {
+		select {
+		case <-w.done:
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+func (d *EigrpDaemon) StopAllRouteWorkers() {
+	d.routeWorkersMu.Lock()
+	if d.routeWorkers == nil {
+		d.routeWorkersMu.Unlock()
+		return
+	}
+	workers := make([]*routeQueueWorker, 0, len(d.routeWorkers))
+	for ni, w := range d.routeWorkers {
+		delete(d.routeWorkers, ni)
+		close(w.stop)
+		workers = append(workers, w)
+	}
+	d.routeWorkersMu.Unlock()
+
+	for _, w := range workers {
+		select {
+		case <-w.done:
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
 
 //export srlGoRouteAdd
-func srlGoRouteAdd(netinst *C.char, prefix *C.char, nexthop *C.char, metric C.uint32_t, wideMetric C.uint64_t, isExt C.int) {
+func srlGoRouteAdd(netinst *C.char, prefix *C.char, nexthop *C.char, metric C.uint32_t, wideMetric C.uint64_t, isExt C.int, preference C.uint32_t) {
 	if daemonApp != nil {
 		ni := C.GoString(netinst)
 		pfx := C.GoString(prefix)
@@ -16,7 +176,8 @@ func srlGoRouteAdd(netinst *C.char, prefix *C.char, nexthop *C.char, metric C.ui
 		m := uint32(metric)
 		wm := uint64(wideMetric)
 		ext := isExt != 0
-		go daemonApp.OnRouteAdd(ni, pfx, nh, m, wm, ext)
+		pref := uint32(preference)
+		daemonApp.EnqueueRouteAdd(ni, pfx, nh, m, wm, ext, pref)
 	}
 }
 
@@ -25,7 +186,7 @@ func srlGoRouteDel(netinst *C.char, prefix *C.char) {
 	if daemonApp != nil {
 		ni := C.GoString(netinst)
 		pfx := C.GoString(prefix)
-		go daemonApp.OnRouteDel(ni, pfx)
+		daemonApp.EnqueueRouteDel(ni, pfx)
 	}
 }
 

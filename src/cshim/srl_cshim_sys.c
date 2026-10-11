@@ -529,7 +529,9 @@ static void *srl_runtime_loop(void *arg) {
             void *cb_arg = ready->arg;
             free(ready);
             if (cb) {
+                pthread_mutex_lock(&g_data_lock);
                 cb(cb_arg);
+                pthread_mutex_unlock(&g_data_lock);
             }
         }
 
@@ -2142,8 +2144,12 @@ int srlShimNetworkAdd(const char *netinst, const char *prefix) {
     // Re-scan interfaces in case any new ones appeared
     srlShimInterfacesScan(ni);
 
+    pthread_mutex_lock(&g_data_lock);
     eigrp_instance_t *runtime = srl_instance_get_afi(ni, EIGRP_AFI_IPV4);
-    if (!runtime) return -1;
+    if (!runtime) {
+        pthread_mutex_unlock(&g_data_lock);
+        return -1;
+    }
 
     char pfx_copy[128];
     strncpy(pfx_copy, prefix, sizeof(pfx_copy) - 1);
@@ -2160,9 +2166,10 @@ int srlShimNetworkAdd(const char *netinst, const char *prefix) {
     memset(&pfx, 0, sizeof(pfx));
     pfx.address.afi = EIGRP_AFI_IPV4;
     if (inet_pton(AF_INET, pfx_copy, pfx.address.bytes) != 1) {
+        pthread_mutex_unlock(&g_data_lock);
         return -1;
     }
-    pfx.prefix_length = plen;
+    pthread_mutex_unlock(&g_data_lock);
 
     eigrp_instance_context_t ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -2173,10 +2180,10 @@ int srlShimNetworkAdd(const char *netinst, const char *prefix) {
         return -1;
     }
 
-    pthread_mutex_lock(&g_data_lock);
     uint32_t net_ip = 0;
     memcpy(&net_ip, pfx.address.bytes, 4);
     uint32_t mask = (plen == 0) ? 0 : htonl(~((1ULL << (32 - plen)) - 1));
+    pthread_mutex_lock(&g_data_lock);
     for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
         if (strcmp(ci->netinst, ni) != 0) continue;
         uint32_t ci_ip = 0;
@@ -2203,7 +2210,7 @@ static eigrp_result_t srl_nbr_iter_cb(const eigrp_nbr_state_t *st, void *arg) {
     pthread_mutex_lock(&g_data_lock);
     for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
         if (strcmp(ci->netinst, ni) == 0 && ci->ifname[0] && st->interface_name &&
-            strcmp(ci->ifname, st->interface_name) == 0) {
+            srl_match_ifname(ci->ifname, st->interface_name)) {
             if (st->address.afi == EIGRP_AFI_IPV6) {
                 if (ci->passive_v6) is_passive = true;
             } else {
@@ -2258,11 +2265,11 @@ void srlShimNeighborsReport(const char *netinst) {
             instances[count++] = b->eigrp;
         }
     }
-    pthread_mutex_unlock(&g_data_lock);
 
     for (int i = 0; i < count; i++) {
         eigrp_nbr_state_iterate(NULL, instances[i], NULL, false, srl_nbr_iter_cb, (void *)ni);
     }
+    pthread_mutex_unlock(&g_data_lock);
 }
 
 void srlShimInterfacesReport(const char *netinst) {
@@ -2398,11 +2405,11 @@ void srlShimTopologyReport(const char *netinst) {
             instances[count++] = b->eigrp;
         }
     }
-    pthread_mutex_unlock(&g_data_lock);
 
     for (int i = 0; i < count; i++) {
         eigrp_topology_state_iterate(NULL, instances[i], NULL, true, srl_topo_prefix_cb, srl_topo_route_cb, (void *)ni);
     }
+    pthread_mutex_unlock(&g_data_lock);
 }
 
 static eigrp_result_t srl_intf_traffic_cb(const eigrp_intf_state_t *st, void *arg) {
@@ -2430,11 +2437,11 @@ void srlShimTrafficReport(const char *netinst) {
             instances[count++] = b->eigrp;
         }
     }
-    pthread_mutex_unlock(&g_data_lock);
 
     for (int i = 0; i < count; i++) {
         eigrp_intf_state_iterate(NULL, instances[i], NULL, srl_intf_traffic_cb, (void *)ni);
     }
+    pthread_mutex_unlock(&g_data_lock);
 }
 
 int srlShimVarianceUpdate(const char *netinst, uint8_t variance) {
@@ -2624,9 +2631,9 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
         }
     }
     if (!found) {
-        for (int retry = 0; retry < 15 && !found; retry++) {
+        for (int retry = 0; retry < 3 && !found; retry++) {
             pthread_mutex_unlock(&g_data_lock);
-            usleep(100000);
+            usleep(20000);
             srlShimInterfacesScan(ni);
             pthread_mutex_lock(&g_data_lock);
             for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
@@ -2667,6 +2674,17 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
     eigrp_prefix_t intf_addr = found->address;
     uint32_t intf_bw = found->bandwidth;
     uint32_t intf_mtu = found->mtu;
+
+    char eff_mode[32] = {0};
+    char eff_key[256] = {0};
+    char eff_kc[64] = {0};
+    const char *m = (found->auth_mode_v4[0]) ? found->auth_mode_v4 : found->auth_mode;
+    const char *k = (found->auth_key_v4[0]) ? found->auth_key_v4 : found->auth_key;
+    const char *kc = (found->keychain_v4[0]) ? found->keychain_v4 : found->keychain;
+    if (m && m[0]) strncpy(eff_mode, m, sizeof(eff_mode) - 1);
+    if (k && k[0]) strncpy(eff_key, k, sizeof(eff_key) - 1);
+    if (kc && kc[0]) strncpy(eff_kc, kc, sizeof(eff_kc) - 1);
+
     pthread_mutex_unlock(&g_data_lock);
 
     eigrp_instance_context_t ctx;
@@ -2752,33 +2770,25 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
             if (hold_time > 0) {
                 ei->params.v_wait = hold_time;
             }
-            for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
-                if (strcmp(ci->netinst, ni) == 0 && strcmp(ci->ifname, actual_ifname) == 0) {
-                    const char *eff_mode = (ci->auth_mode_v4[0]) ? ci->auth_mode_v4 : ci->auth_mode;
-                    const char *eff_key = (ci->auth_key_v4[0]) ? ci->auth_key_v4 : ci->auth_key;
-                    const char *eff_kc = (ci->keychain_v4[0]) ? ci->keychain_v4 : ci->keychain;
-                    if (eff_mode[0] && strcasecmp(eff_mode, "none") != 0) {
-                        ei->params.auth_type = (strcasecmp(eff_mode, "md5") == 0) ? EIGRP_AUTH_TYPE_MD5 : EIGRP_AUTH_TYPE_SHA256;
-                        if (eff_key[0]) {
-                            if (ei->params.auth_password) free(ei->params.auth_password);
-                            ei->params.auth_password = strdup(eff_key);
-                        }
-                        if (eff_kc[0]) {
-                            if (ei->params.auth_keychain) free(ei->params.auth_keychain);
-                            ei->params.auth_keychain = strdup(eff_kc);
-                        }
-                    } else {
-                        ei->params.auth_type = EIGRP_AUTH_TYPE_NONE;
-                        if (ei->params.auth_password) {
-                            free(ei->params.auth_password);
-                            ei->params.auth_password = NULL;
-                        }
-                        if (ei->params.auth_keychain) {
-                            free(ei->params.auth_keychain);
-                            ei->params.auth_keychain = NULL;
-                        }
-                    }
-                    break;
+            if (eff_mode[0] && strcasecmp(eff_mode, "none") != 0) {
+                ei->params.auth_type = (strcasecmp(eff_mode, "md5") == 0) ? EIGRP_AUTH_TYPE_MD5 : EIGRP_AUTH_TYPE_SHA256;
+                if (eff_key[0]) {
+                    if (ei->params.auth_password) free(ei->params.auth_password);
+                    ei->params.auth_password = strdup(eff_key);
+                }
+                if (eff_kc[0]) {
+                    if (ei->params.auth_keychain) free(ei->params.auth_keychain);
+                    ei->params.auth_keychain = strdup(eff_kc);
+                }
+            } else {
+                ei->params.auth_type = EIGRP_AUTH_TYPE_NONE;
+                if (ei->params.auth_password) {
+                    free(ei->params.auth_password);
+                    ei->params.auth_password = NULL;
+                }
+                if (ei->params.auth_keychain) {
+                    free(ei->params.auth_keychain);
+                    ei->params.auth_keychain = NULL;
                 }
             }
             if (!ei->operative && !passive) {
@@ -2838,9 +2848,9 @@ int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passi
         }
     }
     if (!found) {
-        for (int retry = 0; retry < 15 && !found; retry++) {
+        for (int retry = 0; retry < 3 && !found; retry++) {
             pthread_mutex_unlock(&g_data_lock);
-            usleep(100000);
+            usleep(20000);
             srlShimInterfacesScan(ni);
             pthread_mutex_lock(&g_data_lock);
             for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
@@ -2878,6 +2888,17 @@ int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passi
     bool has_glob_v6 = (glob_v6.address.afi == EIGRP_AFI_IPV6 && glob_v6.prefix_length > 0);
     uint32_t intf_bw = found->bandwidth;
     uint32_t intf_mtu = found->mtu;
+
+    char eff_mode[32] = {0};
+    char eff_key[128] = {0};
+    char eff_kc[64] = {0};
+    const char *m = (found->auth_mode_v6[0]) ? found->auth_mode_v6 : found->auth_mode;
+    const char *k = (found->auth_key_v6[0]) ? found->auth_key_v6 : found->auth_key;
+    const char *kc = (found->keychain_v6[0]) ? found->keychain_v6 : found->keychain;
+    if (m && m[0]) strncpy(eff_mode, m, sizeof(eff_mode) - 1);
+    if (k && k[0]) strncpy(eff_key, k, sizeof(eff_key) - 1);
+    if (kc && kc[0]) strncpy(eff_kc, kc, sizeof(eff_kc) - 1);
+
     pthread_mutex_unlock(&g_data_lock);
 
     if (has_v6) {
@@ -2954,33 +2975,25 @@ int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passi
             if (hold_time > 0) {
                 ei6->params.v_wait = hold_time;
             }
-            for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
-                if (strcmp(ci->netinst, ni) == 0 && strcmp(ci->ifname, actual_ifname) == 0) {
-                    const char *eff_mode = (ci->auth_mode_v6[0]) ? ci->auth_mode_v6 : ci->auth_mode;
-                    const char *eff_key = (ci->auth_key_v6[0]) ? ci->auth_key_v6 : ci->auth_key;
-                    const char *eff_kc = (ci->keychain_v6[0]) ? ci->keychain_v6 : ci->keychain;
-                    if (eff_mode[0] && strcasecmp(eff_mode, "none") != 0) {
-                        ei6->params.auth_type = (strcasecmp(eff_mode, "md5") == 0) ? EIGRP_AUTH_TYPE_MD5 : EIGRP_AUTH_TYPE_SHA256;
-                        if (eff_key[0]) {
-                            if (ei6->params.auth_password) free(ei6->params.auth_password);
-                            ei6->params.auth_password = strdup(eff_key);
-                        }
-                        if (eff_kc[0]) {
-                            if (ei6->params.auth_keychain) free(ei6->params.auth_keychain);
-                            ei6->params.auth_keychain = strdup(eff_kc);
-                        }
-                    } else {
-                        ei6->params.auth_type = EIGRP_AUTH_TYPE_NONE;
-                        if (ei6->params.auth_password) {
-                            free(ei6->params.auth_password);
-                            ei6->params.auth_password = NULL;
-                        }
-                        if (ei6->params.auth_keychain) {
-                            free(ei6->params.auth_keychain);
-                            ei6->params.auth_keychain = NULL;
-                        }
-                    }
-                    break;
+            if (eff_mode[0] && strcasecmp(eff_mode, "none") != 0) {
+                ei6->params.auth_type = (strcasecmp(eff_mode, "md5") == 0) ? EIGRP_AUTH_TYPE_MD5 : EIGRP_AUTH_TYPE_SHA256;
+                if (eff_key[0]) {
+                    if (ei6->params.auth_password) free(ei6->params.auth_password);
+                    ei6->params.auth_password = strdup(eff_key);
+                }
+                if (eff_kc[0]) {
+                    if (ei6->params.auth_keychain) free(ei6->params.auth_keychain);
+                    ei6->params.auth_keychain = strdup(eff_kc);
+                }
+            } else {
+                ei6->params.auth_type = EIGRP_AUTH_TYPE_NONE;
+                if (ei6->params.auth_password) {
+                    free(ei6->params.auth_password);
+                    ei6->params.auth_password = NULL;
+                }
+                if (ei6->params.auth_keychain) {
+                    free(ei6->params.auth_keychain);
+                    ei6->params.auth_keychain = NULL;
                 }
             }
             if (!ei6->operative && !passive && admin_up) {
@@ -3178,7 +3191,9 @@ int srlShimRouteOriginateV6(const char *netinst, const char *prefix_str, const c
     metric.mtu[2] = 0xdc;
     metric.hop_count = 0;
 
+    pthread_mutex_lock(&g_data_lock);
     eigrp_result_t res = eigrp_topology_redistributed_route_update(runtime, &sr, &metric);
+    pthread_mutex_unlock(&g_data_lock);
     return (res == EIGRP_RESULT_SUCCESS) ? 0 : -1;
 }
 
@@ -3215,7 +3230,9 @@ int srlShimRouteWithdrawV6(const char *netinst, const char *prefix_str) {
     sr.redist.source.protocol = EIGRP_REDISTRIBUTE_PROTOCOL_CONNECTED;
     sr.install.type = EIGRP_RIB_ROUTE_INTERNAL;
 
+    pthread_mutex_lock(&g_data_lock);
     eigrp_result_t res = eigrp_topology_redistributed_route_remove(runtime, &sr);
+    pthread_mutex_unlock(&g_data_lock);
     return (res == EIGRP_RESULT_SUCCESS) ? 0 : -1;
 }
 
@@ -3296,7 +3313,9 @@ int srlShimRouteRedistributeAdd(const char *netinst, const char *prefix_str, con
     metric.mtu[2] = (m >> 16) & 0xff;
     metric.hop_count = 0;
 
+    pthread_mutex_lock(&g_data_lock);
     eigrp_result_t res = eigrp_topology_redistributed_route_update(runtime, &sr, &metric);
+    pthread_mutex_unlock(&g_data_lock);
     return (res == EIGRP_RESULT_SUCCESS) ? 0 : -1;
 }
 
@@ -3359,6 +3378,7 @@ int srlShimRouteRedistributeRemove(const char *netinst, const char *prefix_str, 
     }
 
     int success = 0;
+    pthread_mutex_lock(&g_data_lock);
     for (int i = 0; i < nprotos; i++) {
         eigrp_rib_route_t sr;
         memset(&sr, 0, sizeof(sr));
@@ -3370,6 +3390,7 @@ int srlShimRouteRedistributeRemove(const char *netinst, const char *prefix_str, 
             success = 1;
         }
     }
+    pthread_mutex_unlock(&g_data_lock);
     return success ? 0 : -1;
 }
 
@@ -3477,7 +3498,6 @@ int srlShimInstanceCreateV6(const char *netinst, uint16_t asn, const char *route
             snap_count++;
         }
     }
-    pthread_mutex_unlock(&g_data_lock);
 
     for (int i = 0; i < snap_count; i++) {
         eigrp_intf_runtime_state_t st;
@@ -3496,7 +3516,6 @@ int srlShimInstanceCreateV6(const char *netinst, uint16_t asn, const char *route
             srlShimRouteOriginateV6(ni, v6_snaps[i].global_pfx, NULL);
         }
     }
-    pthread_mutex_lock(&g_data_lock);
     g_pending_netinst[0] = '\0';
     pthread_mutex_unlock(&g_data_lock);
 
@@ -3911,6 +3930,261 @@ int srlShimGracefulShutdown(const char *netinst) {
 
     for (int i = 0; i < count; i++) {
         eigrp_hello_send(intfs[i], EIGRP_HELLO_GRACEFUL_SHUTDOWN, NULL);
+    }
+    return 0;
+}
+
+int srlShimStaticNeighborAdd(const char *netinst, const char *ip_str, const char *ifname) {
+    if (!ip_str || !ifname) return -1;
+    const char *ni = (netinst && netinst[0]) ? netinst : "default";
+
+    pthread_mutex_lock(&g_data_lock);
+    char actual_ifname[64];
+    strncpy(actual_ifname, ifname, sizeof(actual_ifname) - 1);
+    actual_ifname[sizeof(actual_ifname) - 1] = '\0';
+    for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+        if (strcmp(ci->netinst, ni) == 0 && srl_match_ifname(ci->ifname, ifname)) {
+            strncpy(actual_ifname, ci->ifname, sizeof(actual_ifname) - 1);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_data_lock);
+
+    bool is_v6 = (strchr(ip_str, ':') != NULL);
+    eigrp_instance_t *runtime = srl_instance_get_afi(ni, is_v6 ? EIGRP_AFI_IPV6 : EIGRP_AFI_IPV4);
+    if (!runtime) {
+        return 0;
+    }
+
+    eigrp_af_config_t *af = eigrp_af_config_runtime_read(runtime);
+    if (!af) {
+        return -1;
+    }
+
+    eigrp_address_t addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.afi = is_v6 ? EIGRP_AFI_IPV6 : EIGRP_AFI_IPV4;
+    int res = inet_pton(is_v6 ? AF_INET6 : AF_INET, ip_str, addr.bytes);
+    if (res != 1) {
+        return -1;
+    }
+
+    eigrp_result_t er = eigrp_nbr_static_create(af, &addr, actual_ifname);
+    return (er == EIGRP_RESULT_SUCCESS) ? 0 : -1;
+}
+
+int srlShimStaticNeighborDel(const char *netinst, const char *ip_str, const char *ifname) {
+    if (!ip_str) return -1;
+    const char *ni = (netinst && netinst[0]) ? netinst : "default";
+
+    pthread_mutex_lock(&g_data_lock);
+    char actual_ifname[64];
+    if (ifname && ifname[0]) {
+        strncpy(actual_ifname, ifname, sizeof(actual_ifname) - 1);
+        actual_ifname[sizeof(actual_ifname) - 1] = '\0';
+        for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+            if (strcmp(ci->netinst, ni) == 0 && srl_match_ifname(ci->ifname, ifname)) {
+                strncpy(actual_ifname, ci->ifname, sizeof(actual_ifname) - 1);
+                break;
+            }
+        }
+    } else {
+        actual_ifname[0] = '\0';
+    }
+    pthread_mutex_unlock(&g_data_lock);
+
+    bool is_v6 = (strchr(ip_str, ':') != NULL);
+    eigrp_instance_t *runtime = srl_instance_get_afi(ni, is_v6 ? EIGRP_AFI_IPV6 : EIGRP_AFI_IPV4);
+    if (!runtime) {
+        return 0;
+    }
+
+    eigrp_af_config_t *af = eigrp_af_config_runtime_read(runtime);
+    if (!af) {
+        return -1;
+    }
+
+    eigrp_address_t addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.afi = is_v6 ? EIGRP_AFI_IPV6 : EIGRP_AFI_IPV4;
+    int res = inet_pton(is_v6 ? AF_INET6 : AF_INET, ip_str, addr.bytes);
+    if (res != 1) {
+        return -1;
+    }
+
+    eigrp_result_t er = eigrp_nbr_static_delete(af, &addr, actual_ifname[0] ? actual_ifname : NULL);
+    return (er == EIGRP_RESULT_SUCCESS) ? 0 : -1;
+}
+
+int srlShimSummaryAddressAdd(const char *netinst, const char *ifname, const char *prefix_str, uint8_t distance) {
+    if (!ifname || !prefix_str) return -1;
+    const char *ni = (netinst && netinst[0]) ? netinst : "default";
+
+    pthread_mutex_lock(&g_data_lock);
+    char actual_ifname[64];
+    strncpy(actual_ifname, ifname, sizeof(actual_ifname) - 1);
+    actual_ifname[sizeof(actual_ifname) - 1] = '\0';
+    for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+        if (strcmp(ci->netinst, ni) == 0 && srl_match_ifname(ci->ifname, ifname)) {
+            strncpy(actual_ifname, ci->ifname, sizeof(actual_ifname) - 1);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_data_lock);
+
+    char pfx_copy[128];
+    strncpy(pfx_copy, prefix_str, sizeof(pfx_copy) - 1);
+    pfx_copy[sizeof(pfx_copy) - 1] = '\0';
+    char *slash = strchr(pfx_copy, '/');
+    uint8_t plen = 0;
+    if (slash) {
+        *slash = '\0';
+        plen = (uint8_t)atoi(slash + 1);
+    }
+
+    bool is_v6 = (strchr(pfx_copy, ':') != NULL);
+    if (plen == 0) {
+        plen = is_v6 ? 128 : 32;
+    }
+
+    eigrp_afi_t afi = is_v6 ? EIGRP_AFI_IPV6 : EIGRP_AFI_IPV4;
+    eigrp_instance_t *runtime = srl_instance_get_afi(ni, afi);
+    if (!runtime) {
+        return 0;
+    }
+
+    eigrp_af_config_t *af = eigrp_af_config_runtime_read(runtime);
+    if (!af) {
+        return -1;
+    }
+
+    eigrp_intf_t *ei = eigrp_intf_lookup_by_name(runtime, actual_ifname);
+    eigrp_intf_config_t *ic = eigrp_intf_config_read(af, actual_ifname);
+    if (!ic) {
+        eigrp_intf_config_create(af, actual_ifname);
+        ic = eigrp_intf_config_read(af, actual_ifname);
+    }
+    if (!ic) {
+        return -1;
+    }
+
+    eigrp_intf_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.address_family = af;
+    ctx.config = ic;
+    ctx.runtime = ei;
+
+    eigrp_prefix_t pfx;
+    memset(&pfx, 0, sizeof(pfx));
+    pfx.address.afi = afi;
+    pfx.prefix_length = plen;
+    if (inet_pton(is_v6 ? AF_INET6 : AF_INET, pfx_copy, pfx.address.bytes) != 1) {
+        return -1;
+    }
+
+    eigrp_summary_options_t opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.administrative_distance = distance ? distance : 5;
+
+    eigrp_result_t er = eigrp_summary_create(&ctx, &pfx, &opts);
+    return (er == EIGRP_RESULT_SUCCESS) ? 0 : -1;
+}
+
+int srlShimSummaryAddressDelete(const char *netinst, const char *ifname, const char *prefix_str) {
+    if (!ifname || !prefix_str) return -1;
+    const char *ni = (netinst && netinst[0]) ? netinst : "default";
+
+    pthread_mutex_lock(&g_data_lock);
+    char actual_ifname[64];
+    strncpy(actual_ifname, ifname, sizeof(actual_ifname) - 1);
+    actual_ifname[sizeof(actual_ifname) - 1] = '\0';
+    for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+        if (strcmp(ci->netinst, ni) == 0 && srl_match_ifname(ci->ifname, ifname)) {
+            strncpy(actual_ifname, ci->ifname, sizeof(actual_ifname) - 1);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_data_lock);
+
+    char pfx_copy[128];
+    strncpy(pfx_copy, prefix_str, sizeof(pfx_copy) - 1);
+    pfx_copy[sizeof(pfx_copy) - 1] = '\0';
+    char *slash = strchr(pfx_copy, '/');
+    uint8_t plen = 0;
+    if (slash) {
+        *slash = '\0';
+        plen = (uint8_t)atoi(slash + 1);
+    }
+
+    bool is_v6 = (strchr(pfx_copy, ':') != NULL);
+    if (plen == 0) {
+        plen = is_v6 ? 128 : 32;
+    }
+
+    eigrp_afi_t afi = is_v6 ? EIGRP_AFI_IPV6 : EIGRP_AFI_IPV4;
+    eigrp_instance_t *runtime = srl_instance_get_afi(ni, afi);
+    if (!runtime) {
+        return 0;
+    }
+
+    eigrp_af_config_t *af = eigrp_af_config_runtime_read(runtime);
+    if (!af) {
+        return -1;
+    }
+
+    eigrp_intf_t *ei = eigrp_intf_lookup_by_name(runtime, actual_ifname);
+    eigrp_intf_config_t *ic = eigrp_intf_config_read(af, actual_ifname);
+    if (!ic) {
+        return 0;
+    }
+
+    eigrp_intf_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.address_family = af;
+    ctx.config = ic;
+    ctx.runtime = ei;
+
+    eigrp_prefix_t pfx;
+    memset(&pfx, 0, sizeof(pfx));
+    pfx.address.afi = afi;
+    pfx.prefix_length = plen;
+    if (inet_pton(is_v6 ? AF_INET6 : AF_INET, pfx_copy, pfx.address.bytes) != 1) {
+        return -1;
+    }
+
+    eigrp_result_t er = eigrp_summary_delete(&ctx, &pfx);
+    return (er == EIGRP_RESULT_SUCCESS) ? 0 : -1;
+}
+
+int srlShimDistanceUpdate(const char *netinst, uint8_t internal_dist, uint8_t external_dist) {
+    const char *ni = (netinst && netinst[0]) ? netinst : "default";
+    eigrp_instance_t *r4 = srl_instance_get_afi(ni, EIGRP_AFI_IPV4);
+    if (r4) {
+        eigrp_af_config_t *af4 = eigrp_af_config_runtime_read(r4);
+        if (af4) {
+            (void)eigrp_af_config_distance_update(EIGRP_SET, af4, internal_dist, external_dist);
+        }
+    }
+    eigrp_instance_t *r6 = srl_instance_get_afi(ni, EIGRP_AFI_IPV6);
+    if (r6) {
+        eigrp_af_config_t *af6 = eigrp_af_config_runtime_read(r6);
+        if (af6) {
+            (void)eigrp_af_config_distance_update(EIGRP_SET, af6, internal_dist, external_dist);
+        }
+    }
+    return 0;
+}
+
+int srlShimDistanceUpdateAfi(const char *netinst, const char *afi_name, uint8_t internal_dist, uint8_t external_dist) {
+    if (!afi_name) return -1;
+    const char *ni = (netinst && netinst[0]) ? netinst : "default";
+    eigrp_afi_t afi = (strcmp(afi_name, "ipv6-unicast") == 0) ? EIGRP_AFI_IPV6 : EIGRP_AFI_IPV4;
+    eigrp_instance_t *r = srl_instance_get_afi(ni, afi);
+    if (r) {
+        eigrp_af_config_t *af = eigrp_af_config_runtime_read(r);
+        if (af) {
+            (void)eigrp_af_config_distance_update(EIGRP_SET, af, internal_dist, external_dist);
+        }
     }
     return 0;
 }

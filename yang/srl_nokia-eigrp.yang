@@ -418,7 +418,10 @@ module srl_nokia-eigrp {
           range "1..128";
         }
         default 1;
-        description "Multiplier for unequal-cost load balancing";
+        description
+          "Multiplier for unequal-cost load balancing. Feasible successor routes
+           within the variance window are installed into the SR Linux FIB as
+           uniform ECMP multipath due to NDK schema boundaries.";
       }
       leaf maximum-paths {
         type uint8 {
@@ -440,6 +443,20 @@ module srl_nokia-eigrp {
         }
         default 128;
         description "Scale factor for converting 64-bit wide metrics to 32-bit RIB metrics";
+      }
+      leaf preference {
+        type uint8 {
+          range "1..255";
+        }
+        default 90;
+        description "Route table preference (administrative distance) for internal EIGRP routes";
+      }
+      leaf external-preference {
+        type uint8 {
+          range "1..255";
+        }
+        default 170;
+        description "Route table preference (administrative distance) for external EIGRP routes";
       }
       leaf wide-metrics {
         type boolean;
@@ -587,6 +604,20 @@ module srl_nokia-eigrp {
           }
           description "Import policy for filtering EIGRP routes in this address family";
         }
+        leaf preference {
+          type uint8 {
+            range "1..255";
+          }
+          default 90;
+          description "Route table preference (administrative distance) for internal EIGRP routes in this address family";
+        }
+        leaf external-preference {
+          type uint8 {
+            range "1..255";
+          }
+          default 170;
+          description "Route table preference (administrative distance) for external EIGRP routes in this address family";
+        }
       }
 
       list interface {
@@ -675,6 +706,7 @@ module srl_nokia-eigrp {
         }
         leaf interface {
           type srl_nokia-comm:subinterface-all;
+          mandatory true;
           description "Interface connected to the static neighbor";
         }
         leaf oper-state {

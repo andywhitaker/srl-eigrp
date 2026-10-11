@@ -489,6 +489,11 @@ class Plugin(CliPlugin):
             output.print_line(f"{'Established Neighbors':<24}: {len(nbrs)}")
             output.print_line(f"{'Learned Routes':<24}: {len(routes)}")
             output.print_line(f"{'RIB Scale':<24}: {data.get('rib-scale', 128)}")
+            output.print_line(f"{'Preference (Internal)':<24}: {data.get('preference', 90)}")
+            output.print_line(f"{'Preference (External)':<24}: {data.get('external-preference', 170)}")
+            output.print_line(f"{'Variance':<24}: {data.get('variance', 1)}")
+            output.print_line(f"{'Maximum Paths':<24}: {data.get('maximum-paths', 4)}")
+            output.print_line(f"{'Maximum Hops':<24}: {data.get('maximum-hops', 100)}")
             output.print_line(f"{'Wide Metrics (64-bit)':<24}: {'enabled' if data.get('wide-metrics', True) else 'disabled'}")
             gr = data.get('graceful-restart', {})
             if isinstance(gr, dict):
@@ -560,8 +565,9 @@ class Plugin(CliPlugin):
                         pfx = r.get("prefix", "")
                         metric = str(r.get("metric", 0))
                         wide_metric = str(r.get("wide-metric", 0))
-                        rtype = "External" if r.get("external", False) else "Internal"
-                        pref = "170" if r.get("external", False) else "90"
+                        ext = r.get("external", False)
+                        rtype = "External" if ext else "Internal"
+                        pref = str(r.get("preference", 170 if ext else 90))
                         output.print_line(f"  {pfx:<22} {metric:<12} {wide_metric:<18} {rtype:<10} {pref:<6}")
                 else:
                     output.print_line("  None")
@@ -690,7 +696,7 @@ class Plugin(CliPlugin):
                     wide_metric = str(r.get("wide-metric", 0))
                     is_ext = r.get("external", False)
                     rtype = "External" if is_ext else "Internal"
-                    pref = "170" if is_ext else "90"
+                    pref = str(r.get("preference", 170 if is_ext else 90))
                     output.print_line(f"{pfx:<{pfx_w}} {nh:<{nh_w}} {metric:<12} {wide_metric:<18} {rtype:<10} {pref:<6}")
 
             output.print_line("-" * div_len)

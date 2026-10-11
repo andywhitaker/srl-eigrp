@@ -20,7 +20,7 @@ extern "C" {
 #endif
 
 // Bridge functions exported from Go
-extern void srlGoRouteAdd(char *netinst, char *prefix, char *nexthop, uint32_t metric, uint64_t wide_metric, int is_external);
+extern void srlGoRouteAdd(char *netinst, char *prefix, char *nexthop, uint32_t metric, uint64_t wide_metric, int is_external, uint32_t preference);
 extern void srlGoRouteDel(char *netinst, char *prefix);
 extern void srlGoLog(int level, char *msg);
 extern void srlGoNeighborReport(char *netinst, char *ip, char *ifname, char *state, uint16_t hold, uint64_t uptime, uint32_t srtt, uint32_t rto, char *bfd_state, char *restart_state, char *auth_mode);
@@ -76,6 +76,12 @@ int srl_netns_ipv6_socket_open(const char *netinst);
 void srl_resolve_v6_gateway(const char *netinst, eigrp_ifindex_t ifidx, char *nh_str, size_t max_len);
 int srl_decrypt_password(const char *in, char *out, size_t out_len);
 int srl_netns_restore_root(void);
+int srlShimStaticNeighborAdd(const char *netinst, const char *ip_str, const char *ifname);
+int srlShimStaticNeighborDel(const char *netinst, const char *ip_str, const char *ifname);
+int srlShimSummaryAddressAdd(const char *netinst, const char *ifname, const char *prefix_str, uint8_t distance);
+int srlShimSummaryAddressDelete(const char *netinst, const char *ifname, const char *prefix_str);
+int srlShimDistanceUpdate(const char *netinst, uint8_t internal_dist, uint8_t external_dist);
+int srlShimDistanceUpdateAfi(const char *netinst, const char *afi_name, uint8_t internal_dist, uint8_t external_dist);
 
 
 #ifdef __cplusplus

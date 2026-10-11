@@ -337,7 +337,7 @@ func publishInterfaceSublists(
 			"admin-state":                 bfdAdmin,
 			"oper-state":                  bfdOper,
 			"desired-minimum-tx-interval": bfdTx,
-			"required-minimum-receive":   bfdRx,
+			"required-minimum-receive":    bfdRx,
 			"detection-multiplier":        bfdMult,
 		}
 
@@ -420,33 +420,35 @@ func (d *EigrpDaemon) TelemetryWorker(ctx context.Context) {
 func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 	d.mu.RLock()
 	type instData struct {
-		ni                     string
-		asn                    uint16
-		routerId               string
-		adminState             string
-		operState              string
-		networks               []string
-		variance               uint8
-		maximumPaths           uint8
-		maximumHops            uint8
-		ribScale               uint8
-		wideMetrics            bool
-		exportPolicy           string
-		importPolicy           string
-		gracefulRestart        *GracefulRestartConfig
-		timers                 *TimersConfig
-		metrics                *MetricsConfig
-		metricWeights          *MetricsConfig
-		authentication         *AuthConfig
-		defaultIntf            *DefaultInterfaceConfig
-		configuredInterfaces   map[string]*InterfaceConfig
-		addressFamily          []AddressFamilyConfig
-		staticNeighbors        map[string]*StaticNeighborConfig
-		nbrList                []*NeighborInfo
-		routeList              []*RouteInfo
-		intfList               []*InterfaceInfo
-		topoList               []*TopologyPrefixInfo
-		trafficList            []*TrafficInfo
+		ni                   string
+		asn                  uint16
+		routerId             string
+		adminState           string
+		operState            string
+		networks             []string
+		variance             uint8
+		maximumPaths         uint8
+		maximumHops          uint8
+		ribScale             uint8
+		preference           uint8
+		externalPreference   uint8
+		wideMetrics          bool
+		exportPolicy         string
+		importPolicy         string
+		gracefulRestart      *GracefulRestartConfig
+		timers               *TimersConfig
+		metrics              *MetricsConfig
+		metricWeights        *MetricsConfig
+		authentication       *AuthConfig
+		defaultIntf          *DefaultInterfaceConfig
+		configuredInterfaces map[string]*InterfaceConfig
+		addressFamily        []AddressFamilyConfig
+		staticNeighbors      map[string]*StaticNeighborConfig
+		nbrList              []*NeighborInfo
+		routeList            []*RouteInfo
+		intfList             []*InterfaceInfo
+		topoList             []*TopologyPrefixInfo
+		trafficList          []*TrafficInfo
 	}
 	allInstData := make([]instData, 0, len(d.instances))
 	for ni, inst := range d.instances {
@@ -482,7 +484,14 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 			}
 			isPassive := ic.IsAfiPassive(afiName, defPassive)
 			if !isPassive {
-				nbrList = append(nbrList, n)
+				nbrCopy := *n
+				if nbrCopy.AuthMode == "" || nbrCopy.AuthMode == "none" {
+					auth := ic.GetAfiAuthentication(afiName, inst.defaultIntf, inst.authentication)
+					if auth != nil && auth.Mode != "" && auth.Mode != "none" {
+						nbrCopy.AuthMode = auth.Mode
+					}
+				}
+				nbrList = append(nbrList, &nbrCopy)
 			}
 		}
 		routeList := make([]*RouteInfo, 0, len(inst.routes))
@@ -619,7 +628,9 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 		sort.Slice(nbrList, func(i, j int) bool { return nbrList[i].IPAddress < nbrList[j].IPAddress })
 		sort.Slice(routeList, func(i, j int) bool { return routeList[i].Prefix < routeList[j].Prefix })
 		sort.Slice(intfList, func(i, j int) bool { return normalizeIfName(intfList[i].Name) < normalizeIfName(intfList[j].Name) })
-		sort.Slice(trafficList, func(i, j int) bool { return normalizeIfName(trafficList[i].Interface) < normalizeIfName(trafficList[j].Interface) })
+		sort.Slice(trafficList, func(i, j int) bool {
+			return normalizeIfName(trafficList[i].Interface) < normalizeIfName(trafficList[j].Interface)
+		})
 		sort.Slice(topoList, func(i, j int) bool { return topoList[i].Destination < topoList[j].Destination })
 
 		variance := inst.variance
@@ -637,6 +648,14 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 		ribScale := inst.ribScale
 		if ribScale == 0 {
 			ribScale = 128
+		}
+		pref := inst.preference
+		if pref == 0 {
+			pref = 90
+		}
+		extPref := inst.externalPreference
+		if extPref == 0 {
+			extPref = 170
 		}
 
 		cfgIntfs := make(map[string]*InterfaceConfig, len(inst.configuredInterfaces))
@@ -716,6 +735,8 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 			maximumPaths:         maxPaths,
 			maximumHops:          maxHops,
 			ribScale:             ribScale,
+			preference:           pref,
+			externalPreference:   extPref,
 			wideMetrics:          inst.wideMetrics,
 			exportPolicy:         inst.exportPolicy,
 			importPolicy:         inst.importPolicy,
@@ -748,11 +769,13 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 			"router-id":         item.routerId,
 			"admin-state":       item.adminState,
 			"oper-state":        item.operState,
-			"variance":          item.variance,
-			"maximum-paths":     item.maximumPaths,
-			"maximum-hops":      item.maximumHops,
-			"rib-scale":         item.ribScale,
-			"wide-metrics":      item.wideMetrics,
+			"variance":            item.variance,
+			"maximum-paths":       item.maximumPaths,
+			"maximum-hops":        item.maximumHops,
+			"rib-scale":           item.ribScale,
+			"preference":          item.preference,
+			"external-preference": item.externalPreference,
+			"wide-metrics":        item.wideMetrics,
 			"export-policy":     item.exportPolicy,
 			"import-policy":     item.importPolicy,
 			"graceful-restart":  item.gracefulRestart,
@@ -959,7 +982,7 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 				"admin-state":                 bfdAdmin,
 				"oper-state":                  bfdOper,
 				"desired-minimum-tx-interval": bfdTx,
-				"required-minimum-receive":   bfdRx,
+				"required-minimum-receive":    bfdRx,
 				"detection-multiplier":        bfdMult,
 			}
 
@@ -1033,11 +1056,13 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 		topData := map[string]interface{}{
 			"admin-state":       item.adminState,
 			"oper-state":        item.operState,
-			"variance":          item.variance,
-			"maximum-paths":     item.maximumPaths,
-			"maximum-hops":      item.maximumHops,
-			"rib-scale":         item.ribScale,
-			"wide-metrics":      item.wideMetrics,
+			"variance":            item.variance,
+			"maximum-paths":       item.maximumPaths,
+			"maximum-hops":        item.maximumHops,
+			"rib-scale":           item.ribScale,
+			"preference":          item.preference,
+			"external-preference": item.externalPreference,
+			"wide-metrics":        item.wideMetrics,
 			"total-neighbors":   len(item.nbrList),
 			"total-routes":      len(item.routeList),
 			"total-interfaces":  len(item.intfList),
@@ -1140,13 +1165,33 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 			if rstSt == "" {
 				rstSt = "normal"
 			}
-			authMd := n.AuthMode
-			if authMd == "" {
-				authMd = "none"
-			}
 			afName := "ipv4-unicast"
 			if strings.Contains(n.IPAddress, ":") {
 				afName = "ipv6-unicast"
+			}
+			authMd := n.AuthMode
+			if authMd == "" || authMd == "none" {
+				normIf := normalizeIfName(n.Interface)
+				var ic *InterfaceConfig
+				if c, ok := item.configuredInterfaces[n.Interface]; ok {
+					ic = c
+				} else if c, ok := item.configuredInterfaces[normIf]; ok {
+					ic = c
+				}
+				if ic != nil {
+					auth := ic.GetAfiAuthentication(afName, item.defaultIntf, item.authentication)
+					if auth != nil && auth.Mode != "" && auth.Mode != "none" {
+						authMd = auth.Mode
+					}
+				} else if item.defaultIntf != nil {
+					authDef := item.defaultIntf.GetAfiAuthentication(afName)
+					if authDef != nil && authDef.Mode != "" && authDef.Mode != "none" {
+						authMd = authDef.Mode
+					}
+				}
+			}
+			if authMd == "" {
+				authMd = "none"
 			}
 			nbrData := map[string]interface{}{
 				"ip-address":     n.IPAddress,
@@ -1174,9 +1219,13 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 
 		// Routes
 		for _, r := range item.routeList {
-			pref := uint8(90)
-			if r.External {
-				pref = 170
+			pref := r.Preference
+			if pref == 0 {
+				if r.External {
+					pref = item.externalPreference
+				} else {
+					pref = item.preference
+				}
 			}
 			routeKey := fmt.Sprintf(".network_instance{.name==\"%s\"}.protocols.eigrp.route{.prefix==\"%s\"}", ni, r.Prefix)
 			currentKeys[routeKey] = struct{}{}
@@ -1312,10 +1361,25 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 			if item.operState == "down" || afAdmin == "disable" {
 				afOper = "down"
 			}
+			afPref := item.preference
+			afExtPref := item.externalPreference
+			for _, af := range item.addressFamily {
+				if af.Name == afName {
+					if af.Preference > 0 {
+						afPref = af.Preference
+					}
+					if af.ExternalPreference > 0 {
+						afExtPref = af.ExternalPreference
+					}
+					break
+				}
+			}
 			afData := map[string]interface{}{
-				"name":        afName,
-				"admin-state": afAdmin,
-				"oper-state":  afOper,
+				"name":                afName,
+				"admin-state":         afAdmin,
+				"oper-state":          afOper,
+				"preference":          afPref,
+				"external-preference": afExtPref,
 			}
 			if afOper != "up" {
 				if afAdmin == "disable" {
@@ -1350,7 +1414,7 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 				"reliable-unicast":     tf.ReliableUcast,
 				"unreliable-unicast":   tf.UnreliableUcast,
 				"retransmissions":      tf.Retransmissions,
-				"cr-packets":          tf.CRPackets,
+				"cr-packets":           tf.CRPackets,
 			}
 			if b, err := json.Marshal(trafData); err == nil {
 				states = append(states, &ndk.TelemetryInfo{
@@ -1412,7 +1476,7 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 	d.prevTeleKeys = currentKeys
 	d.mu.Unlock()
 
-	if len(delKeys) > 0 {
+	if len(delKeys) > 0 && d.teleClient != nil {
 		delReq := &ndk.TelemetryDeleteRequest{Keys: delKeys}
 		if _, err := d.teleClient.TelemetryDelete(ctx, delReq); err != nil {
 			log.Debug().Err(err).Msg("TelemetryDelete failed")
@@ -1437,7 +1501,7 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 	})
 
 	// Add or update current states
-	if len(states) > 0 {
+	if len(states) > 0 && d.teleClient != nil {
 		req := &ndk.TelemetryUpdateRequest{States: states}
 		resp, err := d.teleClient.TelemetryAddOrUpdate(ctx, req)
 		if err != nil {

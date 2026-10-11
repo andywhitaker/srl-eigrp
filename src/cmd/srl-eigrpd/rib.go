@@ -13,7 +13,7 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-func (d *EigrpDaemon) OnRouteAdd(netinst string, prefix string, nexthop string, metric uint32, wideMetric uint64, isExt bool) {
+func (d *EigrpDaemon) OnRouteAdd(netinst string, prefix string, nexthop string, metric uint32, wideMetric uint64, isExt bool, preference uint32) {
 	if netinst == "" {
 		netinst = "default"
 	}
@@ -93,14 +93,19 @@ func (d *EigrpDaemon) OnRouteAdd(netinst string, prefix string, nexthop string, 
 			},
 		},
 	}
-	if _, err := d.nhgClient.NextHopGroupAddOrUpdate(ctx, nhgReq); err != nil {
-		log.Error().Err(err).Str("netinst", netinst).Str("nhg", nhgName).Msg("NextHopGroupAddOrUpdate failed")
-		return
+	if d.nhgClient != nil {
+		if _, err := d.nhgClient.NextHopGroupAddOrUpdate(ctx, nhgReq); err != nil {
+			log.Error().Err(err).Str("netinst", netinst).Str("nhg", nhgName).Msg("NextHopGroupAddOrUpdate failed")
+			return
+		}
 	}
 
-	pref := uint32(90) // EIGRP Internal
-	if isExt {
-		pref = 170     // EIGRP External
+	pref := preference
+	if pref == 0 {
+		pref = 90 // EIGRP Internal
+		if isExt {
+			pref = 170 // EIGRP External
+		}
 	}
 
 	routeReq := &ndk.RouteAddRequest{
@@ -121,9 +126,11 @@ func (d *EigrpDaemon) OnRouteAdd(netinst string, prefix string, nexthop string, 
 			},
 		},
 	}
-	if _, err := d.routeClient.RouteAddOrUpdate(ctx, routeReq); err != nil {
-		log.Error().Err(err).Str("netinst", netinst).Str("prefix", prefix).Msg("RouteAddOrUpdate failed")
-		return
+	if d.routeClient != nil {
+		if _, err := d.routeClient.RouteAddOrUpdate(ctx, routeReq); err != nil {
+			log.Error().Err(err).Str("netinst", netinst).Str("prefix", prefix).Msg("RouteAddOrUpdate failed")
+			return
+		}
 	}
 
 	primaryNh := validNhStrs[0]
@@ -135,6 +142,7 @@ func (d *EigrpDaemon) OnRouteAdd(netinst string, prefix string, nexthop string, 
 		Metric:     metric,
 		WideMetric: wideMetric,
 		External:   isExt,
+		Preference: uint8(pref),
 	}
 	d.mu.Unlock()
 	d.mu.RLock()
@@ -234,8 +242,10 @@ func (d *EigrpDaemon) withdrawRouteInternal(netinst string, prefix string) {
 			},
 		},
 	}
-	if _, err := d.routeClient.RouteDelete(ctx, delReq); err != nil {
-		log.Error().Err(err).Str("netinst", netinst).Str("prefix", prefix).Msg("RouteDelete failed")
+	if d.routeClient != nil {
+		if _, err := d.routeClient.RouteDelete(ctx, delReq); err != nil {
+			log.Error().Err(err).Str("netinst", netinst).Str("prefix", prefix).Msg("RouteDelete failed")
+		}
 	}
 	nhgDelReq := &ndk.NextHopGroupDeleteRequest{
 		GroupKeys: []*ndk.NextHopGroupKey{
@@ -245,8 +255,10 @@ func (d *EigrpDaemon) withdrawRouteInternal(netinst string, prefix string) {
 			},
 		},
 	}
-	if _, err := d.nhgClient.NextHopGroupDelete(ctx, nhgDelReq); err != nil {
-		log.Debug().Err(err).Str("netinst", netinst).Str("nhg", nhgName).Msg("NextHopGroupDelete failed")
+	if d.nhgClient != nil {
+		if _, err := d.nhgClient.NextHopGroupDelete(ctx, nhgDelReq); err != nil {
+			log.Debug().Err(err).Str("netinst", netinst).Str("nhg", nhgName).Msg("NextHopGroupDelete failed")
+		}
 	}
 
 	log.Info().Str("netinst", netinst).Str("prefix", prefix).Msg("Withdrew EIGRP route from FIB")
@@ -302,20 +314,30 @@ func (d *EigrpDaemon) triggerDebouncedTelemetry() {
 }
 
 func (d *EigrpDaemon) FibSyncStart(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	d.mu.Lock()
 	d.fibSyncActive = true
 	d.mu.Unlock()
 
 	log.Info().Msg("Initiating NDK hitless FIB state synchronization")
-	if _, err := d.nhgClient.SyncStart(ctx, &ndk.SyncRequest{}); err != nil {
-		log.Error().Err(err).Msg("nhgClient.SyncStart failed")
+	if d.nhgClient != nil {
+		if _, err := d.nhgClient.SyncStart(ctx, &ndk.SyncRequest{}); err != nil {
+			log.Error().Err(err).Msg("nhgClient.SyncStart failed")
+		}
 	}
-	if _, err := d.routeClient.SyncStart(ctx, &ndk.SyncRequest{}); err != nil {
-		log.Error().Err(err).Msg("routeClient.SyncStart failed")
+	if d.routeClient != nil {
+		if _, err := d.routeClient.SyncStart(ctx, &ndk.SyncRequest{}); err != nil {
+			log.Error().Err(err).Msg("routeClient.SyncStart failed")
+		}
 	}
 }
 
 func (d *EigrpDaemon) FibSyncEnd(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	d.mu.Lock()
 	if !d.fibSyncActive {
 		d.mu.Unlock()
@@ -332,11 +354,15 @@ func (d *EigrpDaemon) FibSyncEnd(ctx context.Context) {
 	fibSyncMu.Unlock()
 
 	log.Info().Msg("Completing NDK hitless FIB state synchronization (purging orphaned routes and NHGs)")
-	if _, err := d.routeClient.SyncEnd(ctx, &ndk.SyncRequest{}); err != nil {
-		log.Error().Err(err).Msg("routeClient.SyncEnd failed")
+	if d.routeClient != nil {
+		if _, err := d.routeClient.SyncEnd(ctx, &ndk.SyncRequest{}); err != nil {
+			log.Error().Err(err).Msg("routeClient.SyncEnd failed")
+		}
 	}
-	if _, err := d.nhgClient.SyncEnd(ctx, &ndk.SyncRequest{}); err != nil {
-		log.Error().Err(err).Msg("nhgClient.SyncEnd failed")
+	if d.nhgClient != nil {
+		if _, err := d.nhgClient.SyncEnd(ctx, &ndk.SyncRequest{}); err != nil {
+			log.Error().Err(err).Msg("nhgClient.SyncEnd failed")
+		}
 	}
 }
 

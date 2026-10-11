@@ -39,18 +39,19 @@ type RouteInfo struct {
 	Metric     uint32 `json:"metric"`
 	WideMetric uint64 `json:"wide-metric"`
 	External   bool   `json:"external"`
+	Preference uint8  `json:"preference,omitempty"`
 }
 
 type NeighborInfo struct {
-	IPAddress    string `json:"ip-address"`
-	Interface    string `json:"interface"`
-	State        string `json:"state"`
-	HoldTime     uint16 `json:"hold-time"`
-	Uptime       uint64 `json:"uptime"`
-	SRTT         uint32 `json:"srtt-ms"`
-	RTO          uint32 `json:"rto-ms"`
-	BfdState     string `json:"bfd-state,omitempty"`
-	RestartState string `json:"restart-state,omitempty"`
+	IPAddress      string `json:"ip-address"`
+	Interface      string `json:"interface"`
+	State          string `json:"state"`
+	HoldTime       uint16 `json:"hold-time"`
+	Uptime         uint64 `json:"uptime"`
+	SRTT           uint32 `json:"srtt-ms"`
+	RTO            uint32 `json:"rto-ms"`
+	BfdState       string `json:"bfd-state,omitempty"`
+	RestartState   string `json:"restart-state,omitempty"`
 	AuthMode       string `json:"auth-mode,omitempty"`
 	OperDownReason string `json:"oper-down-reason,omitempty"`
 }
@@ -113,39 +114,41 @@ type IPCResponse struct {
 }
 
 type EigrpInstance struct {
-	netinst                string
-	asn                    uint16
-	routerId               string
-	adminState             string
-	operState              string
-	networks               []string
-	configuredInterfaces   map[string]*InterfaceConfig
-	defaultIntf            *DefaultInterfaceConfig
-	exportPolicy           string
-	importPolicy           string
-	variance               uint8
-	maximumPaths           uint8
-	maximumHops            uint8
-	ribScale               uint8
-	wideMetrics            bool
-	hasV6                  bool
-	gracefulRestart        *GracefulRestartConfig
-	metrics                *MetricsConfig
-	metricWeights          *MetricsConfig
-	timers                 *TimersConfig
-	authentication         *AuthConfig
-	addressFamily          []AddressFamilyConfig
-	restarting             bool
-	bfdSessions            map[string]string
-	staticNeighbors        map[string]*StaticNeighborConfig
-	redistributedRoutes    map[string]string
+	netinst              string
+	asn                  uint16
+	routerId             string
+	adminState           string
+	operState            string
+	networks             []string
+	configuredInterfaces map[string]*InterfaceConfig
+	defaultIntf          *DefaultInterfaceConfig
+	exportPolicy         string
+	importPolicy         string
+	variance             uint8
+	maximumPaths         uint8
+	maximumHops          uint8
+	ribScale             uint8
+	preference           uint8
+	externalPreference   uint8
+	wideMetrics          bool
+	hasV6                bool
+	gracefulRestart      *GracefulRestartConfig
+	metrics              *MetricsConfig
+	metricWeights        *MetricsConfig
+	timers               *TimersConfig
+	authentication       *AuthConfig
+	addressFamily        []AddressFamilyConfig
+	restarting           bool
+	bfdSessions          map[string]string
+	staticNeighbors      map[string]*StaticNeighborConfig
+	redistributedRoutes  map[string]string
 
-	routes         map[string]*RouteInfo
-	neighbors      map[string]*NeighborInfo
-	interfaces     map[string]*InterfaceInfo
-	topology       map[string]*TopologyPrefixInfo
-	traffic        map[string]*TrafficInfo
-	currentPfx     *TopologyPrefixInfo
+	routes     map[string]*RouteInfo
+	neighbors  map[string]*NeighborInfo
+	interfaces map[string]*InterfaceInfo
+	topology   map[string]*TopologyPrefixInfo
+	traffic    map[string]*TrafficInfo
+	currentPfx *TopologyPrefixInfo
 
 	tempNeighbors  map[string]*NeighborInfo
 	tempInterfaces map[string]*InterfaceInfo
@@ -230,29 +233,100 @@ func (inst *EigrpInstance) SetAfiImportPolicy(afi string, policy string) {
 	})
 }
 
+func (inst *EigrpInstance) GetAfiPreference(afi string) uint8 {
+	for _, af := range inst.addressFamily {
+		if af.Name == afi && af.Preference > 0 {
+			return af.Preference
+		}
+	}
+	if inst.preference > 0 {
+		return inst.preference
+	}
+	return 90
+}
+
+func (inst *EigrpInstance) SetAfiPreference(afi string, pref uint8) {
+	for i, af := range inst.addressFamily {
+		if af.Name == afi {
+			inst.addressFamily[i].Preference = pref
+			return
+		}
+	}
+	inst.addressFamily = append(inst.addressFamily, AddressFamilyConfig{
+		Name:       afi,
+		Preference: pref,
+	})
+}
+
+func (inst *EigrpInstance) GetAfiExternalPreference(afi string) uint8 {
+	for _, af := range inst.addressFamily {
+		if af.Name == afi && af.ExternalPreference > 0 {
+			return af.ExternalPreference
+		}
+	}
+	if inst.externalPreference > 0 {
+		return inst.externalPreference
+	}
+	return 170
+}
+
+func (inst *EigrpInstance) SetAfiExternalPreference(afi string, extPref uint8) {
+	for i, af := range inst.addressFamily {
+		if af.Name == afi {
+			inst.addressFamily[i].ExternalPreference = extPref
+			return
+		}
+	}
+	inst.addressFamily = append(inst.addressFamily, AddressFamilyConfig{
+		Name:               afi,
+		ExternalPreference: extPref,
+	})
+}
+
+func (inst *EigrpInstance) SetAfiPreferences(afi string, pref, extPref uint8) {
+	for i, af := range inst.addressFamily {
+		if af.Name == afi {
+			if pref > 0 {
+				inst.addressFamily[i].Preference = pref
+			}
+			if extPref > 0 {
+				inst.addressFamily[i].ExternalPreference = extPref
+			}
+			return
+		}
+	}
+	inst.addressFamily = append(inst.addressFamily, AddressFamilyConfig{
+		Name:               afi,
+		Preference:         pref,
+		ExternalPreference: extPref,
+	})
+}
+
 func newEigrpInstance(netinst string) *EigrpInstance {
 	return &EigrpInstance{
-		netinst:                netinst,
-		adminState:             "enable",
-		operState:              "up",
-		variance:               1,
-		maximumPaths:           4,
-		maximumHops:            100,
-		ribScale:               128,
-		wideMetrics:            true,
-		configuredInterfaces:   make(map[string]*InterfaceConfig),
-		staticNeighbors:        make(map[string]*StaticNeighborConfig),
-		routes:                 make(map[string]*RouteInfo),
-		neighbors:              make(map[string]*NeighborInfo),
-		interfaces:             make(map[string]*InterfaceInfo),
-		topology:               make(map[string]*TopologyPrefixInfo),
-		traffic:                make(map[string]*TrafficInfo),
-		tempNeighbors:          make(map[string]*NeighborInfo),
-		tempInterfaces:         make(map[string]*InterfaceInfo),
-		tempTopology:           make(map[string]*TopologyPrefixInfo),
-		tempTraffic:            make(map[string]*TrafficInfo),
-		bfdSessions:            make(map[string]string),
-		redistributedRoutes:    make(map[string]string),
+		netinst:              netinst,
+		adminState:           "enable",
+		operState:            "up",
+		variance:             1,
+		maximumPaths:         4,
+		maximumHops:          100,
+		ribScale:             128,
+		preference:           90,
+		externalPreference:   170,
+		wideMetrics:          true,
+		configuredInterfaces: make(map[string]*InterfaceConfig),
+		staticNeighbors:      make(map[string]*StaticNeighborConfig),
+		routes:               make(map[string]*RouteInfo),
+		neighbors:            make(map[string]*NeighborInfo),
+		interfaces:           make(map[string]*InterfaceInfo),
+		topology:             make(map[string]*TopologyPrefixInfo),
+		traffic:              make(map[string]*TrafficInfo),
+		tempNeighbors:        make(map[string]*NeighborInfo),
+		tempInterfaces:       make(map[string]*InterfaceInfo),
+		tempTopology:         make(map[string]*TopologyPrefixInfo),
+		tempTraffic:          make(map[string]*TrafficInfo),
+		bfdSessions:          make(map[string]string),
+		redistributedRoutes:  make(map[string]string),
 	}
 }
 
@@ -273,21 +347,25 @@ func (inst *EigrpInstance) CommitTelemetryCollection() {
 }
 
 type EigrpDaemon struct {
-	conn         *grpc.ClientConn
-	sdkClient    ndk.SdkMgrServiceClient
-	routeClient  ndk.SdkMgrRouteServiceClient
-	nhgClient    ndk.SdkMgrNextHopGroupServiceClient
-	teleClient   ndk.SdkMgrTelemetryServiceClient
-	notifClient  ndk.SdkNotificationServiceClient
-	appId        uint32
-	streamId     uint64
-	mu           sync.RWMutex
-	instances    map[string]*EigrpInstance
-	prevTeleKeys map[string]struct{}
-	policies     map[string]*PolicyMetricConfig
-	policyDefs   map[string]*PolicyDef
-	redistChan   chan string
-	fibSyncActive bool
+	conn           *grpc.ClientConn
+	sdkClient      ndk.SdkMgrServiceClient
+	routeClient    ndk.SdkMgrRouteServiceClient
+	nhgClient      ndk.SdkMgrNextHopGroupServiceClient
+	teleClient     ndk.SdkMgrTelemetryServiceClient
+	notifClient    ndk.SdkNotificationServiceClient
+	appId          uint32
+	streamId       uint64
+	mu             sync.RWMutex
+	instances      map[string]*EigrpInstance
+	prevTeleKeys   map[string]struct{}
+	policies       map[string]*PolicyMetricConfig
+	policyDefs     map[string]*PolicyDef
+	redistChan     chan string
+	fibSyncActive  bool
+	routeWorkers   map[string]*routeQueueWorker
+	routeWorkersMu sync.Mutex
+	routeCache     map[string]*candidateRouteCacheEntry
+	routeCacheMu   sync.RWMutex
 }
 
 var daemonApp *EigrpDaemon
@@ -298,6 +376,9 @@ func (d *EigrpDaemon) GetInstance(netinst string) *EigrpInstance {
 	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+	if d.instances == nil {
+		return nil
+	}
 	return d.instances[netinst]
 }
 
@@ -307,6 +388,9 @@ func (d *EigrpDaemon) GetOrCreateInstance(netinst string) *EigrpInstance {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.instances == nil {
+		d.instances = make(map[string]*EigrpInstance)
+	}
 	inst, exists := d.instances[netinst]
 	if !exists {
 		inst = newEigrpInstance(netinst)
@@ -319,8 +403,12 @@ func (d *EigrpDaemon) DeleteInstance(netinst string) {
 	if netinst == "" {
 		netinst = "default"
 	}
+	d.StopRouteWorker(netinst)
+	d.InvalidateCandidateRouteCache(netinst)
 	d.mu.Lock()
-	delete(d.instances, netinst)
+	if d.instances != nil {
+		delete(d.instances, netinst)
+	}
 	d.mu.Unlock()
 }
 
@@ -964,6 +1052,8 @@ func main() {
 		policies:     make(map[string]*PolicyMetricConfig),
 		policyDefs:   make(map[string]*PolicyDef),
 		redistChan:   make(chan string, 32),
+		routeWorkers: make(map[string]*routeQueueWorker),
+		routeCache:   make(map[string]*candidateRouteCacheEntry),
 	}
 
 	daemonApp.Register(ctx)
@@ -985,6 +1075,7 @@ func main() {
 	sig := <-sigCh
 
 	log.Info().Str("signal", sig.String()).Msg("Shutting down srl-eigrpd...")
+	daemonApp.StopAllRouteWorkers()
 	daemonApp.FibSyncEnd(context.Background())
 	C.srlShimFinish()
 	if conn != nil {
