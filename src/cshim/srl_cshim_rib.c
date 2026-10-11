@@ -73,7 +73,7 @@ eigrp_result_t eigrp_rib_route_add(eigrp_instance_t *eigrp, const eigrp_rib_rout
     }
     uint64_t scaled = route->metric / rib_scale;
     if (scaled == 0 && route->metric > 0) scaled = 1;
-    if (scaled > UINT32_MAX) scaled = UINT32_MAX;
+    if (scaled > 4294967294ULL) scaled = 4294967294ULL;
     uint32_t rib_metric = (uint32_t)scaled;
     srlGoRouteAdd((char *)netinst, pfx_str, nhs_buf, rib_metric, (uint64_t)route->metric, is_ext);
     return EIGRP_RESULT_SUCCESS;

@@ -52,9 +52,7 @@ jobs:
 
       - name: Install nFPM
         run: |
-          echo 'deb [trusted=yes] https://repo.goreleaser.com/apt/ /' | sudo tee /etc/apt/sources.list.d/goreleaser.list
-          sudo apt-get update
-          sudo apt-get install -y nfpm
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
 
       - name: Build Debian Package
         run: |

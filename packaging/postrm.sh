@@ -30,8 +30,8 @@ def remove_cpm(filter_type, match_regex):
             return
 
         cmds = ["enter candidate"]
-        for seq in entries_to_delete:
-            cmds.append(f"/ acl acl-filter cpm type {filter_type} entry {seq} delete")
+        for seq in sorted(entries_to_delete):
+            cmds.append(f"delete / acl acl-filter cpm type {filter_type} entry {seq}")
         cmds.append("commit now")
 
         subprocess.run(

@@ -571,11 +571,11 @@ class Plugin(CliPlugin):
             # Summary view
             is_v6 = any(":" in str(n.get("ip-address", "")) for n in nbrs)
             ip_w = 30 if is_v6 else 16
-            div_len = 114 if is_v6 else 98
+            div_len = 116 if is_v6 else 100
             output.print_line("=" * div_len)
             output.print_line(f"EIGRP Neighbors for Network-Instance: {netinst} (AS: {asn})")
             output.print_line("-" * div_len)
-            output.print_line(f"{'Neighbor IP':<{ip_w}} {'Interface':<18} {'State':<8} {'Hold (s)':<10} {'Uptime (s)':<12} {'BFD':<10} {'Auth':<10}")
+            output.print_line(f"{'Neighbor IP':<{ip_w}} {'Interface':<18} {'State':<8} {'Hold (s)':<10} {'Uptime (s)':<12} {'BFD':<12} {'Auth':<10}")
             output.print_line("-" * div_len)
 
             if not nbrs:
@@ -625,7 +625,7 @@ class Plugin(CliPlugin):
                     up_clean = up_raw[:-1] if up_raw.endswith("s") else up_raw
                     bfd_st = str(n.get("bfd-state", "disabled"))
                     auth_md = str(n.get("auth-mode", "none"))
-                    output.print_line(f"{ip:<{ip_w}} {itf:<18} {st:<8} {hold:<10} {up_clean:<12} {bfd_st:<10} {auth_md:<10}")
+                    output.print_line(f"{ip:<{ip_w}} {itf:<18} {st:<8} {hold:<10} {up_clean:<12} {bfd_st:<12} {auth_md:<10}")
 
             output.print_line("-" * div_len)
             output.print_line(f"Total Neighbors: {len(nbrs)}")

@@ -1,7 +1,7 @@
 #!/bin/bash
 action="${1:-remove}"
 
-if [ "$action" = "remove" ]; then
+if [ "$action" = "remove" ] || [ "$action" = "purge" ]; then
     if command -v sr_cli >/dev/null 2>&1; then
         eigrp_cfg=$(sr_cli "info flat / network-instance * protocols eigrp" 2>/dev/null | grep "protocols eigrp" || true)
         if [ -n "$eigrp_cfg" ]; then
