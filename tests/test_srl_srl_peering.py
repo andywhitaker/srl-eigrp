@@ -280,26 +280,36 @@ EOF"""
     out = srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", policy_cfg])
     assert "All changes have been committed" in out or "committed" in out.lower(), f"Policy commit failed: {out}"
 
-    info_action = srl_exec("clab-srl-srl-eigrp-srl1", [
-        "sr_cli", "info routing-policy policy eigrp-policy statement 10 action eigrp"
-    ])
-    assert "bandwidth 100000" in info_action, f"metric bandwidth missing: {info_action}"
-    assert "delay 100" in info_action, f"metric delay missing: {info_action}"
-    assert "reliability 255" in info_action, f"metric reliability missing: {info_action}"
-    assert "load 1" in info_action, f"metric load missing: {info_action}"
-    assert "mtu 1500" in info_action, f"metric mtu missing: {info_action}"
+    try:
+        info_action = srl_exec("clab-srl-srl-eigrp-srl1", [
+            "sr_cli", "info routing-policy policy eigrp-policy statement 10 action eigrp"
+        ])
+        assert "bandwidth 100000" in info_action, f"metric bandwidth missing: {info_action}"
+        assert "delay 100" in info_action, f"metric delay missing: {info_action}"
+        assert "reliability 255" in info_action, f"metric reliability missing: {info_action}"
+        assert "load 1" in info_action, f"metric load missing: {info_action}"
+        assert "mtu 1500" in info_action, f"metric mtu missing: {info_action}"
 
-    info_defaction = srl_exec("clab-srl-srl-eigrp-srl1", [
-        "sr_cli", "info routing-policy policy eigrp-policy default-action eigrp"
-    ])
-    assert "bandwidth 50000" in info_defaction, f"default-action metric bandwidth missing: {info_defaction}"
+        info_defaction = srl_exec("clab-srl-srl-eigrp-srl1", [
+            "sr_cli", "info routing-policy policy eigrp-policy default-action eigrp"
+        ])
+        assert "bandwidth 50000" in info_defaction, f"default-action metric bandwidth missing: {info_defaction}"
 
-    # Verify standard import-policy and export-policy leaves are present under address-family in running config
-    info_eigrp = srl_exec("clab-srl-srl-eigrp-srl1", [
-        "sr_cli", "info network-instance default protocols eigrp address-family ipv4-unicast"
-    ])
-    assert "export-policy eigrp-policy" in info_eigrp, f"export-policy missing: {info_eigrp}"
-    assert "import-policy eigrp-policy" in info_eigrp, f"import-policy missing: {info_eigrp}"
+        # Verify standard import-policy and export-policy leaves are present under address-family in running config
+        info_eigrp = srl_exec("clab-srl-srl-eigrp-srl1", [
+            "sr_cli", "info network-instance default protocols eigrp address-family ipv4-unicast"
+        ])
+        assert "export-policy eigrp-policy" in info_eigrp, f"export-policy missing: {info_eigrp}"
+        assert "import-policy eigrp-policy" in info_eigrp, f"import-policy missing: {info_eigrp}"
+    finally:
+        cleanup_cfg = """sr_cli << 'EOF'
+enter candidate
+delete / network-instance default protocols eigrp address-family ipv4-unicast export-policy
+delete / network-instance default protocols eigrp address-family ipv4-unicast import-policy
+delete / routing-policy policy eigrp-policy
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cleanup_cfg])
 
 
 def test_interface_dynamic_deletion(srl_exec):
@@ -1092,50 +1102,51 @@ EOF"""
     srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_bfd_enable])
     srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", cfg_bfd_enable])
 
-    # Ensure neighbor is Up and BFD is Up
-    bfd_up = False
-    for _ in range(15):
-        time.sleep(1)
-        out = srl_exec("clab-srl-srl-eigrp-srl1", [
-            "sr_cli", "show network-instance default protocols eigrp neighbor"
+    try:
+        # Ensure neighbor is Up and BFD is Up
+        bfd_up = False
+        for _ in range(15):
+            time.sleep(1)
+            out = srl_exec("clab-srl-srl-eigrp-srl1", [
+                "sr_cli", "show network-instance default protocols eigrp neighbor"
+            ])
+            if "10.0.0.2" in out and "Up" in out and ("up" in out or "not-tracked" in out or "listening" in out):
+                bfd_up = True
+                break
+        assert bfd_up, f"Neighbor not Up with BFD up before teardown test: {out}"
+
+        # Verify BFD state in state DB
+        out_state = srl_exec("clab-srl-srl-eigrp-srl1", [
+            "sr_cli", "info from state network-instance default protocols eigrp"
         ])
-        if "10.0.0.2" in out and "Up" in out and ("up" in out or "not-tracked" in out or "listening" in out):
-            bfd_up = True
-            break
-    assert bfd_up, f"Neighbor not Up with BFD up before teardown test: {out}"
+        assert "bfd-state" in out_state, f"State DB missing bfd-state: {out_state}"
 
-    # Verify BFD state in state DB
-    out_state = srl_exec("clab-srl-srl-eigrp-srl1", [
-        "sr_cli", "info from state network-instance default protocols eigrp"
-    ])
-    assert "bfd-state" in out_state, f"State DB missing bfd-state: {out_state}"
-
-    # 2. Trigger BFD down operational tool command
-    out_bfd = srl_exec("clab-srl-srl-eigrp-srl1", [
-        "sr_cli", "tools network-instance default protocols eigrp neighbor bfd-down 10.0.0.2"
-    ])
-    assert "Success" in out_bfd or "BFD down signaled" in out_bfd, f"BFD down command failed: {out_bfd}"
-
-    # 3. Verify neighbor adjacency was torn down and recovers once Hellos resume
-    recovered = False
-    for _ in range(20):
-        time.sleep(1)
-        out = srl_exec("clab-srl-srl-eigrp-srl1", [
-            "sr_cli", "show network-instance default protocols eigrp neighbor"
+        # 2. Trigger BFD down operational tool command
+        out_bfd = srl_exec("clab-srl-srl-eigrp-srl1", [
+            "sr_cli", "tools network-instance default protocols eigrp neighbor bfd-down 10.0.0.2"
         ])
-        if "10.0.0.2" in out and "Up" in out:
-            recovered = True
-            break
-    assert recovered, f"Neighbor failed to recover after BFD teardown: {out}"
+        assert "Success" in out_bfd or "BFD down signaled" in out_bfd, f"BFD down command failed: {out_bfd}"
 
-    # 4. Clean up BFD config
-    cfg_bfd_clean = """sr_cli << 'EOF'
+        # 3. Verify neighbor adjacency was torn down and recovers once Hellos resume
+        recovered = False
+        for _ in range(20):
+            time.sleep(1)
+            out = srl_exec("clab-srl-srl-eigrp-srl1", [
+                "sr_cli", "show network-instance default protocols eigrp neighbor"
+            ])
+            if "10.0.0.2" in out and "Up" in out:
+                recovered = True
+                break
+        assert recovered, f"Neighbor failed to recover after BFD teardown: {out}"
+    finally:
+        # 4. Clean up BFD config
+        cfg_bfd_clean = """sr_cli << 'EOF'
 enter candidate
 delete / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast bfd
 commit now
 EOF"""
-    srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_bfd_clean])
-    srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", cfg_bfd_clean])
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_bfd_clean])
+        srl_exec("clab-srl-srl-eigrp-srl2", ["bash", "-c", cfg_bfd_clean])
 
 
 def test_admin_state_disable_state_db(srl_exec):
@@ -1613,9 +1624,14 @@ EOF"""
         assert timers_ok, f"State DB did not reflect independent per-AFI timers: {out_state}"
 
         # Verify on SRL2 that neighbor hold times reflect independent timers
-        out_nbrs = srl_exec("clab-srl-srl-eigrp-srl2", [
-            "sr_cli", "show network-instance default protocols eigrp neighbor"
-        ])
+        out_nbrs = ""
+        for _ in range(15):
+            out_nbrs = srl_exec("clab-srl-srl-eigrp-srl2", [
+                "sr_cli", "show network-instance default protocols eigrp neighbor"
+            ])
+            if "10.0.0.1" in out_nbrs and "Up" in out_nbrs:
+                break
+            time.sleep(1)
         assert "10.0.0.1" in out_nbrs and "Up" in out_nbrs
     finally:
         revert_cfg = """sr_cli << 'EOF'

@@ -10,8 +10,6 @@
 
 #define IPPROTO_EIGRPIGP 88
 
-static __thread int t_netns_depth = 0;
-
 int srl_netns_restore_root(void) {
     int root_fd = open("/proc/1/ns/net", O_RDONLY | O_CLOEXEC);
     if (root_fd < 0) {
@@ -20,21 +18,25 @@ int srl_netns_restore_root(void) {
     if (root_fd >= 0) {
         int ret = setns(root_fd, CLONE_NEWNET);
         close(root_fd);
-        t_netns_depth = 0;
         return ret;
     }
-    t_netns_depth = 0;
     return -1;
 }
 
 int srl_netns_enter(const char *netinst, int *saved_ns) {
-    if (saved_ns) *saved_ns = 0;
+    if (!saved_ns) return -1;
+    *saved_ns = -1;
 
     char path[256];
     if (netinst && strcmp(netinst, "default") != 0 && strlen(netinst) > 0) {
         snprintf(path, sizeof(path), "/var/run/netns/srbase-%s", netinst);
     } else {
         snprintf(path, sizeof(path), "/var/run/netns/srbase-default");
+    }
+
+    int current_ns = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
+    if (current_ns < 0) {
+        return -1;
     }
 
     int target_ns = open(path, O_RDONLY | O_CLOEXEC);
@@ -49,26 +51,25 @@ int srl_netns_enter(const char *netinst, int *saved_ns) {
         }
     }
     if (target_ns < 0) {
+        close(current_ns);
         return -1;
     }
 
     if (setns(target_ns, CLONE_NEWNET) < 0) {
         close(target_ns);
+        close(current_ns);
         return -1;
     }
 
     close(target_ns);
-    t_netns_depth++;
+    *saved_ns = current_ns;
     return 0;
 }
 
 void srl_netns_leave(int saved_ns) {
-    (void)saved_ns;
-    if (t_netns_depth > 0) {
-        t_netns_depth--;
-    }
-    if (t_netns_depth == 0) {
-        srl_netns_restore_root();
+    if (saved_ns >= 0) {
+        setns(saved_ns, CLONE_NEWNET);
+        close(saved_ns);
     }
 }
 

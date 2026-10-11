@@ -280,6 +280,36 @@ static bool srl_match_ifname(const char *dev_name, const char *cfg_name) {
     return false;
 }
 
+static eigrp_ifindex_t srl_resolve_ifindex_dev(const char *ifname, char *dev_name_out, size_t dev_len) {
+    if (!ifname || !ifname[0]) return 0;
+    if (dev_name_out && dev_len > 0) dev_name_out[0] = '\0';
+
+    eigrp_ifindex_t idx = (eigrp_ifindex_t)if_nametoindex(ifname);
+    if (idx > 0) {
+        if (dev_name_out && dev_len > 0) {
+            strncpy(dev_name_out, ifname, dev_len - 1);
+            dev_name_out[dev_len - 1] = '\0';
+        }
+        return idx;
+    }
+
+    struct if_nameindex *nlist = if_nameindex();
+    if (nlist) {
+        for (struct if_nameindex *cur = nlist; cur->if_index != 0 && cur->if_name != NULL; cur++) {
+            if (srl_match_ifname(cur->if_name, ifname)) {
+                idx = (eigrp_ifindex_t)cur->if_index;
+                if (dev_name_out && dev_len > 0) {
+                    strncpy(dev_name_out, cur->if_name, dev_len - 1);
+                    dev_name_out[dev_len - 1] = '\0';
+                }
+                break;
+            }
+        }
+        if_freenameindex(nlist);
+    }
+    return idx;
+}
+
 static srl_binding_t *g_bindings = NULL;
 static srl_intf_t *g_interfaces = NULL;
 static pthread_mutex_t g_data_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
@@ -529,9 +559,7 @@ static void *srl_runtime_loop(void *arg) {
             void *cb_arg = ready->arg;
             free(ready);
             if (cb) {
-                pthread_mutex_lock(&g_data_lock);
                 cb(cb_arg);
-                pthread_mutex_unlock(&g_data_lock);
             }
         }
 
@@ -1808,13 +1836,14 @@ int srlShimInterfaceAdd(const char *netinst, const char *ifname, const char *ip_
 
     // Resolve ifindex inside netns if available
     eigrp_ifindex_t idx = 0;
+    char dev_name[IFNAMSIZ] = {0};
     int saved_ns = -1;
     bool in_ns = (srl_netns_enter(ni, &saved_ns) == 0);
     if (in_ns) {
-        idx = (eigrp_ifindex_t)if_nametoindex(ifname);
+        idx = srl_resolve_ifindex_dev(ifname, dev_name, sizeof(dev_name));
     }
     if (idx == 0) {
-        idx = (eigrp_ifindex_t)if_nametoindex(ifname);
+        idx = srl_resolve_ifindex_dev(ifname, dev_name, sizeof(dev_name));
     }
     if (idx == 0) {
         if (in_ns) srl_netns_leave(saved_ns);
@@ -1848,7 +1877,7 @@ int srlShimInterfaceAdd(const char *netinst, const char *ifname, const char *ip_
     if (sock >= 0) {
         struct ifreq ifr;
         memset(&ifr, 0, sizeof(ifr));
-        strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+        strncpy(ifr.ifr_name, dev_name[0] ? dev_name : ifname, IFNAMSIZ - 1);
         if (ioctl(sock, SIOCGIFMTU, &ifr) == 0 && ifr.ifr_mtu > 0) {
             found->mtu = (uint32_t)ifr.ifr_mtu;
         }
@@ -1861,7 +1890,7 @@ int srlShimInterfaceAdd(const char *netinst, const char *ifname, const char *ip_
 
     // Try reading speed from /sys/class/net/<ifname>/speed (Mbps -> Kbps)
     char speed_path[256];
-    snprintf(speed_path, sizeof(speed_path), "/sys/class/net/%s/speed", ifname);
+    snprintf(speed_path, sizeof(speed_path), "/sys/class/net/%s/speed", dev_name[0] ? dev_name : ifname);
     FILE *sf = fopen(speed_path, "r");
     if (sf) {
         long mbps = 0;
@@ -1896,13 +1925,14 @@ int srlShimInterfaceAddV6(const char *netinst, const char *ifname, const char *i
     if (inet_pton(AF_INET6, ip_addr, &in6) != 1) return -1;
 
     eigrp_ifindex_t idx = 0;
+    char dev_name[IFNAMSIZ] = {0};
     int saved_ns = -1;
     bool in_ns = (srl_netns_enter(ni, &saved_ns) == 0);
     if (in_ns) {
-        idx = (eigrp_ifindex_t)if_nametoindex(ifname);
+        idx = srl_resolve_ifindex_dev(ifname, dev_name, sizeof(dev_name));
     }
     if (idx == 0) {
-        idx = (eigrp_ifindex_t)if_nametoindex(ifname);
+        idx = srl_resolve_ifindex_dev(ifname, dev_name, sizeof(dev_name));
     }
     if (idx == 0) {
         if (in_ns) srl_netns_leave(saved_ns);
@@ -1932,7 +1962,7 @@ int srlShimInterfaceAddV6(const char *netinst, const char *ifname, const char *i
     if (sock >= 0) {
         struct ifreq ifr;
         memset(&ifr, 0, sizeof(ifr));
-        strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+        strncpy(ifr.ifr_name, dev_name[0] ? dev_name : ifname, IFNAMSIZ - 1);
         if (ioctl(sock, SIOCGIFMTU, &ifr) == 0 && ifr.ifr_mtu > 0) {
             found->mtu = (uint32_t)ifr.ifr_mtu;
         }
@@ -1944,7 +1974,7 @@ int srlShimInterfaceAddV6(const char *netinst, const char *ifname, const char *i
     }
 
     char speed_path[256];
-    snprintf(speed_path, sizeof(speed_path), "/sys/class/net/%s/speed", ifname);
+    snprintf(speed_path, sizeof(speed_path), "/sys/class/net/%s/speed", dev_name[0] ? dev_name : ifname);
     FILE *sf = fopen(speed_path, "r");
     if (sf) {
         long mbps = 0;
@@ -1989,10 +2019,13 @@ int srlShimInterfacesScan(const char *netinst) {
     const char *ni = (netinst && netinst[0]) ? netinst : "default";
     int saved_ns = -1;
     int entered = srl_netns_enter(ni, &saved_ns);
+    if (entered < 0) {
+        return -1;
+    }
 
     struct ifaddrs *ifap = NULL;
     if (getifaddrs(&ifap) != 0) {
-        if (entered == 0) srl_netns_leave(saved_ns);
+        srl_netns_leave(saved_ns);
         return -1;
     }
 
@@ -2041,7 +2074,7 @@ int srlShimInterfacesScan(const char *netinst) {
     }
 
     freeifaddrs(ifap);
-    if (entered == 0) srl_netns_leave(saved_ns);
+    srl_netns_leave(saved_ns);
     return 0;
 }
 
@@ -3191,9 +3224,7 @@ int srlShimRouteOriginateV6(const char *netinst, const char *prefix_str, const c
     metric.mtu[2] = 0xdc;
     metric.hop_count = 0;
 
-    pthread_mutex_lock(&g_data_lock);
     eigrp_result_t res = eigrp_topology_redistributed_route_update(runtime, &sr, &metric);
-    pthread_mutex_unlock(&g_data_lock);
     return (res == EIGRP_RESULT_SUCCESS) ? 0 : -1;
 }
 
@@ -3230,9 +3261,7 @@ int srlShimRouteWithdrawV6(const char *netinst, const char *prefix_str) {
     sr.redist.source.protocol = EIGRP_REDISTRIBUTE_PROTOCOL_CONNECTED;
     sr.install.type = EIGRP_RIB_ROUTE_INTERNAL;
 
-    pthread_mutex_lock(&g_data_lock);
     eigrp_result_t res = eigrp_topology_redistributed_route_remove(runtime, &sr);
-    pthread_mutex_unlock(&g_data_lock);
     return (res == EIGRP_RESULT_SUCCESS) ? 0 : -1;
 }
 
@@ -3313,9 +3342,7 @@ int srlShimRouteRedistributeAdd(const char *netinst, const char *prefix_str, con
     metric.mtu[2] = (m >> 16) & 0xff;
     metric.hop_count = 0;
 
-    pthread_mutex_lock(&g_data_lock);
     eigrp_result_t res = eigrp_topology_redistributed_route_update(runtime, &sr, &metric);
-    pthread_mutex_unlock(&g_data_lock);
     return (res == EIGRP_RESULT_SUCCESS) ? 0 : -1;
 }
 
@@ -3378,7 +3405,6 @@ int srlShimRouteRedistributeRemove(const char *netinst, const char *prefix_str, 
     }
 
     int success = 0;
-    pthread_mutex_lock(&g_data_lock);
     for (int i = 0; i < nprotos; i++) {
         eigrp_rib_route_t sr;
         memset(&sr, 0, sizeof(sr));
@@ -3390,7 +3416,6 @@ int srlShimRouteRedistributeRemove(const char *netinst, const char *prefix_str, 
             success = 1;
         }
     }
-    pthread_mutex_unlock(&g_data_lock);
     return success ? 0 : -1;
 }
 
