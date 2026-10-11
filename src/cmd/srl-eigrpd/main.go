@@ -1124,6 +1124,9 @@ func (d *EigrpDaemon) HandleBfdNotification(bfd *ndk.BfdSessionNotification) {
 
 	d.mu.Lock()
 	for _, inst := range d.instances {
+		if _, ok := inst.neighbors[destIp]; !ok {
+			continue
+		}
 		inst.bfdSessions[destIp] = statusStr
 		if nbr, ok := inst.neighbors[destIp]; ok {
 			nbr.BfdState = statusStr
