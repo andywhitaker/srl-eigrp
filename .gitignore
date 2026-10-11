@@ -28,6 +28,7 @@ topologies/clab-*
 .gemini/
 .antigravity/
 .agy/
+.agent/
 
 # IDE and Editor files
 .vscode/

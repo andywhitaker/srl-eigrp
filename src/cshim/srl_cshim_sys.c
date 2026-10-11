@@ -243,6 +243,8 @@ typedef struct srl_intf {
     struct srl_intf *next;
 } srl_intf_t;
 
+static void srl_intf_metric_update(eigrp_instance_t *runtime, eigrp_intf_t *ei);
+
 static bool srl_match_ifname(const char *dev_name, const char *cfg_name) {
     if (!dev_name || !cfg_name) return false;
     if (strcmp(dev_name, cfg_name) == 0) return true;
@@ -2931,6 +2933,47 @@ int srlShimInterfaceAdd(const char *netinst, const char *ifname, const char *ip_
 
     eigrp_sys_intf_update((eigrp_vrf_id_t)srl_vrf_id_get(ni), &st);
 
+    if (active) {
+        eigrp_instance_t *runtime = srl_instance_get_afi(ni, EIGRP_AFI_IPV4);
+        if (runtime) {
+            eigrp_prefix_t pfx;
+            memset(&pfx, 0, sizeof(pfx));
+            pfx.address.afi = EIGRP_AFI_IPV4;
+            pfx.prefix_length = (uint8_t)prefixlen;
+            uint32_t mask = (prefixlen == 0) ? 0 : htonl(~((1ULL << (32 - prefixlen)) - 1));
+            uint32_t net_ip = in.s_addr & mask;
+            memcpy(pfx.address.bytes, &net_ip, 4);
+
+            eigrp_instance_context_t ctx;
+            memset(&ctx, 0, sizeof(ctx));
+            ctx.runtime = runtime;
+            eigrp_network_create(&ctx, &pfx);
+
+            eigrp_intf_t *ei = eigrp_intf_lookup_by_name(runtime, st.interface_name);
+            if (!ei) ei = eigrp_intf_lookup_by_ifindex(runtime, st.ifindex);
+            if (ei) {
+                pthread_mutex_lock(&g_data_lock);
+                bool pass = false;
+                uint32_t bw = 0;
+                for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+                    if (strcmp(ci->netinst, ni) == 0 && (strcmp(ci->ifname, st.interface_name) == 0 || srl_match_ifname(ci->ifname, st.interface_name))) {
+                        pass = ci->passive;
+                        bw = ci->bandwidth;
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&g_data_lock);
+                ei->params.passive_interface = pass ? EIGRP_INTF_PASSIVE : EIGRP_INTF_ACTIVE;
+                if (bw > 0) {
+                    ei->params.bandwidth = bw;
+                    ei->curr_bandwidth = bw;
+                }
+                srl_intf_metric_update(runtime, ei);
+                eigrp_intf_multicast_update(EIGRP_SET, ei);
+            }
+        }
+    }
+
     return 0;
 }
 
@@ -3038,6 +3081,34 @@ int srlShimInterfaceAddV6(const char *netinst, const char *ifname, const char *i
     }
 
     eigrp_sys_intf_update((eigrp_vrf_id_t)srl_vrf_id_get(ni), &st);
+
+    if (active_v6) {
+        eigrp_instance_t *runtime_v6 = srl_instance_get_afi(ni, EIGRP_AFI_IPV6);
+        if (runtime_v6) {
+            eigrp_intf_t *ei_v6 = eigrp_intf_lookup_by_name(runtime_v6, st.interface_name);
+            if (!ei_v6) ei_v6 = eigrp_intf_lookup_by_ifindex(runtime_v6, st.ifindex);
+            if (ei_v6) {
+                pthread_mutex_lock(&g_data_lock);
+                bool pass_v6 = false;
+                uint32_t bw = 0;
+                for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+                    if (strcmp(ci->netinst, ni) == 0 && (strcmp(ci->ifname, st.interface_name) == 0 || srl_match_ifname(ci->ifname, st.interface_name))) {
+                        pass_v6 = ci->passive_v6;
+                        bw = ci->bandwidth;
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&g_data_lock);
+                ei_v6->params.passive_interface = pass_v6 ? EIGRP_INTF_PASSIVE : EIGRP_INTF_ACTIVE;
+                if (bw > 0) {
+                    ei_v6->params.bandwidth = bw;
+                    ei_v6->curr_bandwidth = bw;
+                }
+                srl_intf_metric_update(runtime_v6, ei_v6);
+                eigrp_intf_multicast_update(EIGRP_SET, ei_v6);
+            }
+        }
+    }
 
     return 0;
 }
@@ -3897,6 +3968,15 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
         }
     }
     if (!found) {
+        found = calloc(1, sizeof(*found));
+        if (found) {
+            strncpy(found->netinst, ni, sizeof(found->netinst) - 1);
+            strncpy(found->ifname, ifname, sizeof(found->ifname) - 1);
+            found->next = g_interfaces;
+            g_interfaces = found;
+        }
+    }
+    if (!found) {
         pthread_mutex_unlock(&g_data_lock);
         return -1;
     }
@@ -3914,6 +3994,11 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
         found->bandwidth = bandwidth;
     } else {
         found->bandwidth = EIGRP_BANDWIDTH_DEFAULT;
+    }
+
+    if (admin_up && (found->ifindex == 0 || found->address.prefix_length == 0)) {
+        pthread_mutex_unlock(&g_data_lock);
+        return 0;
     }
 
     eigrp_prefix_t pfx;
@@ -4118,6 +4203,15 @@ int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passi
         }
     }
     if (!found) {
+        found = calloc(1, sizeof(*found));
+        if (found) {
+            strncpy(found->netinst, ni, sizeof(found->netinst) - 1);
+            strncpy(found->ifname, ifname, sizeof(found->ifname) - 1);
+            found->next = g_interfaces;
+            g_interfaces = found;
+        }
+    }
+    if (!found) {
         pthread_mutex_unlock(&g_data_lock);
         return -1;
     }
@@ -4147,6 +4241,11 @@ int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passi
         addr_v6 = found->global_v6;
     }
     bool has_v6 = (addr_v6.address.afi == EIGRP_AFI_IPV6);
+
+    if (admin_up && (found->ifindex == 0 || !has_v6)) {
+        pthread_mutex_unlock(&g_data_lock);
+        return 0;
+    }
     eigrp_prefix_t glob_v6 = found->global_v6;
     bool has_glob_v6 = (glob_v6.address.afi == EIGRP_AFI_IPV6 && glob_v6.prefix_length > 0);
     uint32_t intf_bw = found->bandwidth;
