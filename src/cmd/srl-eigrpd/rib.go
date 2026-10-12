@@ -28,7 +28,7 @@ func computeNhgName(netinst string, nhStrs []string) string {
 	return fmt.Sprintf("eigrp_nhg_%s_%s_sdk", netinst, hash)
 }
 
-func (d *EigrpDaemon) OnRouteAdd(netinst string, prefix string, nexthop string, metric uint32, wideMetric uint64, isExt bool, preference uint32) {
+func (d *EigrpDaemon) OnRouteAdd(netinst string, prefix string, nexthop string, metric uint32, wideMetric uint64, isExt bool, preference uint32, ifname ...string) {
 	if netinst == "" {
 		netinst = "default"
 	}
@@ -58,11 +58,18 @@ func (d *EigrpDaemon) OnRouteAdd(netinst string, prefix string, nexthop string, 
 		return
 	}
 
+	var rawIfnames []string
+	if len(ifname) > 0 && ifname[0] != "" {
+		rawIfnames = strings.Split(ifname[0], ",")
+	}
+
 	rawNhs := strings.Split(nexthop, ",")
 	validNexthops := make([]*ndk.NextHop, 0, len(rawNhs))
 	validNhStrs := make([]string, 0, len(rawNhs))
+	validRawNhs := make([]string, 0, len(rawNhs))
+	var primaryIf string
 
-	for _, nh := range rawNhs {
+	for i, nh := range rawNhs {
 		nh = strings.TrimSpace(nh)
 		nhNetIP := net.ParseIP(nh)
 		if nhNetIP == nil || nhNetIP.IsUnspecified() || nh == "0.0.0.0" || nh == "::" || nh == "" {
@@ -76,6 +83,14 @@ func (d *EigrpDaemon) OnRouteAdd(netinst string, prefix string, nexthop string, 
 		} else {
 			continue
 		}
+		var nhIf string
+		if i < len(rawIfnames) {
+			nhIf = normalizeIfName(strings.TrimSpace(rawIfnames[i]))
+		}
+		if primaryIf == "" && nhIf != "" {
+			primaryIf = nhIf
+		}
+
 		validNexthops = append(validNexthops, &ndk.NextHop{
 			Type:      ndk.NextHop_RESOLUTION_TYPE_REGULAR,
 			ResolveTo: ndk.NextHop_RESOLVE_TO_TYPE_DIRECT,
@@ -83,7 +98,14 @@ func (d *EigrpDaemon) OnRouteAdd(netinst string, prefix string, nexthop string, 
 				IpNexthop: &ndk.IpAddressPb{IpAddress: nhIP},
 			},
 		})
-		validNhStrs = append(validNhStrs, nh)
+
+		nhStr := nhNetIP.String()
+		nhDisplay := nhStr
+		if nhNetIP.IsLinkLocalUnicast() && nhIf != "" {
+			nhDisplay = fmt.Sprintf("%s%%%s", nhStr, nhIf)
+		}
+		validNhStrs = append(validNhStrs, nhDisplay)
+		validRawNhs = append(validRawNhs, nhStr)
 	}
 
 	if len(validNexthops) == 0 {
@@ -188,12 +210,13 @@ func (d *EigrpDaemon) OnRouteAdd(netinst string, prefix string, nexthop string, 
 		}
 	}
 
-	primaryNh := validNhStrs[0]
+	primaryNh := validRawNhs[0]
 	inst := d.GetOrCreateInstance(netinst)
 	d.mu.Lock()
 	inst.routes[prefix] = &RouteInfo{
 		Prefix:     prefix,
 		NextHop:    primaryNh,
+		Interface:  primaryIf,
 		Metric:     metric,
 		WideMetric: wideMetric,
 		External:   isExt,

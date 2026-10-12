@@ -675,15 +675,22 @@ class Plugin(CliPlugin):
             if target_pfx and target_pfx != "*":
                 routes = [r for r in routes if _match_prefix(str(r.get("prefix", "")), target_pfx)]
 
+            has_itf = any(r.get("interface") for r in routes)
             is_v6 = any(":" in str(r.get("prefix", "")) or ":" in str(r.get("next-hop", "")) for r in routes)
             pfx_w = 28 if is_v6 else 20
             nh_w = 26 if is_v6 else 16
+            itf_w = 18 if has_itf else 0
             div_len = 114 if is_v6 else 98
+            if has_itf:
+                div_len += 19
 
             output.print_line("=" * div_len)
             output.print_line(f"EIGRP Learned{title_af} Routes for Network-Instance: {netinst} (AS: {asn}, RIB-Scale: {rib_scale})")
             output.print_line("-" * div_len)
-            output.print_line(f"{'Prefix':<{pfx_w}} {'Next-Hop':<{nh_w}} {'Metric':<12} {'Wide-Metric':<18} {'Type':<10} {'Pref':<6}")
+            if has_itf:
+                output.print_line(f"{'Prefix':<{pfx_w}} {'Next-Hop':<{nh_w}} {'Interface':<{itf_w}} {'Metric':<12} {'Wide-Metric':<18} {'Type':<10} {'Pref':<6}")
+            else:
+                output.print_line(f"{'Prefix':<{pfx_w}} {'Next-Hop':<{nh_w}} {'Metric':<12} {'Wide-Metric':<18} {'Type':<10} {'Pref':<6}")
             output.print_line("-" * div_len)
 
             if not routes:
@@ -692,12 +699,16 @@ class Plugin(CliPlugin):
                 for r in routes:
                     pfx = r.get("prefix", "")
                     nh = r.get("next-hop", "")
+                    itf = normalize_interface_name(r.get("interface", ""))
                     metric = str(r.get("metric", 0))
                     wide_metric = str(r.get("wide-metric", 0))
                     is_ext = r.get("external", False)
                     rtype = "External" if is_ext else "Internal"
                     pref = str(r.get("preference", 170 if is_ext else 90))
-                    output.print_line(f"{pfx:<{pfx_w}} {nh:<{nh_w}} {metric:<12} {wide_metric:<18} {rtype:<10} {pref:<6}")
+                    if has_itf:
+                        output.print_line(f"{pfx:<{pfx_w}} {nh:<{nh_w}} {itf:<{itf_w}} {metric:<12} {wide_metric:<18} {rtype:<10} {pref:<6}")
+                    else:
+                        output.print_line(f"{pfx:<{pfx_w}} {nh:<{nh_w}} {metric:<12} {wide_metric:<18} {rtype:<10} {pref:<6}")
 
             output.print_line("-" * div_len)
             output.print_line(f"Total Routes: {len(routes)}")

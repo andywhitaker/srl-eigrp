@@ -980,6 +980,30 @@ const char *srl_netinst_by_instance(eigrp_instance_t *e) {
     return srl_netinst_by_vrf(e->vrf_id);
 }
 
+const char *srl_get_ifname_by_index(const char *netinst, eigrp_ifindex_t ifidx) {
+    if (!netinst || ifidx == 0) return "";
+    pthread_mutex_lock(&g_data_lock);
+    // Pass 1: exact ifindex match
+    for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+        if (strcmp(ci->netinst, netinst) == 0 && ci->ifindex == ifidx) {
+            const char *name = ci->ifname;
+            pthread_mutex_unlock(&g_data_lock);
+            return name;
+        }
+    }
+    // Pass 2: fallback root_ifindex match
+    for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+        if (strcmp(ci->netinst, netinst) == 0 && ci->root_ifindex == ifidx) {
+            const char *name = ci->ifname;
+            pthread_mutex_unlock(&g_data_lock);
+            return name;
+        }
+    }
+    pthread_mutex_unlock(&g_data_lock);
+    return "";
+}
+
+
 static eigrp_instance_t *srl_instance_get_afi(const char *netinst, eigrp_afi_t afi) {
     const char *ni = (netinst && netinst[0]) ? netinst : "default";
     pthread_mutex_lock(&g_data_lock);

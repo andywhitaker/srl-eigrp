@@ -15,13 +15,13 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-var ifRe = regexp.MustCompile(`^e(\d+)-(\d+)(\.\d+)?$`)
+var ifRe = regexp.MustCompile(`^e(\d+)-(\d+)(?:[.\-_](\d+))?$`)
 
 func normalizeIfName(ifname string) string {
 	if m := ifRe.FindStringSubmatch(ifname); len(m) > 2 {
 		sub := ""
-		if len(m) > 3 {
-			sub = m[3]
+		if len(m) > 3 && m[3] != "" {
+			sub = "." + m[3]
 		}
 		return fmt.Sprintf("ethernet-%s/%s%s", m[1], m[2], sub)
 	}
@@ -419,6 +419,12 @@ func (d *EigrpDaemon) TelemetryWorker(ctx context.Context) {
 }
 
 func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
+	d.telemetryMu.Lock()
+	defer d.telemetryMu.Unlock()
+	d.publishTelemetryLocked(ctx)
+}
+
+func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 	d.mu.RLock()
 	type instData struct {
 		ni                   string
@@ -504,7 +510,8 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 			if !inst.IsAfiEnabled(afiName) {
 				continue
 			}
-			routeList = append(routeList, r)
+			rCopy := *r
+			routeList = append(routeList, &rCopy)
 		}
 		intfList := make([]*InterfaceInfo, 0, len(inst.interfaces))
 		for _, i := range inst.interfaces {
@@ -525,7 +532,8 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 			if ic == nil {
 				continue
 			}
-			intfList = append(intfList, i)
+			iCopy := *i
+			intfList = append(intfList, &iCopy)
 		}
 		topoList := make([]*TopologyPrefixInfo, 0, len(inst.topology))
 		for _, t := range inst.topology {
@@ -536,7 +544,15 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 			if !inst.IsAfiEnabled(afiName) {
 				continue
 			}
-			topoList = append(topoList, t)
+			tCopy := *t
+			if len(t.Routes) > 0 {
+				tCopy.Routes = make([]*TopologyRouteInfo, len(t.Routes))
+				for rIdx, tr := range t.Routes {
+					trCopy := *tr
+					tCopy.Routes[rIdx] = &trCopy
+				}
+			}
+			topoList = append(topoList, &tCopy)
 		}
 		trafficList := make([]*TrafficInfo, 0, len(inst.traffic))
 		for _, tf := range inst.traffic {
@@ -557,7 +573,8 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 			if ic == nil {
 				continue
 			}
-			trafficList = append(trafficList, tf)
+			tfCopy := *tf
+			trafficList = append(trafficList, &tfCopy)
 		}
 		networks := make([]string, len(inst.networks))
 		copy(networks, inst.networks)
@@ -1238,6 +1255,9 @@ func (d *EigrpDaemon) publishTelemetry(ctx context.Context) {
 				"rib-scale":   item.ribScale,
 				"external":    r.External,
 				"preference":  pref,
+			}
+			if r.Interface != "" {
+				routeData["interface"] = normalizeIfName(r.Interface)
 			}
 			if b, err := json.Marshal(routeData); err == nil {
 				states = append(states, &ndk.TelemetryInfo{

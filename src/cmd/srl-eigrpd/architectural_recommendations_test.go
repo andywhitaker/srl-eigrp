@@ -1,11 +1,16 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"net"
 	"os"
+	"sync"
 	"syscall"
 	"testing"
+
+	gnmi "github.com/openconfig/gnmi/proto/gnmi"
+	ndk "github.com/nokia/srlinux-ndk-go/ndk"
 )
 
 // TestSocketOptions_ConstantsAndDSCPCS6 verifies that native socket options and DSCP CS6
@@ -481,3 +486,344 @@ func TestBPFFilterBytecodeExecution(t *testing.T) {
 		t.Errorf("expected BPF filter with no active interfaces to DROP, but accepted (ret=%d)", ret)
 	}
 }
+
+// TestTelemetry_SerializationAndConcurrency verifies that concurrent telemetry collection,
+// publishing, BFD status updates, and state commits do not race or corrupt datastores.
+func TestTelemetry_SerializationAndConcurrency(t *testing.T) {
+	d := &EigrpDaemon{
+		instances: make(map[string]*EigrpInstance),
+	}
+	inst := d.GetOrCreateInstance("default")
+	inst.asn = 100
+	inst.adminState = "enable"
+	inst.neighbors["10.0.0.1"] = &NeighborInfo{
+		IPAddress: "10.0.0.1",
+		Interface: "ethernet-1/1",
+		State:     "Up",
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	const iterations = 50
+
+	// Goroutine 1: CollectAndPublish
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			d.CollectAndPublish(ctx)
+		}
+	}()
+
+	// Goroutine 2: PrepareTelemetryCollection / CommitTelemetryCollection
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			d.mu.Lock()
+			inst.PrepareTelemetryCollection()
+			inst.tempNeighbors["10.0.0.2"] = &NeighborInfo{
+				IPAddress: "10.0.0.2",
+				Interface: "ethernet-1/2",
+				State:     "Up",
+			}
+			inst.CommitTelemetryCollection()
+			d.mu.Unlock()
+		}
+	}()
+
+	// Goroutine 3: BFD session updates
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			_ = d.BfdSessionAddOrUpdate("default", "10.0.0.1", "ethernet-1/1", "up", 100, 100, 3)
+			_ = d.BfdSessionAddOrUpdate("default", "10.0.0.1", "ethernet-1/1", "down", 100, 100, 3)
+		}
+	}()
+
+	// Goroutine 4: publishTelemetry
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			d.publishTelemetry(ctx)
+		}
+	}()
+
+	wg.Wait()
+}
+
+// TestSyncRedistribution_AbortOnError verifies that SyncRedistribution aborts without withdrawing
+// existing redistributed routes if an export policy lookup or candidate route query fails.
+func TestSyncRedistribution_AbortOnError(t *testing.T) {
+	d := &EigrpDaemon{
+		instances:           make(map[string]*EigrpInstance),
+		candidateRoutes:     make(map[string]map[string]CandidateRoute),
+		policyDefs:          make(map[string]*PolicyDef),
+		netinstNameToId:     make(map[string]string),
+	}
+	daemonApp = d
+	defer func() { daemonApp = nil }()
+
+	inst := d.GetOrCreateInstance("default")
+	inst.asn = 100
+	inst.adminState = "enable"
+	inst.SetAfiAdminState("ipv4-unicast", "enable")
+	inst.SetAfiExportPolicy("ipv4-unicast", "non-existent-policy")
+
+	// Setup a pre-existing redistributed route
+	inst.redistributedRoutes["10.50.0.0/24"] = "ospf"
+	inst.redistributedHashes["10.50.0.0/24"] = "ospf|10.0.0.1|1000|100|255|1|1500"
+
+	// SyncRedistribution should fail to load "non-existent-policy" and ABORT, leaving 10.50.0.0/24 intact
+	d.SyncRedistribution("default")
+
+	d.mu.RLock()
+	_, stillExists := inst.redistributedRoutes["10.50.0.0/24"]
+	d.mu.RUnlock()
+
+	if !stillExists {
+		t.Fatal("expected pre-existing redistributed route to be preserved when export policy lookup fails")
+	}
+
+	// When export policy is explicitly unconfigured, SyncRedistribution should safely withdraw
+	d.mu.Lock()
+	inst.SetAfiExportPolicy("ipv4-unicast", "")
+	d.mu.Unlock()
+
+	d.SyncRedistribution("default")
+
+	d.mu.RLock()
+	_, afterUnconfig := inst.redistributedRoutes["10.50.0.0/24"]
+	d.mu.RUnlock()
+
+	if afterUnconfig {
+		t.Fatal("expected redistributed route to be withdrawn when export policy is removed")
+	}
+}
+
+// TestGNMIClient_FallbackPriority verifies the fallback hierarchy in getGNMIClient:
+// environment variables precedence, caching, and clean reset.
+func TestGNMIClient_FallbackPriority(t *testing.T) {
+	d := &EigrpDaemon{}
+
+	os.Setenv("SRL_GNMI_USER", "custom_user")
+	os.Setenv("SRL_GNMI_PASS", "custom_pass")
+	defer func() {
+		os.Unsetenv("SRL_GNMI_USER")
+		os.Unsetenv("SRL_GNMI_PASS")
+	}()
+
+	d.resetGNMIClient()
+	client, err := d.getGNMIClient()
+	if err == nil || client != nil {
+		t.Fatalf("expected error when no gNMI server is running, got client=%v, err=%v", client, err)
+	}
+
+	// Verify caching and reset
+	fakeClient := &fakeGNMIClient{}
+	d.gnmiClient = fakeClient
+	cached, err := d.getGNMIClient()
+	if err != nil || cached != fakeClient {
+		t.Fatalf("expected cached client, got %v, err=%v", cached, err)
+	}
+	d.resetGNMIClient()
+	if d.gnmiClient != nil {
+		t.Fatalf("expected resetGNMIClient to clear client")
+	}
+}
+
+type fakeGNMIClient struct {
+	gnmi.GNMIClient
+}
+
+// TestIPv6LinkLocalNextHop_InterfaceDisambiguation verifies that:
+// 1. RouteInfo.NextHop preserves raw IP (backward compatible with CLI and YANG schema)
+// 2. RouteInfo.Interface is correctly populated
+// 3. computeNhgName isolates NHGs with same link-local address on different interfaces
+// 4. Multi-nexthop IPv6 link-local routes are properly supported
+func TestIPv6LinkLocalNextHop_InterfaceDisambiguation(t *testing.T) {
+	d := &EigrpDaemon{
+		instances:    make(map[string]*EigrpInstance),
+		prefixToNhg:  make(map[string]string),
+		nhgRefCounts: make(map[string]int),
+	}
+
+	// 1. Add route via link-local next-hop on interface ethernet-1/1
+	d.OnRouteAdd("default", "2001:db8:1::/64", "fe80::1", 1000, 100000, false, 90, "ethernet-1/1")
+
+	inst := d.GetInstance("default")
+	if inst == nil {
+		t.Fatal("expected default instance to be created")
+	}
+
+	r1 := inst.routes["2001:db8:1::/64"]
+	if r1 == nil {
+		t.Fatal("expected route 2001:db8:1::/64 to be present")
+	}
+	if r1.NextHop != "fe80::1" {
+		t.Errorf("expected clean next-hop 'fe80::1', got %q", r1.NextHop)
+	}
+	if r1.Interface != "ethernet-1/1" {
+		t.Errorf("expected Interface 'ethernet-1/1', got %q", r1.Interface)
+	}
+
+	d.nhgMu.Lock()
+	nhg1 := d.prefixToNhg["default:2001:db8:1::/64"]
+	d.nhgMu.Unlock()
+	if nhg1 == "" {
+		t.Fatal("expected non-empty NHG name for route 1")
+	}
+
+	// 2. Add route via the SAME link-local next-hop on a DIFFERENT interface ethernet-1/2
+	d.OnRouteAdd("default", "2001:db8:2::/64", "fe80::1", 1000, 100000, false, 90, "ethernet-1/2")
+
+	r2 := inst.routes["2001:db8:2::/64"]
+	if r2 == nil {
+		t.Fatal("expected route 2001:db8:2::/64 to be present")
+	}
+	if r2.NextHop != "fe80::1" {
+		t.Errorf("expected clean next-hop 'fe80::1', got %q", r2.NextHop)
+	}
+	if r2.Interface != "ethernet-1/2" {
+		t.Errorf("expected Interface 'ethernet-1/2', got %q", r2.Interface)
+	}
+
+	d.nhgMu.Lock()
+	nhg2 := d.prefixToNhg["default:2001:db8:2::/64"]
+	d.nhgMu.Unlock()
+	if nhg2 == "" {
+		t.Fatal("expected non-empty NHG name for route 2")
+	}
+
+	// NHG names MUST be distinct to avoid cross-interface link-local collision!
+	if nhg1 == nhg2 {
+		t.Fatalf("NHG collision detected: routes on different interfaces share same NHG %q", nhg1)
+	}
+
+	// 3. Multi-nexthop IPv6 route
+	d.OnRouteAdd("default", "2001:db8:3::/64", "fe80::1,fe80::2", 1000, 100000, false, 90, "ethernet-1/1,ethernet-1/2")
+	r3 := inst.routes["2001:db8:3::/64"]
+	if r3 == nil {
+		t.Fatal("expected route 2001:db8:3::/64 to be present")
+	}
+	if r3.NextHop != "fe80::1" {
+		t.Errorf("expected primary NextHop 'fe80::1', got %q", r3.NextHop)
+	}
+	if r3.Interface != "ethernet-1/1" {
+		t.Errorf("expected primary Interface 'ethernet-1/1', got %q", r3.Interface)
+	}
+}
+
+// TestNormalizeIfName_Formats verifies that Linux netns and SR Linux interface
+// naming variations (e1-1, e1-1.0, e1-1-0, e1-1_0) are all canonically normalized
+// to ethernet-X/Y[.Z], while leaving non-matching strings intact.
+func TestNormalizeIfName_Formats(t *testing.T) {
+	cases := []struct {
+		input    string
+		expected string
+	}{
+		{"e1-1", "ethernet-1/1"},
+		{"e1-1.0", "ethernet-1/1.0"},
+		{"e1-1-0", "ethernet-1/1.0"},
+		{"e1-1_0", "ethernet-1/1.0"},
+		{"e1-2.100", "ethernet-1/2.100"},
+		{"e2-10-5", "ethernet-2/10.5"},
+		{"ethernet-1/1", "ethernet-1/1"},
+		{"ethernet-1/1.0", "ethernet-1/1.0"},
+		{"mgmt0.0", "mgmt0.0"},
+		{"lo0.1", "lo0.1"},
+		{"", ""},
+	}
+
+	for _, tc := range cases {
+		actual := normalizeIfName(tc.input)
+		if actual != tc.expected {
+			t.Errorf("normalizeIfName(%q) = %q, expected %q", tc.input, actual, tc.expected)
+		}
+	}
+}
+
+// TestHandleBfdNotification_DuringCollection verifies that when a BFD notification
+// arrives while telemetry collection is active (inst.collecting == true), the BFD
+// state update is preserved in both tempNeighbors and bfdSessions, and remains
+// present after CommitTelemetryCollection().
+func TestHandleBfdNotification_DuringCollection(t *testing.T) {
+	d := &EigrpDaemon{
+		instances: make(map[string]*EigrpInstance),
+	}
+
+	inst := d.GetOrCreateInstance("default")
+	destIP := "192.168.10.2"
+
+	// Initial neighbor state before collection
+	inst.neighbors[destIP] = &NeighborInfo{
+		IPAddress: destIP,
+		Interface: "ethernet-1/1.0",
+		State:     "up",
+		BfdState:  "up",
+	}
+	inst.bfdSessions[destIP] = "up"
+
+	// Start collection
+	d.mu.Lock()
+	inst.PrepareTelemetryCollection()
+	// Simulate neighbor reported during collection before BFD event
+	inst.tempNeighbors[destIP] = &NeighborInfo{
+		IPAddress: destIP,
+		Interface: "ethernet-1/1.0",
+		State:     "up",
+		BfdState:  "up",
+	}
+	d.mu.Unlock()
+
+	// Dispatch BFD DOWN notification during active collection
+	bfdNotif := &ndk.BfdSessionNotification{
+		Key: &ndk.BfdGeneralSessionKey{
+			Key: &ndk.BfdGeneralSessionKey_P2P{
+				P2P: &ndk.BfdGeneralSessionKey_P2PKey{
+					DestinationIpAddress: &ndk.IpAddressPb{
+						IpAddress: net.ParseIP(destIP).To4(),
+					},
+				},
+			},
+		},
+		Data: &ndk.BfdGeneralSessionData{
+			Status: ndk.BfdSessionStatus_BFD_SESSION_STATUS_DOWN,
+		},
+	}
+
+	d.HandleBfdNotification(bfdNotif)
+
+	// Verify both neighbors and tempNeighbors received the "down" transition
+	d.mu.RLock()
+	if inst.neighbors[destIP].BfdState != "down" {
+		t.Errorf("expected inst.neighbors[%s].BfdState == 'down', got %q", destIP, inst.neighbors[destIP].BfdState)
+	}
+	if inst.tempNeighbors[destIP].BfdState != "down" {
+		t.Errorf("expected inst.tempNeighbors[%s].BfdState == 'down', got %q", destIP, inst.tempNeighbors[destIP].BfdState)
+	}
+	if inst.bfdSessions[destIP] != "down" {
+		t.Errorf("expected inst.bfdSessions[%s] == 'down', got %q", destIP, inst.bfdSessions[destIP])
+	}
+	d.mu.RUnlock()
+
+	// Commit collection
+	d.mu.Lock()
+	inst.CommitTelemetryCollection()
+	d.mu.Unlock()
+
+	// After commit, neighbors must retain "down" state rather than being reverted
+	d.mu.RLock()
+	if inst.neighbors[destIP] == nil {
+		t.Fatalf("expected neighbor %s to be present after commit", destIP)
+	}
+	if inst.neighbors[destIP].BfdState != "down" {
+		t.Errorf("expected neighbor BfdState to persist as 'down' after CommitTelemetryCollection, got %q", inst.neighbors[destIP].BfdState)
+	}
+	d.mu.RUnlock()
+}
+

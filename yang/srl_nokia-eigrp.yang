@@ -691,6 +691,7 @@ module srl_nokia-eigrp {
         description "Learned EIGRP routes";
         leaf prefix { type srl_nokia-comm:ip-prefix; }
         leaf next-hop { type srl_nokia-comm:ip-address; }
+        leaf interface { type string; description "Outgoing interface for next-hop"; }
         leaf metric { type uint32; }
         leaf wide-metric { type uint64; description "64-bit RFC 7868 wide composite metric"; }
         leaf rib-scale { type uint8; description "RIB scale factor used to derive metric"; }

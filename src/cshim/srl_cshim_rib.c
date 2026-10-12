@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <arpa/inet.h>
+#include <net/if.h>
 #include "srl_cshim.h"
 
 void eigrp_rib_init(void) {}
@@ -39,6 +40,7 @@ eigrp_result_t eigrp_rib_route_add(eigrp_instance_t *eigrp, const eigrp_rib_rout
     snprintf(pfx_str, sizeof(pfx_str), "%s/%u", addr_str, route->prefix.prefix_length);
 
     char nhs_buf[512] = "";
+    char ifnames_buf[512] = "";
     const char *netinst = srl_netinst_by_instance(eigrp);
 
     for (size_t i = 0; i < route->nexthop_count; i++) {
@@ -52,8 +54,19 @@ eigrp_result_t eigrp_rib_route_add(eigrp_instance_t *eigrp, const eigrp_rib_rout
             if (single_nh[0] != '\0') {
                 if (nhs_buf[0] != '\0') {
                     strncat(nhs_buf, ",", sizeof(nhs_buf) - strlen(nhs_buf) - 1);
+                    strncat(ifnames_buf, ",", sizeof(ifnames_buf) - strlen(ifnames_buf) - 1);
                 }
                 strncat(nhs_buf, single_nh, sizeof(nhs_buf) - strlen(nhs_buf) - 1);
+
+                const char *ifname = srl_get_ifname_by_index(netinst, route->nexthops[i].ifindex);
+                if (ifname && ifname[0]) {
+                    strncat(ifnames_buf, ifname, sizeof(ifnames_buf) - strlen(ifnames_buf) - 1);
+                } else {
+                    char kern_if[IF_NAMESIZE] = "";
+                    if (if_indextoname((unsigned)route->nexthops[i].ifindex, kern_if)) {
+                        strncat(ifnames_buf, kern_if, sizeof(ifnames_buf) - strlen(ifnames_buf) - 1);
+                    }
+                }
             }
         }
     }
@@ -84,7 +97,7 @@ eigrp_result_t eigrp_rib_route_add(eigrp_instance_t *eigrp, const eigrp_rib_rout
     if (scaled == 0 && route->metric > 0) scaled = 1;
     if (scaled > 4294967294ULL) scaled = 4294967294ULL;
     uint32_t rib_metric = (uint32_t)scaled;
-    srlGoRouteAdd((char *)netinst, pfx_str, nhs_buf, rib_metric, (uint64_t)route->metric, is_ext, pref);
+    srlGoRouteAdd((char *)netinst, pfx_str, nhs_buf, rib_metric, (uint64_t)route->metric, is_ext, pref, ifnames_buf);
     return EIGRP_RESULT_SUCCESS;
 }
 

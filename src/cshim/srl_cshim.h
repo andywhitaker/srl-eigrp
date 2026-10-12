@@ -20,7 +20,8 @@ extern "C" {
 #endif
 
 // Bridge functions exported from Go
-extern void srlGoRouteAdd(char *netinst, char *prefix, char *nexthop, uint32_t metric, uint64_t wide_metric, int is_external, uint32_t preference);
+extern void srlGoRouteAdd(char *netinst, char *prefix, char *nexthop, uint32_t metric, uint64_t wide_metric, int is_external, uint32_t preference, char *ifname);
+const char *srl_get_ifname_by_index(const char *netinst, eigrp_ifindex_t ifidx);
 extern void srlGoRouteDel(char *netinst, char *prefix);
 extern void srlGoLog(int level, char *msg);
 extern void srlGoNeighborReport(char *netinst, char *ip, char *ifname, char *state, uint16_t hold, uint64_t uptime, uint32_t srtt, uint32_t rto, char *bfd_state, char *restart_state, char *auth_mode);

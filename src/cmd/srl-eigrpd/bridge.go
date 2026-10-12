@@ -29,6 +29,7 @@ type routeEvent struct {
 	wideMetric uint64
 	isExt      bool
 	preference uint32
+	ifname     string
 }
 
 type routeQueueWorker struct {
@@ -140,13 +141,17 @@ func (d *EigrpDaemon) runRouteWorker(w *routeQueueWorker) {
 func (d *EigrpDaemon) processRouteEvent(ev routeEvent) {
 	switch ev.eventType {
 	case routeEventAdd:
-		d.OnRouteAdd(ev.netinst, ev.prefix, ev.nexthop, ev.metric, ev.wideMetric, ev.isExt, ev.preference)
+		d.OnRouteAdd(ev.netinst, ev.prefix, ev.nexthop, ev.metric, ev.wideMetric, ev.isExt, ev.preference, ev.ifname)
 	case routeEventDel:
 		d.OnRouteDel(ev.netinst, ev.prefix)
 	}
 }
 
-func (d *EigrpDaemon) EnqueueRouteAdd(netinst, prefix, nexthop string, metric uint32, wideMetric uint64, isExt bool, preference uint32) {
+func (d *EigrpDaemon) EnqueueRouteAdd(netinst, prefix, nexthop string, metric uint32, wideMetric uint64, isExt bool, preference uint32, ifname ...string) {
+	var ifn string
+	if len(ifname) > 0 {
+		ifn = ifname[0]
+	}
 	w := d.getOrCreateRouteWorker(netinst)
 	w.enqueue(routeEvent{
 		eventType:  routeEventAdd,
@@ -157,6 +162,7 @@ func (d *EigrpDaemon) EnqueueRouteAdd(netinst, prefix, nexthop string, metric ui
 		wideMetric: wideMetric,
 		isExt:      isExt,
 		preference: preference,
+		ifname:     ifn,
 	})
 }
 
@@ -216,7 +222,7 @@ func (d *EigrpDaemon) StopAllRouteWorkers() {
 }
 
 //export srlGoRouteAdd
-func srlGoRouteAdd(netinst *C.char, prefix *C.char, nexthop *C.char, metric C.uint32_t, wideMetric C.uint64_t, isExt C.int, preference C.uint32_t) {
+func srlGoRouteAdd(netinst *C.char, prefix *C.char, nexthop *C.char, metric C.uint32_t, wideMetric C.uint64_t, isExt C.int, preference C.uint32_t, ifname *C.char) {
 	if daemonApp != nil {
 		ni := C.GoString(netinst)
 		pfx := C.GoString(prefix)
@@ -225,7 +231,11 @@ func srlGoRouteAdd(netinst *C.char, prefix *C.char, nexthop *C.char, metric C.ui
 		wm := uint64(wideMetric)
 		ext := isExt != 0
 		pref := uint32(preference)
-		daemonApp.EnqueueRouteAdd(ni, pfx, nh, m, wm, ext, pref)
+		var ifn string
+		if ifname != nil {
+			ifn = C.GoString(ifname)
+		}
+		daemonApp.EnqueueRouteAdd(ni, pfx, nh, m, wm, ext, pref, ifn)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -15,8 +16,10 @@ import (
 	gnmi "github.com/openconfig/gnmi/proto/gnmi"
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 /*
@@ -3982,34 +3985,166 @@ func (d *EigrpDaemon) getGNMIClient() (gnmi.GNMIClient, error) {
 		return d.gnmiClient, nil
 	}
 
-	targets := []string{
-		"unix:///opt/srlinux/var/run/sr_grpc_server_insecure-mgmt",
-		"127.0.0.1:57411",
+	type gnmiDialCandidate struct {
+		target  string
+		useAuth bool
+		user    string
+		pass    string
+		desc    string
 	}
 
-	authInterceptor := func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-		ctx = metadata.AppendToOutgoingContext(ctx, "username", "admin", "password", "NokiaSrl1!")
-		return invoker(ctx, method, req, reply, cc, opts...)
+	envUser := os.Getenv("SRL_GNMI_USER")
+	envPass := os.Getenv("SRL_GNMI_PASS")
+	hasEnv := envUser != "" || envPass != ""
+
+	var ipcTargets []string
+	var tcpTargets []string
+
+	if custom := os.Getenv("SRL_GNMI_TARGET"); custom != "" {
+		if strings.HasPrefix(custom, "unix://") {
+			ipcTargets = append(ipcTargets, custom)
+		} else {
+			tcpTargets = append(tcpTargets, custom)
+		}
+	}
+
+	ipcTargets = append(ipcTargets,
+		"unix:///opt/srlinux/var/run/sr_grpc_server_insecure-mgmt",
+		"unix:///opt/srlinux/var/run/sr_grpc_server_mgmt",
+	)
+
+	tcpTargets = append(tcpTargets,
+		"127.0.0.1:57401",
+		"127.0.0.1:57411",
+		"127.0.0.1:57400",
+	)
+
+	var candidates []gnmiDialCandidate
+
+	// 1. Prefer IPC over socket without credentials
+	for _, t := range ipcTargets {
+		candidates = append(candidates, gnmiDialCandidate{
+			target:  t,
+			useAuth: false,
+			desc:    "IPC unix socket without auth metadata",
+		})
+	}
+
+	// 2. Fall back to socket (TCP) without credentials
+	for _, t := range tcpTargets {
+		candidates = append(candidates, gnmiDialCandidate{
+			target:  t,
+			useAuth: false,
+			desc:    "network socket (TCP) without auth metadata",
+		})
+	}
+
+	// 3. Fall back to environment credentials (IPC first, then socket)
+	if hasEnv {
+		for _, t := range ipcTargets {
+			candidates = append(candidates, gnmiDialCandidate{
+				target:  t,
+				useAuth: true,
+				user:    envUser,
+				pass:    envPass,
+				desc:    "IPC unix socket with environment credentials",
+			})
+		}
+		for _, t := range tcpTargets {
+			candidates = append(candidates, gnmiDialCandidate{
+				target:  t,
+				useAuth: true,
+				user:    envUser,
+				pass:    envPass,
+				desc:    "network socket (TCP) with environment credentials",
+			})
+		}
+	}
+
+	// 4. Fall back to default credentials (IPC first, then socket)
+	for _, t := range ipcTargets {
+		candidates = append(candidates, gnmiDialCandidate{
+			target:  t,
+			useAuth: true,
+			user:    "admin",
+			pass:    "NokiaSrl1!",
+			desc:    "IPC unix socket with default credentials",
+		})
+	}
+	for _, t := range tcpTargets {
+		candidates = append(candidates, gnmiDialCandidate{
+			target:  t,
+			useAuth: true,
+			user:    "admin",
+			pass:    "NokiaSrl1!",
+			desc:    "network socket (TCP) with default credentials",
+		})
 	}
 
 	var lastErr error
-	for _, target := range targets {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		conn, err := grpc.DialContext(ctx, target,
+	for _, c := range candidates {
+		if strings.HasPrefix(c.target, "unix://") {
+			sockPath := strings.TrimPrefix(c.target, "unix://")
+			if _, statErr := os.Stat(sockPath); statErr != nil {
+				continue
+			}
+		} else {
+			probeConn, probeErr := net.DialTimeout("tcp", c.target, 100*time.Millisecond)
+			if probeErr != nil {
+				lastErr = probeErr
+				continue
+			}
+			_ = probeConn.Close()
+		}
+
+		dialOpts := []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 			grpc.WithBlock(),
-			grpc.WithUnaryInterceptor(authInterceptor),
-		)
-		cancel()
-		if err == nil {
-			d.gnmiConn = conn
-			d.gnmiClient = gnmi.NewGNMIClient(conn)
-			return d.gnmiClient, nil
 		}
-		lastErr = err
+		if c.useAuth {
+			user := c.user
+			pass := c.pass
+			authInterceptor := func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+				ctx = metadata.AppendToOutgoingContext(ctx, "username", user, "password", pass)
+				return invoker(ctx, method, req, reply, cc, opts...)
+			}
+			dialOpts = append(dialOpts, grpc.WithUnaryInterceptor(authInterceptor))
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		conn, err := grpc.DialContext(ctx, c.target, dialOpts...)
+		cancel()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		testClient := gnmi.NewGNMIClient(conn)
+		capCtx, capCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, capErr := testClient.Capabilities(capCtx, &gnmi.CapabilityRequest{})
+		capCancel()
+		if capErr != nil {
+			st := status.Code(capErr)
+			if st == codes.Unauthenticated || st == codes.PermissionDenied {
+				log.Debug().Str("target", c.target).Str("strategy", c.desc).Err(capErr).Msg("gNMI auth rejected, trying next candidate")
+				_ = conn.Close()
+				lastErr = capErr
+				continue
+			} else if st != codes.Unimplemented && st != codes.OK {
+				log.Debug().Str("target", c.target).Str("strategy", c.desc).Err(capErr).Msg("gNMI probe failed, trying next candidate")
+				_ = conn.Close()
+				lastErr = capErr
+				continue
+			}
+		}
+
+		d.gnmiConn = conn
+		d.gnmiClient = testClient
+		log.Info().Str("target", c.target).Str("strategy", c.desc).Msg("Successfully connected to gNMI server")
+		return d.gnmiClient, nil
 	}
 
-	return nil, fmt.Errorf("failed to connect to gNMI on targets %v: %w", targets, lastErr)
+	return nil, fmt.Errorf("failed to connect to gNMI on all candidates: %w", lastErr)
 }
 
 func (d *EigrpDaemon) getPolicyDef(policyName string) (*PolicyDef, error) {
@@ -4292,30 +4427,38 @@ func (d *EigrpDaemon) SyncRedistribution(netinst string) {
 
 	if v4Enabled && v4Policy != "" {
 		pol, err := d.getPolicyDef(v4Policy)
-		if err == nil && pol != nil {
-			routes, rErr := getCandidateRoutes(netinst, "ipv4-unicast")
-			if rErr == nil {
-				for _, r := range routes {
-					if ok, m := evaluateRoutePolicy(r, pol); ok {
-						acceptedRoutes[r.Prefix] = r
-						acceptedMetrics[r.Prefix] = m
-					}
-				}
+		if err != nil || pol == nil {
+			log.Warn().Err(err).Str("netinst", netinst).Str("policy", v4Policy).Msg("Failed to get IPv4 export policy definition; aborting SyncRedistribution to prevent route flap")
+			return
+		}
+		routes, rErr := getCandidateRoutes(netinst, "ipv4-unicast")
+		if rErr != nil {
+			log.Warn().Err(rErr).Str("netinst", netinst).Msg("Failed to query IPv4 candidate routes; aborting SyncRedistribution to prevent route flap")
+			return
+		}
+		for _, r := range routes {
+			if ok, m := evaluateRoutePolicy(r, pol); ok {
+				acceptedRoutes[r.Prefix] = r
+				acceptedMetrics[r.Prefix] = m
 			}
 		}
 	}
 
 	if v6Enabled && v6Policy != "" {
 		pol, err := d.getPolicyDef(v6Policy)
-		if err == nil && pol != nil {
-			routes, rErr := getCandidateRoutes(netinst, "ipv6-unicast")
-			if rErr == nil {
-				for _, r := range routes {
-					if ok, m := evaluateRoutePolicy(r, pol); ok {
-						acceptedRoutes[r.Prefix] = r
-						acceptedMetrics[r.Prefix] = m
-					}
-				}
+		if err != nil || pol == nil {
+			log.Warn().Err(err).Str("netinst", netinst).Str("policy", v6Policy).Msg("Failed to get IPv6 export policy definition; aborting SyncRedistribution to prevent route flap")
+			return
+		}
+		routes, rErr := getCandidateRoutes(netinst, "ipv6-unicast")
+		if rErr != nil {
+			log.Warn().Err(rErr).Str("netinst", netinst).Msg("Failed to query IPv6 candidate routes; aborting SyncRedistribution to prevent route flap")
+			return
+		}
+		for _, r := range routes {
+			if ok, m := evaluateRoutePolicy(r, pol); ok {
+				acceptedRoutes[r.Prefix] = r
+				acceptedMetrics[r.Prefix] = m
 			}
 		}
 	}

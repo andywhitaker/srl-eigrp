@@ -43,6 +43,7 @@ type RouteInfo struct {
 	WideMetric uint64 `json:"wide-metric"`
 	External   bool   `json:"external"`
 	Preference uint8  `json:"preference,omitempty"`
+	Interface  string `json:"interface,omitempty"`
 }
 
 type NeighborInfo struct {
@@ -344,10 +345,30 @@ func (inst *EigrpInstance) PrepareTelemetryCollection() {
 }
 
 func (inst *EigrpInstance) CommitTelemetryCollection() {
-	inst.neighbors = inst.tempNeighbors
-	inst.interfaces = inst.tempInterfaces
-	inst.topology = inst.tempTopology
-	inst.traffic = inst.tempTraffic
+	if inst.tempNeighbors != nil {
+		inst.neighbors = inst.tempNeighbors
+	} else if inst.neighbors == nil {
+		inst.neighbors = make(map[string]*NeighborInfo)
+	}
+	if inst.tempInterfaces != nil {
+		inst.interfaces = inst.tempInterfaces
+	} else if inst.interfaces == nil {
+		inst.interfaces = make(map[string]*InterfaceInfo)
+	}
+	if inst.tempTopology != nil {
+		inst.topology = inst.tempTopology
+	} else if inst.topology == nil {
+		inst.topology = make(map[string]*TopologyPrefixInfo)
+	}
+	if inst.tempTraffic != nil {
+		inst.traffic = inst.tempTraffic
+	} else if inst.traffic == nil {
+		inst.traffic = make(map[string]*TrafficInfo)
+	}
+	inst.tempNeighbors = nil
+	inst.tempInterfaces = nil
+	inst.tempTopology = nil
+	inst.tempTraffic = nil
 	inst.collecting = false
 }
 
@@ -361,6 +382,7 @@ type EigrpDaemon struct {
 	appId          uint32
 	streamId       uint64
 	mu             sync.RWMutex
+	telemetryMu    sync.Mutex
 	instances      map[string]*EigrpInstance
 	learnedVlans   map[string]uint16
 	prevTeleKeys   map[string]struct{}
@@ -535,6 +557,9 @@ func (d *EigrpDaemon) DeleteInstance(netinst string) {
 }
 
 func (d *EigrpDaemon) CollectAndPublish(ctx context.Context) {
+	d.telemetryMu.Lock()
+	defer d.telemetryMu.Unlock()
+
 	d.mu.RLock()
 	netinsts := make([]string, 0, len(d.instances))
 	for ni := range d.instances {
@@ -574,7 +599,7 @@ func (d *EigrpDaemon) CollectAndPublish(ctx context.Context) {
 		d.mu.Unlock()
 	}
 
-	d.publishTelemetry(ctx)
+	d.publishTelemetryLocked(ctx)
 }
 
 func (d *EigrpDaemon) BfdSessionAddOrUpdate(netinst, peerIP, ifname, adminState string, txInterval, rxInterval uint32, mult uint8) error {
@@ -590,10 +615,20 @@ func (d *EigrpDaemon) BfdSessionAddOrUpdate(netinst, peerIP, ifname, adminState 
 		if nbr, ok := inst.neighbors[peerIP]; ok {
 			nbr.BfdState = inst.bfdSessions[peerIP]
 		}
+		if inst.collecting && inst.tempNeighbors != nil {
+			if nbr, ok := inst.tempNeighbors[peerIP]; ok {
+				nbr.BfdState = inst.bfdSessions[peerIP]
+			}
+		}
 	} else {
 		inst.bfdSessions[peerIP] = "disabled"
 		if nbr, ok := inst.neighbors[peerIP]; ok {
 			nbr.BfdState = "disabled"
+		}
+		if inst.collecting && inst.tempNeighbors != nil {
+			if nbr, ok := inst.tempNeighbors[peerIP]; ok {
+				nbr.BfdState = "disabled"
+			}
 		}
 	}
 	return nil
@@ -708,6 +743,14 @@ func (d *EigrpDaemon) OnInterfaceReport(netinst, name, ipAddr string, prefixlen 
 		if normalizeIfName(n.Interface) == normIf && n.BfdState != "" && n.BfdState != "disabled" {
 			bfdState = n.BfdState
 			break
+		}
+	}
+	if bfdState == "disabled" && inst.collecting && inst.tempNeighbors != nil {
+		for _, n := range inst.tempNeighbors {
+			if normalizeIfName(n.Interface) == normIf && n.BfdState != "" && n.BfdState != "disabled" {
+				bfdState = n.BfdState
+				break
+			}
 		}
 	}
 	if bfdState == "disabled" {
@@ -1234,14 +1277,14 @@ func main() {
 	os.Exit(0)
 }
 
-func (d *EigrpDaemon) Register(ctx context.Context) {
+func (d *EigrpDaemon) Register(ctx context.Context) error {
 	req := &ndk.AgentRegistrationRequest{
 		WaitConfigAck: false,
 	}
 	resp, err := d.sdkClient.AgentRegister(ctx, req)
 	if err != nil {
 		log.Error().Err(err).Msg("NDK registration failed")
-		return
+		return err
 	}
 	d.appId = resp.AppId
 	log.Info().Uint32("app_id", d.appId).Msg("Successfully registered with SR Linux NDK Manager")
@@ -1252,6 +1295,7 @@ func (d *EigrpDaemon) Register(ctx context.Context) {
 		},
 	}
 	_, _ = d.teleClient.TelemetryDelete(ctx, delReq)
+	return nil
 }
 
 func (d *EigrpDaemon) InitNotificationStream(ctx context.Context) error {
@@ -1329,10 +1373,27 @@ func (d *EigrpDaemon) InitNotificationStream(ctx context.Context) error {
 	return nil
 }
 
+func (d *EigrpDaemon) reconnectNDK(ctx context.Context) error {
+	if err := d.Register(ctx); err != nil {
+		return err
+	}
+	return d.InitNotificationStream(ctx)
+}
+
 func (d *EigrpDaemon) RunNotificationLoop(ctx context.Context) {
 	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
 		stream, err := d.notifClient.NotificationStream(ctx, &ndk.NotificationStreamRequest{StreamId: d.streamId})
 		if err != nil {
+			log.Warn().Err(err).Msg("Failed to open notification stream; re-registering with NDK SDK Manager...")
+			if recErr := d.reconnectNDK(ctx); recErr != nil {
+				log.Warn().Err(recErr).Msg("reconnectNDK failed during open stream; will retry")
+			}
 			select {
 			case <-ctx.Done():
 				return
@@ -1340,7 +1401,7 @@ func (d *EigrpDaemon) RunNotificationLoop(ctx context.Context) {
 				continue
 			}
 		}
-		log.Info().Msg("Notification stream active and listening for events")
+		log.Info().Uint64("stream_id", d.streamId).Msg("Notification stream active and listening for events")
 
 		for {
 			ev, err := stream.Recv()
@@ -1370,7 +1431,13 @@ func (d *EigrpDaemon) RunNotificationLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(time.Second):
+		}
+
+		// Re-execute Register() and InitNotificationStream() so a new stream ID and subscriptions are established
+		log.Info().Msg("Re-executing Register() and InitNotificationStream() following stream disconnect")
+		if recErr := d.reconnectNDK(ctx); recErr != nil {
+			log.Warn().Err(recErr).Msg("Failed to re-initialize notification stream after disconnect; will retry")
 		}
 	}
 }
@@ -1567,12 +1634,23 @@ func (d *EigrpDaemon) HandleBfdNotification(bfd *ndk.BfdSessionNotification) {
 
 	d.mu.Lock()
 	for _, inst := range d.instances {
-		if _, ok := inst.neighbors[destIp]; !ok {
+		_, inNbr := inst.neighbors[destIp]
+		_, inBfd := inst.bfdSessions[destIp]
+		var inTemp bool
+		if inst.collecting && inst.tempNeighbors != nil {
+			_, inTemp = inst.tempNeighbors[destIp]
+		}
+		if !inNbr && !inBfd && !inTemp {
 			continue
 		}
 		inst.bfdSessions[destIp] = statusStr
 		if nbr, ok := inst.neighbors[destIp]; ok {
 			nbr.BfdState = statusStr
+		}
+		if inst.collecting && inst.tempNeighbors != nil {
+			if nbr, ok := inst.tempNeighbors[destIp]; ok {
+				nbr.BfdState = statusStr
+			}
 		}
 		if status == ndk.BfdSessionStatus_BFD_SESSION_STATUS_DOWN || status == ndk.BfdSessionStatus_BFD_SESSION_STATUS_ADMIN_DOWN {
 			log.Warn().Str("neighbor", destIp).Str("netinst", inst.netinst).Msg("BFD down transition: tearing down neighbor immediately")
