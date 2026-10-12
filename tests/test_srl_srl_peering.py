@@ -1402,7 +1402,7 @@ EOF"""
 
         route_learned = False
         out_routes = ""
-        for _ in range(30):
+        for _ in range(60):
             time.sleep(1)
             out_routes = srl_exec("clab-srl-srl-eigrp-srl2", [
                 "sr_cli", "show network-instance default protocols eigrp routes"

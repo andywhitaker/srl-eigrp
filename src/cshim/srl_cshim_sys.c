@@ -4519,12 +4519,6 @@ int srlShimRedistributeUpdate(const char *netinst, const char *policy_name, uint
             eigrp_redist_add(&ctx, &src_bgp, &metric, policy_name);
             eigrp_redist_add(&ctx, &src_ospf, &metric, policy_name);
             eigrp_redist_add(&ctx, &src_isis, &metric, policy_name);
-        } else {
-            eigrp_redist_remove(&ctx, &src_conn);
-            eigrp_redist_remove(&ctx, &src_stat);
-            eigrp_redist_remove(&ctx, &src_bgp);
-            eigrp_redist_remove(&ctx, &src_ospf);
-            eigrp_redist_remove(&ctx, &src_isis);
         }
     }
     return 0;
@@ -4699,6 +4693,16 @@ int srlShimRouteRedistributeAdd(const char *netinst, const char *prefix_str, con
     metric.mtu[2] = (m >> 16) & 0xff;
     metric.hop_count = 0;
 
+    if (runtime->topology_table) {
+        eigrp_prefix_descriptor_t *existing_pfx = eigrp_topology_table_lookup(runtime->topology_table, &pfx);
+        if (existing_pfx) {
+            bool has_ext = (existing_pfx->external_routes && existing_pfx->external_routes->count > 0);
+            if (existing_pfx->state != EIGRP_FSM_STATE_PASSIVE || !has_ext) {
+                eigrp_prefix_descriptor_delete(runtime, runtime->topology_table, existing_pfx);
+            }
+        }
+    }
+
     eigrp_result_t res = eigrp_topology_redistributed_route_update(runtime, &sr, &metric);
     return (res == EIGRP_RESULT_SUCCESS) ? 0 : -1;
 }
@@ -4772,6 +4776,7 @@ int srlShimRouteRedistributeRemove(const char *netinst, const char *prefix_str, 
             success = 1;
         }
     }
+
     return success ? 0 : -1;
 }
 

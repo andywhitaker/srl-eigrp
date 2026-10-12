@@ -1344,7 +1344,7 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			if inst != nil && inst.adminState != "disable" && inst.asn > 0 {
 				v4Policy := inst.GetAfiExportPolicy("ipv4-unicast")
 				v6Policy := inst.GetAfiExportPolicy("ipv6-unicast")
-				if v4Policy != "" || v6Policy != "" {
+				if v4Policy != "" || v6Policy != "" || len(inst.redistributedRoutes) > 0 {
 					d.TriggerRedistSync(ni)
 				}
 			}
@@ -3276,7 +3276,15 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 		}
 
 		var afCfg AddressFamilyConfig
-		if err := json.Unmarshal([]byte(jsonStr), &afCfg); err != nil {
+		isContainerUpdate := false
+		if err := json.Unmarshal([]byte(jsonStr), &afCfg); err == nil {
+			isContainerUpdate = !strings.Contains(jsPath, ".admin-state") &&
+				!strings.Contains(jsPath, ".preference") &&
+				!strings.Contains(jsPath, ".external-preference") &&
+				!strings.Contains(jsPath, ".external_preference") &&
+				!strings.Contains(jsPath, ".export-policy") &&
+				!strings.Contains(jsPath, ".import-policy")
+		} else {
 			if strings.Contains(jsPath, ".admin-state") {
 				var s string
 				if err2 := json.Unmarshal([]byte(jsonStr), &s); err2 == nil {
@@ -3312,16 +3320,21 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 		if afCfg.Name == "" {
 			afCfg.Name = afName
 		}
-		if afCfg.AdminState != "" || afCfg.ExportPolicy != "" || afCfg.ImportPolicy != "" || afCfg.Preference > 0 || afCfg.ExternalPreference > 0 {
+		if isContainerUpdate || afCfg.AdminState != "" || afCfg.ExportPolicy != "" || afCfg.ImportPolicy != "" || afCfg.Preference > 0 || afCfg.ExternalPreference > 0 {
 			d.mu.Lock()
 			if afCfg.AdminState != "" {
 				inst.SetAfiAdminState(afCfg.Name, afCfg.AdminState)
 			}
-			if afCfg.ExportPolicy != "" {
+			if isContainerUpdate {
 				inst.SetAfiExportPolicy(afCfg.Name, afCfg.ExportPolicy)
-			}
-			if afCfg.ImportPolicy != "" {
 				inst.SetAfiImportPolicy(afCfg.Name, afCfg.ImportPolicy)
+			} else {
+				if afCfg.ExportPolicy != "" {
+					inst.SetAfiExportPolicy(afCfg.Name, afCfg.ExportPolicy)
+				}
+				if afCfg.ImportPolicy != "" {
+					inst.SetAfiImportPolicy(afCfg.Name, afCfg.ImportPolicy)
+				}
 			}
 			intPref := uint8(0)
 			extPref := uint8(0)
@@ -3436,6 +3449,15 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 					C.srlShimDistanceUpdateAfi(cNetinst, cAfName, C.uint8_t(intPref), C.uint8_t(extPref))
 					C.free(unsafe.Pointer(cAfName))
 				}
+			} else if strings.Contains(jsPath, ".export-policy") || strings.Contains(jsPath, ".export_policy") {
+				d.mu.Lock()
+				inst.SetAfiExportPolicy(afName, "")
+				d.mu.Unlock()
+				d.TriggerRedistSync(netinst)
+			} else if strings.Contains(jsPath, ".import-policy") || strings.Contains(jsPath, ".import_policy") {
+				d.mu.Lock()
+				inst.SetAfiImportPolicy(afName, "")
+				d.mu.Unlock()
 			}
 		}
 		go d.CollectAndPublish(context.Background())
@@ -3502,16 +3524,8 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 		inst.adminState = "enable"
 	}
 	inst.networks = conf.Network
-	if conf.ExportPolicy != "" {
-		inst.exportPolicy = conf.ExportPolicy
-	} else if strings.Contains(jsonStr, "\"export-policy\"") {
-		inst.exportPolicy = ""
-	}
-	if conf.ImportPolicy != "" {
-		inst.importPolicy = conf.ImportPolicy
-	} else if strings.Contains(jsonStr, "\"import-policy\"") {
-		inst.importPolicy = ""
-	}
+	inst.exportPolicy = conf.ExportPolicy
+	inst.importPolicy = conf.ImportPolicy
 	if conf.Variance > 0 {
 		inst.variance = conf.Variance
 	} else {
@@ -4201,24 +4215,10 @@ func (d *EigrpDaemon) getPolicyDef(policyName string) (*PolicyDef, error) {
 				continue
 			}
 
-			var pol PolicyDef
-			if err := json.Unmarshal(jsonBytes, &pol); err == nil && (len(pol.Statement) > 0 || pol.DefaultAction.PolicyResult != "") {
-				if pol.Name == "" {
-					pol.Name = policyName
-				}
-				d.mu.Lock()
-				if d.policyDefs == nil {
-					d.policyDefs = make(map[string]*PolicyDef)
-				}
-				d.policyDefs[policyName] = &pol
-				d.mu.Unlock()
-				return &pol, nil
-			}
-
 			var wrap struct {
 				Policy []PolicyDef `json:"policy"`
 			}
-			if err := json.Unmarshal(jsonBytes, &wrap); err == nil {
+			if err := json.Unmarshal(jsonBytes, &wrap); err == nil && len(wrap.Policy) > 0 {
 				for _, p := range wrap.Policy {
 					if p.Name == policyName {
 						d.mu.Lock()
@@ -4230,6 +4230,20 @@ func (d *EigrpDaemon) getPolicyDef(policyName string) (*PolicyDef, error) {
 						return &p, nil
 					}
 				}
+			}
+
+			var pol PolicyDef
+			if err := json.Unmarshal(jsonBytes, &pol); err == nil {
+				if pol.Name == "" {
+					pol.Name = policyName
+				}
+				d.mu.Lock()
+				if d.policyDefs == nil {
+					d.policyDefs = make(map[string]*PolicyDef)
+				}
+				d.policyDefs[policyName] = &pol
+				d.mu.Unlock()
+				return &pol, nil
 			}
 		}
 	}
@@ -4400,6 +4414,18 @@ func (d *EigrpDaemon) withdrawAllRedistributed(netinst string) {
 }
 
 func (d *EigrpDaemon) SyncRedistribution(netinst string) {
+	if netinst == "all" || netinst == "*" {
+		d.mu.RLock()
+		var nis []string
+		for ni := range d.instances {
+			nis = append(nis, ni)
+		}
+		d.mu.RUnlock()
+		for _, ni := range nis {
+			d.SyncRedistribution(ni)
+		}
+		return
+	}
 	if netinst == "" {
 		netinst = "default"
 	}
@@ -4424,43 +4450,51 @@ func (d *EigrpDaemon) SyncRedistribution(netinst string) {
 
 	acceptedRoutes := make(map[string]CandidateRoute)
 	acceptedMetrics := make(map[string]PolicyMetricConfig)
+	v4SyncSuccess := false
+	v6SyncSuccess := false
 
 	if v4Enabled && v4Policy != "" {
 		pol, err := d.getPolicyDef(v4Policy)
 		if err != nil || pol == nil {
-			log.Warn().Err(err).Str("netinst", netinst).Str("policy", v4Policy).Msg("Failed to get IPv4 export policy definition; aborting SyncRedistribution to prevent route flap")
-			return
-		}
-		routes, rErr := getCandidateRoutes(netinst, "ipv4-unicast")
-		if rErr != nil {
-			log.Warn().Err(rErr).Str("netinst", netinst).Msg("Failed to query IPv4 candidate routes; aborting SyncRedistribution to prevent route flap")
-			return
-		}
-		for _, r := range routes {
-			if ok, m := evaluateRoutePolicy(r, pol); ok {
-				acceptedRoutes[r.Prefix] = r
-				acceptedMetrics[r.Prefix] = m
+			log.Warn().Err(err).Str("netinst", netinst).Str("policy", v4Policy).Msg("Failed to get IPv4 export policy definition; skipping IPv4 redistribution sync to prevent route flap")
+		} else {
+			routes, rErr := getCandidateRoutes(netinst, "ipv4-unicast")
+			if rErr != nil {
+				log.Warn().Err(rErr).Str("netinst", netinst).Msg("Failed to query IPv4 candidate routes; skipping IPv4 redistribution sync to prevent route flap")
+			} else {
+				v4SyncSuccess = true
+				for _, r := range routes {
+					if ok, m := evaluateRoutePolicy(r, pol); ok {
+						acceptedRoutes[r.Prefix] = r
+						acceptedMetrics[r.Prefix] = m
+					}
+				}
 			}
 		}
+	} else {
+		v4SyncSuccess = true
 	}
 
 	if v6Enabled && v6Policy != "" {
 		pol, err := d.getPolicyDef(v6Policy)
 		if err != nil || pol == nil {
-			log.Warn().Err(err).Str("netinst", netinst).Str("policy", v6Policy).Msg("Failed to get IPv6 export policy definition; aborting SyncRedistribution to prevent route flap")
-			return
-		}
-		routes, rErr := getCandidateRoutes(netinst, "ipv6-unicast")
-		if rErr != nil {
-			log.Warn().Err(rErr).Str("netinst", netinst).Msg("Failed to query IPv6 candidate routes; aborting SyncRedistribution to prevent route flap")
-			return
-		}
-		for _, r := range routes {
-			if ok, m := evaluateRoutePolicy(r, pol); ok {
-				acceptedRoutes[r.Prefix] = r
-				acceptedMetrics[r.Prefix] = m
+			log.Warn().Err(err).Str("netinst", netinst).Str("policy", v6Policy).Msg("Failed to get IPv6 export policy definition; skipping IPv6 redistribution sync to prevent route flap")
+		} else {
+			routes, rErr := getCandidateRoutes(netinst, "ipv6-unicast")
+			if rErr != nil {
+				log.Warn().Err(rErr).Str("netinst", netinst).Msg("Failed to query IPv6 candidate routes; skipping IPv6 redistribution sync to prevent route flap")
+			} else {
+				v6SyncSuccess = true
+				for _, r := range routes {
+					if ok, m := evaluateRoutePolicy(r, pol); ok {
+						acceptedRoutes[r.Prefix] = r
+						acceptedMetrics[r.Prefix] = m
+					}
+				}
 			}
 		}
+	} else {
+		v6SyncSuccess = true
 	}
 
 	cNetinst := C.CString(netinst)
@@ -4474,6 +4508,13 @@ func (d *EigrpDaemon) SyncRedistribution(netinst string) {
 
 	d.mu.Lock()
 	for oldPfx, oldProto := range inst.redistributedRoutes {
+		isV6 := strings.Contains(oldPfx, ":")
+		if isV6 && !v6SyncSuccess {
+			continue
+		}
+		if !isV6 && !v4SyncSuccess {
+			continue
+		}
 		if _, ok := acceptedRoutes[oldPfx]; !ok {
 			toWithdraw = append(toWithdraw, redistItem{prefix: oldPfx, proto: oldProto})
 			delete(inst.redistributedRoutes, oldPfx)
