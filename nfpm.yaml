@@ -8,6 +8,9 @@ maintainer: "SRL EIGRP <dev@example.com>"
 description: "EIGRP NDK Protocol Daemon for Nokia SR Linux"
 vendor: "SRL Community"
 license: "GPL-2.0-or-later"
+depends:
+  - libc6
+  - libssl3
 
 contents:
   - src: ./bin/srl-eigrpd

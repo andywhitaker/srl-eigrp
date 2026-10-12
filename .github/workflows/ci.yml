@@ -45,6 +45,9 @@ jobs:
           (cd src/cmd/srl-eigrpd && go vet ./...)
           make build
 
+      - name: Run Unit Tests
+        run: make test-unit
+
       - name: Validate Python Syntax (CLI & Tests)
         run: |
           python3 -m py_compile cli/show_eigrp.py cli/tools_eigrp.py

@@ -16,6 +16,7 @@ import (
 	"unsafe"
 
 	ndk "github.com/nokia/srlinux-ndk-go/ndk"
+	gnmi "github.com/openconfig/gnmi/proto/gnmi"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
@@ -144,6 +145,7 @@ type EigrpInstance struct {
 	bfdSessions          map[string]string
 	staticNeighbors      map[string]*StaticNeighborConfig
 	redistributedRoutes  map[string]string
+	redistributedHashes  map[string]string
 
 	routes     map[string]*RouteInfo
 	neighbors  map[string]*NeighborInfo
@@ -329,6 +331,7 @@ func newEigrpInstance(netinst string) *EigrpInstance {
 		tempTraffic:          make(map[string]*TrafficInfo),
 		bfdSessions:          make(map[string]string),
 		redistributedRoutes:  make(map[string]string),
+		redistributedHashes:  make(map[string]string),
 	}
 }
 
@@ -369,9 +372,119 @@ type EigrpDaemon struct {
 	routeWorkersMu sync.Mutex
 	routeCache     map[string]*candidateRouteCacheEntry
 	routeCacheMu   sync.RWMutex
+
+	gnmiConn   *grpc.ClientConn
+	gnmiClient gnmi.GNMIClient
+	gnmiMu     sync.Mutex
+
+	nhgMu        sync.Mutex
+	prefixToNhg  map[string]string
+	nhgRefCounts map[string]int
+
+	appIdMu     sync.RWMutex
+	appIdToName map[uint32]string
+
+	netinstMu       sync.RWMutex
+	netinstIdToName map[string]string
+	netinstNameToId map[string]string
+
+	candidateMu     sync.RWMutex
+	candidateRoutes map[string]map[string]CandidateRoute
 }
 
 var daemonApp *EigrpDaemon
+
+func (d *EigrpDaemon) resolveNetinstName(raw string) string {
+	if raw == "" {
+		return "default"
+	}
+	d.netinstMu.RLock()
+	defer d.netinstMu.RUnlock()
+	if d.netinstIdToName != nil {
+		if name, ok := d.netinstIdToName[raw]; ok && name != "" {
+			return name
+		}
+	}
+	if raw == "10241" {
+		return "default"
+	}
+	if raw == "10240" {
+		return "mgmt"
+	}
+	return raw
+}
+
+func (d *EigrpDaemon) getNetinstId(name string) (string, bool) {
+	d.netinstMu.RLock()
+	defer d.netinstMu.RUnlock()
+	if d.netinstNameToId != nil {
+		if id, ok := d.netinstNameToId[name]; ok && id != "" {
+			return id, true
+		}
+	}
+	if name == "default" {
+		return "10241", true
+	}
+	if name == "mgmt" {
+		return "10240", true
+	}
+	return "", false
+}
+
+func (d *EigrpDaemon) HandleNetworkInstanceNotification(ni *ndk.NetworkInstanceNotification) {
+	if ni == nil || ni.GetKey() == nil {
+		return
+	}
+	name := ni.GetKey().GetInstanceName()
+	if name == "" {
+		return
+	}
+	op := ni.GetOp()
+
+	d.netinstMu.Lock()
+	if d.netinstIdToName == nil {
+		d.netinstIdToName = make(map[string]string)
+	}
+	if d.netinstNameToId == nil {
+		d.netinstNameToId = make(map[string]string)
+	}
+
+	if op == ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE {
+		if idStr, ok := d.netinstNameToId[name]; ok {
+			delete(d.netinstIdToName, idStr)
+		}
+		delete(d.netinstNameToId, name)
+		d.netinstMu.Unlock()
+		return
+	}
+
+	var idStr string
+	if ni.GetData() != nil {
+		id := ni.GetData().GetNetworkInstanceId()
+		idStr = strconv.FormatUint(uint64(id), 10)
+		d.netinstIdToName[idStr] = name
+		d.netinstNameToId[name] = idStr
+		log.Info().Str("netinst", name).Str("id", idStr).Msg("Learned network-instance mapping")
+	}
+	d.netinstMu.Unlock()
+
+	// If candidate routes were stored under idStr before the network-instance mapping arrived, migrate them to name
+	if idStr != "" && idStr != name {
+		d.candidateMu.Lock()
+		if orphanRoutes, exists := d.candidateRoutes[idStr]; exists && len(orphanRoutes) > 0 {
+			if d.candidateRoutes[name] == nil {
+				d.candidateRoutes[name] = make(map[string]CandidateRoute)
+			}
+			for k, v := range orphanRoutes {
+				d.candidateRoutes[name][k] = v
+			}
+			delete(d.candidateRoutes, idStr)
+		}
+		d.candidateMu.Unlock()
+	}
+
+	d.TriggerRedistSync(name)
+}
 
 func (d *EigrpDaemon) GetInstance(netinst string) *EigrpInstance {
 	if netinst == "" {
@@ -413,6 +526,12 @@ func (d *EigrpDaemon) DeleteInstance(netinst string) {
 		delete(d.instances, netinst)
 	}
 	d.mu.Unlock()
+
+	d.candidateMu.Lock()
+	if d.candidateRoutes != nil {
+		delete(d.candidateRoutes, netinst)
+	}
+	d.candidateMu.Unlock()
 }
 
 func (d *EigrpDaemon) CollectAndPublish(ctx context.Context) {
@@ -1052,20 +1171,34 @@ func main() {
 	}
 
 	daemonApp = &EigrpDaemon{
-		conn:         conn,
-		sdkClient:    ndk.NewSdkMgrServiceClient(conn),
-		routeClient:  ndk.NewSdkMgrRouteServiceClient(conn),
-		nhgClient:    ndk.NewSdkMgrNextHopGroupServiceClient(conn),
-		teleClient:   ndk.NewSdkMgrTelemetryServiceClient(conn),
-		notifClient:  ndk.NewSdkNotificationServiceClient(conn),
-		instances:    make(map[string]*EigrpInstance),
-		learnedVlans: make(map[string]uint16),
-		prevTeleKeys: make(map[string]struct{}),
-		policies:     make(map[string]*PolicyMetricConfig),
-		policyDefs:   make(map[string]*PolicyDef),
-		redistChan:   make(chan string, 32),
-		routeWorkers: make(map[string]*routeQueueWorker),
-		routeCache:   make(map[string]*candidateRouteCacheEntry),
+		conn:            conn,
+		sdkClient:       ndk.NewSdkMgrServiceClient(conn),
+		routeClient:     ndk.NewSdkMgrRouteServiceClient(conn),
+		nhgClient:       ndk.NewSdkMgrNextHopGroupServiceClient(conn),
+		teleClient:      ndk.NewSdkMgrTelemetryServiceClient(conn),
+		notifClient:     ndk.NewSdkNotificationServiceClient(conn),
+		instances:       make(map[string]*EigrpInstance),
+		learnedVlans:    make(map[string]uint16),
+		prevTeleKeys:    make(map[string]struct{}),
+		policies:        make(map[string]*PolicyMetricConfig),
+		policyDefs:      make(map[string]*PolicyDef),
+		redistChan:      make(chan string, 32),
+		routeWorkers:    make(map[string]*routeQueueWorker),
+		routeCache:      make(map[string]*candidateRouteCacheEntry),
+		prefixToNhg:     make(map[string]string),
+		nhgRefCounts:    make(map[string]int),
+		appIdToName:     make(map[uint32]string),
+		candidateRoutes: make(map[string]map[string]CandidateRoute),
+		netinstIdToName: map[string]string{
+			"10241": "default",
+			"10240": "mgmt",
+			"10242": "vrf-1",
+		},
+		netinstNameToId: map[string]string{
+			"default": "10241",
+			"mgmt":    "10240",
+			"vrf-1":   "10242",
+		},
 	}
 
 	daemonApp.Register(ctx)
@@ -1093,6 +1226,11 @@ func main() {
 	if conn != nil {
 		conn.Close()
 	}
+	daemonApp.gnmiMu.Lock()
+	if daemonApp.gnmiConn != nil {
+		daemonApp.gnmiConn.Close()
+	}
+	daemonApp.gnmiMu.Unlock()
 	os.Exit(0)
 }
 
@@ -1173,6 +1311,21 @@ func (d *EigrpDaemon) InitNotificationStream(ctx context.Context) error {
 	} else {
 		log.Info().Msg("Successfully registered IP route subscription with NDK")
 	}
+
+	// Step 5: Add subscription for AppId notifications
+	appIdSubReq := &ndk.NotificationRegisterRequest{
+		Op:       ndk.NotificationRegisterRequest_OPERATION_ADD_SUBSCRIPTION,
+		StreamId: d.streamId,
+		SubscriptionTypes: &ndk.NotificationRegisterRequest_AppId{
+			AppId: &ndk.AppIdentSubscriptionRequest{},
+		},
+	}
+	appIdResp, err := d.sdkClient.NotificationRegister(ctx, appIdSubReq)
+	if err != nil || appIdResp.GetStatus() != ndk.SdkMgrStatus_SDK_MGR_STATUS_SUCCESS {
+		log.Warn().Err(err).Msg("Failed to add AppId subscription to stream")
+	} else {
+		log.Info().Msg("Successfully registered AppId subscription with NDK")
+	}
 	return nil
 }
 
@@ -1202,12 +1355,14 @@ func (d *EigrpDaemon) RunNotificationLoop(ctx context.Context) {
 				if bfd := n.GetBfdSession(); bfd != nil {
 					d.HandleBfdNotification(bfd)
 				}
+				if appId := n.GetAppId(); appId != nil {
+					d.HandleAppIdNotification(appId)
+				}
+				if ni := n.GetNetworkInstance(); ni != nil {
+					d.HandleNetworkInstanceNotification(ni)
+				}
 				if r := n.GetRoute(); r != nil {
-					ni := "default"
-					if r.GetKey() != nil && r.GetKey().GetNetworkInstanceName() != "" {
-						ni = r.GetKey().GetNetworkInstanceName()
-					}
-					d.TriggerRedistSync(ni)
+					d.HandleRouteNotification(r)
 				}
 			}
 		}
@@ -1218,6 +1373,165 @@ func (d *EigrpDaemon) RunNotificationLoop(ctx context.Context) {
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
+}
+
+func (d *EigrpDaemon) HandleAppIdNotification(appId *ndk.AppIdentNotification) {
+	if appId == nil || appId.GetKey() == nil {
+		return
+	}
+	id := appId.GetKey().GetId()
+	op := appId.GetOp()
+	var newName string
+	d.appIdMu.Lock()
+	if d.appIdToName == nil {
+		d.appIdToName = make(map[uint32]string)
+	}
+	if op == ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE {
+		delete(d.appIdToName, id)
+	} else if appId.GetData() != nil {
+		newName = appId.GetData().GetName()
+		d.appIdToName[id] = newName
+	}
+	d.appIdMu.Unlock()
+
+	if newName != "" {
+		d.candidateMu.Lock()
+		for _, netinstRoutes := range d.candidateRoutes {
+			for pfx, cr := range netinstRoutes {
+				if cr.OwnerId == id {
+					cr.RouteOwner = newName
+					if cr.RouteType == "" || cr.RouteType == "static" {
+						cr.RouteType = newName
+					}
+					netinstRoutes[pfx] = cr
+				}
+			}
+		}
+		d.candidateMu.Unlock()
+	}
+
+	d.TriggerRedistSync("all")
+}
+
+func (d *EigrpDaemon) getAppOwner(id uint32) string {
+	d.appIdMu.RLock()
+	defer d.appIdMu.RUnlock()
+	if d.appIdToName == nil {
+		return ""
+	}
+	return d.appIdToName[id]
+}
+
+func (d *EigrpDaemon) HandleRouteNotification(r *ndk.IpRouteNotification) {
+	if r == nil || r.GetKey() == nil {
+		return
+	}
+	key := r.GetKey()
+	rawNetinst := key.GetNetworkInstanceName()
+	netinst := d.resolveNetinstName(rawNetinst)
+	if netinst == "" {
+		netinst = "default"
+	}
+	pfxPb := key.GetIpPrefix()
+	if pfxPb == nil || pfxPb.GetIpAddr() == nil {
+		return
+	}
+	ipBytes := pfxPb.GetIpAddr().GetIpAddress()
+	if len(ipBytes) == 0 {
+		return
+	}
+	prefix := fmt.Sprintf("%s/%d", net.IP(ipBytes).String(), pfxPb.GetPrefixLength())
+	isV6 := strings.Contains(prefix, ":")
+	afi := "ipv4-unicast"
+	if isV6 {
+		afi = "ipv6-unicast"
+	}
+
+	op := r.GetOp()
+	d.candidateMu.Lock()
+	if d.candidateRoutes == nil {
+		d.candidateRoutes = make(map[string]map[string]CandidateRoute)
+	}
+	if _, ok := d.candidateRoutes[netinst]; !ok {
+		d.candidateRoutes[netinst] = make(map[string]CandidateRoute)
+	}
+
+	if op == ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE {
+		delete(d.candidateRoutes[netinst], prefix)
+		if rawNetinst != "" && rawNetinst != netinst {
+			if _, ok := d.candidateRoutes[rawNetinst]; ok {
+				delete(d.candidateRoutes[rawNetinst], prefix)
+			}
+		}
+		d.candidateMu.Unlock()
+		d.TriggerRedistSync(netinst)
+		return
+	}
+
+	data := r.GetData()
+	if data == nil {
+		d.candidateMu.Unlock()
+		return
+	}
+
+	// Skip EIGRP's own routes
+	if d.appId != 0 && data.GetOwnerId() == d.appId {
+		delete(d.candidateRoutes[netinst], prefix)
+		if rawNetinst != "" && rawNetinst != netinst {
+			if _, ok := d.candidateRoutes[rawNetinst]; ok {
+				delete(d.candidateRoutes[rawNetinst], prefix)
+			}
+		}
+		d.candidateMu.Unlock()
+		return
+	}
+
+	ownerName := d.getAppOwner(data.GetOwnerId())
+	if strings.Contains(strings.ToLower(ownerName), "eigrp") {
+		delete(d.candidateRoutes[netinst], prefix)
+		if rawNetinst != "" && rawNetinst != netinst {
+			if _, ok := d.candidateRoutes[rawNetinst]; ok {
+				delete(d.candidateRoutes[rawNetinst], prefix)
+			}
+		}
+		d.candidateMu.Unlock()
+		return
+	}
+
+	var nhStr string
+	for _, nh := range data.GetNexthops() {
+		if nh.GetIpNexthop() != nil && len(nh.GetIpNexthop().GetIpAddress()) > 0 {
+			nhIP := net.IP(nh.GetIpNexthop().GetIpAddress())
+			if !nhIP.IsUnspecified() {
+				nhStr = nhIP.String()
+				break
+			}
+		}
+	}
+
+	routeType := ownerName
+	if routeType == "" {
+		routeType = "static"
+	}
+
+	cr := CandidateRoute{
+		Prefix:     prefix,
+		RouteType:  routeType,
+		RouteOwner: ownerName,
+		NextHop:    nhStr,
+		AFI:        afi,
+		OwnerId:    data.GetOwnerId(),
+	}
+	d.candidateRoutes[netinst][prefix] = cr
+	if rawNetinst != "" && rawNetinst != netinst {
+		if d.candidateRoutes[rawNetinst] == nil {
+			d.candidateRoutes[rawNetinst] = make(map[string]CandidateRoute)
+		}
+		d.candidateRoutes[rawNetinst][prefix] = cr
+	}
+	d.candidateMu.Unlock()
+
+	d.TriggerRedistSync(netinst)
 }
 
 func (d *EigrpDaemon) HandleBfdNotification(bfd *ndk.BfdSessionNotification) {

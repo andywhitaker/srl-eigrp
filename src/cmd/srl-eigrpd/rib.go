@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -12,6 +14,19 @@ import (
 	ndk "github.com/nokia/srlinux-ndk-go/ndk"
 	"github.com/rs/zerolog/log"
 )
+
+func computeNhgName(netinst string, nhStrs []string) string {
+	sortedNhs := make([]string, len(nhStrs))
+	copy(sortedNhs, nhStrs)
+	sort.Strings(sortedNhs)
+	h := sha256.New()
+	for _, nh := range sortedNhs {
+		h.Write([]byte(nh))
+		h.Write([]byte{0})
+	}
+	hash := fmt.Sprintf("%x", h.Sum(nil))[:16]
+	return fmt.Sprintf("eigrp_nhg_%s_%s_sdk", netinst, hash)
+}
 
 func (d *EigrpDaemon) OnRouteAdd(netinst string, prefix string, nexthop string, metric uint32, wideMetric uint64, isExt bool, preference uint32) {
 	if netinst == "" {
@@ -76,27 +91,51 @@ func (d *EigrpDaemon) OnRouteAdd(netinst string, prefix string, nexthop string, 
 		return
 	}
 
-	sanitizedPfx := strings.ReplaceAll(strings.ReplaceAll(prefix, ".", "_"), "/", "_")
-	sanitizedPfx = strings.ReplaceAll(sanitizedPfx, ":", "_")
-	nhgName := fmt.Sprintf("eigrp_nhg_%s_%s_sdk", netinst, sanitizedPfx)
+	nhgName := computeNhgName(netinst, validNhStrs)
+	pfxKey := netinst + ":" + prefix
 
-	nhgReq := &ndk.NextHopGroupRequest{
-		GroupInfos: []*ndk.NextHopGroupInfo{
-			{
-				Key: &ndk.NextHopGroupKey{
-					Name:                nhgName,
-					NetworkInstanceName: netinst,
-				},
-				Data: &ndk.NextHopGroup{
-					Nexthops: validNexthops,
+	d.nhgMu.Lock()
+	if d.prefixToNhg == nil {
+		d.prefixToNhg = make(map[string]string)
+	}
+	if d.nhgRefCounts == nil {
+		d.nhgRefCounts = make(map[string]int)
+	}
+	needNhgAdd := (d.nhgRefCounts[nhgName] == 0)
+	oldNhg := d.prefixToNhg[pfxKey]
+	var needOldNhgDel bool
+	if oldNhg != nhgName {
+		d.prefixToNhg[pfxKey] = nhgName
+		d.nhgRefCounts[nhgName]++
+		if oldNhg != "" {
+			d.nhgRefCounts[oldNhg]--
+			if d.nhgRefCounts[oldNhg] <= 0 {
+				delete(d.nhgRefCounts, oldNhg)
+				needOldNhgDel = true
+			}
+		}
+	}
+	d.nhgMu.Unlock()
+
+	if needNhgAdd {
+		nhgReq := &ndk.NextHopGroupRequest{
+			GroupInfos: []*ndk.NextHopGroupInfo{
+				{
+					Key: &ndk.NextHopGroupKey{
+						Name:                nhgName,
+						NetworkInstanceName: netinst,
+					},
+					Data: &ndk.NextHopGroup{
+						Nexthops: validNexthops,
+					},
 				},
 			},
-		},
-	}
-	if d.nhgClient != nil {
-		if _, err := d.nhgClient.NextHopGroupAddOrUpdate(ctx, nhgReq); err != nil {
-			log.Error().Err(err).Str("netinst", netinst).Str("nhg", nhgName).Msg("NextHopGroupAddOrUpdate failed")
-			return
+		}
+		if d.nhgClient != nil {
+			if _, err := d.nhgClient.NextHopGroupAddOrUpdate(ctx, nhgReq); err != nil {
+				log.Error().Err(err).Str("netinst", netinst).Str("nhg", nhgName).Msg("NextHopGroupAddOrUpdate failed")
+				return
+			}
 		}
 	}
 
@@ -130,6 +169,22 @@ func (d *EigrpDaemon) OnRouteAdd(netinst string, prefix string, nexthop string, 
 		if _, err := d.routeClient.RouteAddOrUpdate(ctx, routeReq); err != nil {
 			log.Error().Err(err).Str("netinst", netinst).Str("prefix", prefix).Msg("RouteAddOrUpdate failed")
 			return
+		}
+	}
+
+	if needOldNhgDel && oldNhg != "" {
+		nhgDelReq := &ndk.NextHopGroupDeleteRequest{
+			GroupKeys: []*ndk.NextHopGroupKey{
+				{
+					Name:                oldNhg,
+					NetworkInstanceName: netinst,
+				},
+			},
+		}
+		if d.nhgClient != nil {
+			if _, err := d.nhgClient.NextHopGroupDelete(ctx, nhgDelReq); err != nil {
+				log.Debug().Err(err).Str("netinst", netinst).Str("nhg", oldNhg).Msg("NextHopGroupDelete failed for superseded NHG")
+			}
 		}
 	}
 
@@ -227,10 +282,6 @@ func (d *EigrpDaemon) withdrawRouteInternal(netinst string, prefix string) {
 		return
 	}
 
-	sanitizedPfx := strings.ReplaceAll(strings.ReplaceAll(prefix, ".", "_"), "/", "_")
-	sanitizedPfx = strings.ReplaceAll(sanitizedPfx, ":", "_")
-	nhgName := fmt.Sprintf("eigrp_nhg_%s_%s_sdk", netinst, sanitizedPfx)
-
 	delReq := &ndk.RouteDeleteRequest{
 		Routes: []*ndk.RouteKey{
 			{
@@ -247,17 +298,35 @@ func (d *EigrpDaemon) withdrawRouteInternal(netinst string, prefix string) {
 			log.Error().Err(err).Str("netinst", netinst).Str("prefix", prefix).Msg("RouteDelete failed")
 		}
 	}
-	nhgDelReq := &ndk.NextHopGroupDeleteRequest{
-		GroupKeys: []*ndk.NextHopGroupKey{
-			{
-				Name:                nhgName,
-				NetworkInstanceName: netinst,
-			},
-		},
+
+	pfxKey := netinst + ":" + prefix
+	d.nhgMu.Lock()
+	var nhgToDelete string
+	if d.prefixToNhg != nil {
+		if nhgName, ok := d.prefixToNhg[pfxKey]; ok {
+			delete(d.prefixToNhg, pfxKey)
+			if d.nhgRefCounts != nil {
+				d.nhgRefCounts[nhgName]--
+				if d.nhgRefCounts[nhgName] <= 0 {
+					delete(d.nhgRefCounts, nhgName)
+					nhgToDelete = nhgName
+				}
+			}
+		}
 	}
-	if d.nhgClient != nil {
+	d.nhgMu.Unlock()
+
+	if nhgToDelete != "" && d.nhgClient != nil {
+		nhgDelReq := &ndk.NextHopGroupDeleteRequest{
+			GroupKeys: []*ndk.NextHopGroupKey{
+				{
+					Name:                nhgToDelete,
+					NetworkInstanceName: netinst,
+				},
+			},
+		}
 		if _, err := d.nhgClient.NextHopGroupDelete(ctx, nhgDelReq); err != nil {
-			log.Debug().Err(err).Str("netinst", netinst).Str("nhg", nhgName).Msg("NextHopGroupDelete failed")
+			log.Debug().Err(err).Str("netinst", netinst).Str("nhg", nhgToDelete).Msg("NextHopGroupDelete failed")
 		}
 	}
 

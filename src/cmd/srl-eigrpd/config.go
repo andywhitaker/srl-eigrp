@@ -3,8 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
-	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
@@ -12,7 +12,11 @@ import (
 	"unsafe"
 
 	ndk "github.com/nokia/srlinux-ndk-go/ndk"
+	gnmi "github.com/openconfig/gnmi/proto/gnmi"
 	"github.com/rs/zerolog/log"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 )
 
 /*
@@ -584,6 +588,37 @@ type PolicyAction struct {
 	Eigrp        PolicyEigrpAction `json:"eigrp"`
 }
 
+func (pa *PolicyAction) UnmarshalJSON(data []byte) error {
+	type Alias PolicyAction
+	aux := &struct {
+		SrlEigrp *PolicyEigrpAction `json:"srl_nokia-eigrp:eigrp"`
+		*Alias
+	}{
+		Alias: (*Alias)(pa),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if aux.SrlEigrp != nil {
+		if pa.Eigrp.Metric.Bandwidth == 0 && aux.SrlEigrp.Metric.Bandwidth != 0 {
+			pa.Eigrp.Metric.Bandwidth = aux.SrlEigrp.Metric.Bandwidth
+		}
+		if pa.Eigrp.Metric.Delay == 0 && aux.SrlEigrp.Metric.Delay != 0 {
+			pa.Eigrp.Metric.Delay = aux.SrlEigrp.Metric.Delay
+		}
+		if pa.Eigrp.Metric.Reliability == 0 && aux.SrlEigrp.Metric.Reliability != 0 {
+			pa.Eigrp.Metric.Reliability = aux.SrlEigrp.Metric.Reliability
+		}
+		if pa.Eigrp.Metric.Load == 0 && aux.SrlEigrp.Metric.Load != 0 {
+			pa.Eigrp.Metric.Load = aux.SrlEigrp.Metric.Load
+		}
+		if pa.Eigrp.Metric.Mtu == 0 && aux.SrlEigrp.Metric.Mtu != 0 {
+			pa.Eigrp.Metric.Mtu = aux.SrlEigrp.Metric.Mtu
+		}
+	}
+	return nil
+}
+
 type PolicyStatement struct {
 	Name   string       `json:"name"`
 	Match  PolicyMatch  `json:"match"`
@@ -602,6 +637,7 @@ type CandidateRoute struct {
 	RouteOwner string
 	NextHop    string
 	AFI        string
+	OwnerId    uint32
 }
 
 type AddressFamilyConfig struct {
@@ -3759,18 +3795,6 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 	}
 }
 
-type srlRouteTableOutput struct {
-	Instance []struct {
-		Name    string `json:"Name"`
-		IpRoute []struct {
-			Prefix     string `json:"Prefix"`
-			RouteType  string `json:"Route Type"`
-			RouteOwner string `json:"Route Owner"`
-			NextHops   string `json:"Next-Hop(s)"`
-		} `json:"ip route"`
-	} `json:"instance"`
-}
-
 func parseCandidateNextHop(nhStr string) string {
 	nhStr = strings.TrimSpace(nhStr)
 	if nhStr == "" || strings.EqualFold(nhStr, "direct") {
@@ -3791,6 +3815,9 @@ func parseCandidateNextHop(nhStr string) string {
 
 func matchProtocol(policyProto, routeType, routeOwner string, isV6 bool) bool {
 	pProto := strings.ToLower(strings.TrimSpace(policyProto))
+	if idx := strings.Index(pProto, ":"); idx != -1 {
+		pProto = pProto[idx+1:]
+	}
 	rType := strings.ToLower(strings.TrimSpace(routeType))
 	rOwner := strings.ToLower(strings.TrimSpace(routeOwner))
 	if pProto == "" {
@@ -3884,98 +3911,48 @@ func (d *EigrpDaemon) GetCandidateRoutes(netinst string, afi string) ([]Candidat
 	if netinst == "" {
 		netinst = "default"
 	}
-	cacheKey := netinst + ":" + afi
-
-	d.routeCacheMu.RLock()
-	var entry *candidateRouteCacheEntry
-	var exists bool
-	if d.routeCache != nil {
-		entry, exists = d.routeCache[cacheKey]
+	resolved := d.resolveNetinstName(netinst)
+	isV6 := strings.Contains(afi, "v6") || strings.Contains(afi, "6")
+	d.candidateMu.RLock()
+	instRoutes := d.candidateRoutes[resolved]
+	if len(instRoutes) == 0 && resolved != netinst {
+		instRoutes = d.candidateRoutes[netinst]
 	}
-	if exists && entry != nil && !entry.dirty && time.Since(entry.timestamp) < candidateRouteCacheTTL {
-		routes := make([]CandidateRoute, len(entry.routes))
-		copy(routes, entry.routes)
-		d.routeCacheMu.RUnlock()
-		return routes, nil
-	}
-	d.routeCacheMu.RUnlock()
-
-	routes, err := queryRoutingStateCLI(netinst, afi)
-	if err != nil {
-		d.routeCacheMu.RLock()
-		if exists && entry != nil {
-			cached := make([]CandidateRoute, len(entry.routes))
-			copy(cached, entry.routes)
-			d.routeCacheMu.RUnlock()
-			return cached, nil
+	if len(instRoutes) == 0 {
+		if idStr, ok := d.getNetinstId(resolved); ok && idStr != "" {
+			instRoutes = d.candidateRoutes[idStr]
 		}
-		d.routeCacheMu.RUnlock()
-		return nil, err
 	}
-
-	d.routeCacheMu.Lock()
-	if d.routeCache == nil {
-		d.routeCache = make(map[string]*candidateRouteCacheEntry)
-	}
-	d.routeCache[cacheKey] = &candidateRouteCacheEntry{
-		routes:    routes,
-		timestamp: time.Now(),
-		dirty:     false,
-	}
-	d.routeCacheMu.Unlock()
-
-	result := make([]CandidateRoute, len(routes))
-	copy(result, routes)
-	return result, nil
-}
-
-func queryRoutingStateCLI(netinst string, afi string) ([]CandidateRoute, error) {
-	if netinst == "" {
-		netinst = "default"
-	}
-	afiCli := "ipv4"
-	if strings.Contains(afi, "v6") || strings.Contains(afi, "6") {
-		afiCli = "ipv6"
-	}
-
-	cmdStr := "show network-instance " + netinst + " " + afiCli + " route | as json"
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "sr_cli", cmdStr)
-	out, err := cmd.Output()
-	if err != nil {
-		log.Warn().Err(err).Str("netinst", netinst).Str("afi", afi).Msg("Failed to execute sr_cli route show")
-		return nil, err
-	}
-
-	var table srlRouteTableOutput
-	if err := json.Unmarshal(out, &table); err != nil {
-		log.Warn().Err(err).Str("netinst", netinst).Str("afi", afi).Msg("Failed to unmarshal route table JSON")
-		return nil, err
-	}
-
-	var candidates []CandidateRoute
-	for _, inst := range table.Instance {
-		if !strings.EqualFold(inst.Name, netinst) {
-			continue
-		}
-		for _, r := range inst.IpRoute {
-			rType := strings.ToLower(strings.TrimSpace(r.RouteType))
-			rOwner := strings.ToLower(strings.TrimSpace(r.RouteOwner))
-			if rType == "eigrp" || rOwner == "srl_eigrpd" {
-				continue
+	if len(instRoutes) > 0 {
+		res := make([]CandidateRoute, 0, len(instRoutes))
+		for pfx, cr := range instRoutes {
+			pfxV6 := strings.Contains(pfx, ":")
+			if isV6 == pfxV6 {
+				if cr.RouteOwner == "" && cr.OwnerId != 0 {
+					cr.RouteOwner = d.getAppOwner(cr.OwnerId)
+					if cr.RouteOwner != "" {
+						cr.RouteType = cr.RouteOwner
+					}
+				}
+				res = append(res, cr)
 			}
-			candidates = append(candidates, CandidateRoute{
-				Prefix:     strings.TrimSpace(r.Prefix),
-				RouteType:  rType,
-				RouteOwner: rOwner,
-				NextHop:    parseCandidateNextHop(r.NextHops),
-				AFI:        afi,
-			})
+		}
+		d.candidateMu.RUnlock()
+		return res, nil
+	}
+	d.candidateMu.RUnlock()
+
+	cacheKey := netinst + ":" + afi
+	d.routeCacheMu.RLock()
+	defer d.routeCacheMu.RUnlock()
+	if d.routeCache != nil {
+		if entry, exists := d.routeCache[cacheKey]; exists && entry != nil && !entry.dirty && time.Since(entry.timestamp) < candidateRouteCacheTTL {
+			routes := make([]CandidateRoute, len(entry.routes))
+			copy(routes, entry.routes)
+			return routes, nil
 		}
 	}
-	return candidates, nil
+	return nil, nil
 }
 
 func getCandidateRoutes(netinst string, afi string) ([]CandidateRoute, error) {
@@ -3985,7 +3962,54 @@ func getCandidateRoutes(netinst string, afi string) ([]CandidateRoute, error) {
 	if daemonApp != nil {
 		return daemonApp.GetCandidateRoutes(netinst, afi)
 	}
-	return queryRoutingStateCLI(netinst, afi)
+	return nil, nil
+}
+
+func (d *EigrpDaemon) resetGNMIClient() {
+	d.gnmiMu.Lock()
+	defer d.gnmiMu.Unlock()
+	if d.gnmiConn != nil {
+		_ = d.gnmiConn.Close()
+		d.gnmiConn = nil
+	}
+	d.gnmiClient = nil
+}
+
+func (d *EigrpDaemon) getGNMIClient() (gnmi.GNMIClient, error) {
+	d.gnmiMu.Lock()
+	defer d.gnmiMu.Unlock()
+	if d.gnmiClient != nil {
+		return d.gnmiClient, nil
+	}
+
+	targets := []string{
+		"unix:///opt/srlinux/var/run/sr_grpc_server_insecure-mgmt",
+		"127.0.0.1:57411",
+	}
+
+	authInterceptor := func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		ctx = metadata.AppendToOutgoingContext(ctx, "username", "admin", "password", "NokiaSrl1!")
+		return invoker(ctx, method, req, reply, cc, opts...)
+	}
+
+	var lastErr error
+	for _, target := range targets {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		conn, err := grpc.DialContext(ctx, target,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithBlock(),
+			grpc.WithUnaryInterceptor(authInterceptor),
+		)
+		cancel()
+		if err == nil {
+			d.gnmiConn = conn
+			d.gnmiClient = gnmi.NewGNMIClient(conn)
+			return d.gnmiClient, nil
+		}
+		lastErr = err
+	}
+
+	return nil, fmt.Errorf("failed to connect to gNMI on targets %v: %w", targets, lastErr)
 }
 
 func (d *EigrpDaemon) getPolicyDef(policyName string) (*PolicyDef, error) {
@@ -3999,35 +4023,78 @@ func (d *EigrpDaemon) getPolicyDef(policyName string) (*PolicyDef, error) {
 	}
 	d.mu.RUnlock()
 
-	cmdStr := "info / routing-policy policy " + policyName + " | as json"
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "sr_cli", cmdStr)
-	out, err := cmd.Output()
+	client, err := d.getGNMIClient()
 	if err != nil {
-		log.Warn().Err(err).Str("policy", policyName).Msg("Failed to execute sr_cli info routing-policy")
+		log.Warn().Err(err).Str("policy", policyName).Msg("Failed to connect to gNMI server for routing-policy")
 		return nil, err
 	}
 
-	var pol PolicyDef
-	if err := json.Unmarshal(out, &pol); err == nil && pol.Name != "" {
-		d.mu.Lock()
-		d.policyDefs[policyName] = &pol
-		d.mu.Unlock()
-		return &pol, nil
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req := &gnmi.GetRequest{
+		Path: []*gnmi.Path{
+			{
+				Elem: []*gnmi.PathElem{
+					{Name: "routing-policy"},
+					{Name: "policy", Key: map[string]string{"name": policyName}},
+				},
+			},
+		},
+		Type:     gnmi.GetRequest_CONFIG,
+		Encoding: gnmi.Encoding_JSON_IETF,
 	}
 
-	var wrap struct {
-		Policy []PolicyDef `json:"policy"`
+	resp, err := client.Get(ctx, req)
+	if err != nil {
+		log.Warn().Err(err).Str("policy", policyName).Msg("Failed to get routing-policy via gNMI")
+		d.resetGNMIClient()
+		return nil, err
 	}
-	if err := json.Unmarshal(out, &wrap); err == nil {
-		for _, p := range wrap.Policy {
-			if p.Name == policyName {
+
+	for _, notif := range resp.GetNotification() {
+		for _, upd := range notif.GetUpdate() {
+			val := upd.GetVal()
+			if val == nil {
+				continue
+			}
+			jsonBytes := val.GetJsonIetfVal()
+			if jsonBytes == nil {
+				jsonBytes = val.GetJsonVal()
+			}
+			if jsonBytes == nil {
+				continue
+			}
+
+			var pol PolicyDef
+			if err := json.Unmarshal(jsonBytes, &pol); err == nil && (len(pol.Statement) > 0 || pol.DefaultAction.PolicyResult != "") {
+				if pol.Name == "" {
+					pol.Name = policyName
+				}
 				d.mu.Lock()
-				d.policyDefs[policyName] = &p
+				if d.policyDefs == nil {
+					d.policyDefs = make(map[string]*PolicyDef)
+				}
+				d.policyDefs[policyName] = &pol
 				d.mu.Unlock()
-				return &p, nil
+				return &pol, nil
+			}
+
+			var wrap struct {
+				Policy []PolicyDef `json:"policy"`
+			}
+			if err := json.Unmarshal(jsonBytes, &wrap); err == nil {
+				for _, p := range wrap.Policy {
+					if p.Name == policyName {
+						d.mu.Lock()
+						if d.policyDefs == nil {
+							d.policyDefs = make(map[string]*PolicyDef)
+						}
+						d.policyDefs[policyName] = &p
+						d.mu.Unlock()
+						return &p, nil
+					}
+				}
 			}
 		}
 	}
@@ -4114,11 +4181,6 @@ func (d *EigrpDaemon) TriggerRedistSync(netinst string) {
 }
 
 func (d *EigrpDaemon) RedistributionWorker(ctx context.Context) {
-	// Reconcile periodically at a rapid 3-second cadence for swift convergence.
-	// Subprocess churn is eliminated via candidate route caching.
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
-
 	var debounceTimer *time.Timer
 	var debounceC <-chan time.Time
 	dirty := make(map[string]bool)
@@ -4131,10 +4193,15 @@ func (d *EigrpDaemon) RedistributionWorker(ctx context.Context) {
 			}
 			return
 		case ni := <-d.redistChan:
-			if ni == "" {
-				ni = "default"
+			if ni == "" || ni == "*" || ni == "all" {
+				d.mu.RLock()
+				for name := range d.instances {
+					dirty[name] = true
+				}
+				d.mu.RUnlock()
+			} else {
+				dirty[ni] = true
 			}
-			dirty[ni] = true
 			if debounceTimer == nil {
 				debounceTimer = time.NewTimer(300 * time.Millisecond)
 				debounceC = debounceTimer.C
@@ -4156,22 +4223,6 @@ func (d *EigrpDaemon) RedistributionWorker(ctx context.Context) {
 			}
 			dirty = make(map[string]bool)
 			for _, ni := range instancesToSync {
-				d.SyncRedistribution(ni)
-			}
-		case <-ticker.C:
-			d.mu.RLock()
-			var activeInstances []string
-			for ni, inst := range d.instances {
-				if inst != nil && inst.adminState != "disable" && inst.asn > 0 {
-					v4Policy := inst.GetAfiExportPolicy("ipv4-unicast")
-					v6Policy := inst.GetAfiExportPolicy("ipv6-unicast")
-					if v4Policy != "" || v6Policy != "" {
-						activeInstances = append(activeInstances, ni)
-					}
-				}
-			}
-			d.mu.RUnlock()
-			for _, ni := range activeInstances {
 				d.SyncRedistribution(ni)
 			}
 		}
@@ -4197,6 +4248,7 @@ func (d *EigrpDaemon) withdrawAllRedistributed(netinst string) {
 		toWithdraw = append(toWithdraw, redistItem{prefix: pfx, proto: proto})
 	}
 	inst.redistributedRoutes = make(map[string]string)
+	inst.redistributedHashes = make(map[string]string)
 	d.mu.Unlock()
 
 	cNetinst := C.CString(netinst)
@@ -4282,6 +4334,7 @@ func (d *EigrpDaemon) SyncRedistribution(netinst string) {
 		if _, ok := acceptedRoutes[oldPfx]; !ok {
 			toWithdraw = append(toWithdraw, redistItem{prefix: oldPfx, proto: oldProto})
 			delete(inst.redistributedRoutes, oldPfx)
+			delete(inst.redistributedHashes, oldPfx)
 		}
 	}
 	d.mu.Unlock()
@@ -4300,6 +4353,16 @@ func (d *EigrpDaemon) SyncRedistribution(netinst string) {
 	for pfx, r := range acceptedRoutes {
 		metric := acceptedMetrics[pfx]
 		normProto := normalizeRedistProtocol(r.RouteType, r.RouteOwner, strings.Contains(r.Prefix, ":"))
+		sig := fmt.Sprintf("%s|%s|%d|%d|%d|%d|%d", normProto, r.NextHop, metric.Bandwidth, metric.Delay, metric.Reliability, metric.Load, metric.Mtu)
+
+		d.mu.RLock()
+		existingSig := inst.redistributedHashes[pfx]
+		d.mu.RUnlock()
+
+		if existingSig == sig {
+			continue
+		}
+
 		cPfx := C.CString(r.Prefix)
 		cProto := C.CString(normProto)
 		cNh := C.CString(r.NextHop)
@@ -4320,6 +4383,10 @@ func (d *EigrpDaemon) SyncRedistribution(netinst string) {
 
 		d.mu.Lock()
 		inst.redistributedRoutes[pfx] = normProto
+		if inst.redistributedHashes == nil {
+			inst.redistributedHashes = make(map[string]string)
+		}
+		inst.redistributedHashes[pfx] = sig
 		d.mu.Unlock()
 
 		log.Info().Str("netinst", netinst).Str("prefix", pfx).Str("proto", normProto).Interface("metric", metric).Msg("Synchronized redistributed route in EIGRP")
