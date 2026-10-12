@@ -3566,7 +3566,6 @@ int srlShimNeighborClear(const char *netinst, const char *neighbor_ip) {
             instances[count++] = b->eigrp;
         }
     }
-    pthread_mutex_unlock(&g_data_lock);
 
     size_t total_affected = 0;
     for (int i = 0; i < count; i++) {
@@ -3578,6 +3577,7 @@ int srlShimNeighborClear(const char *netinst, const char *neighbor_ip) {
         (void)eigrp_nbr_clear(e, &req, NULL, NULL, &affected);
         total_affected += affected;
     }
+    pthread_mutex_unlock(&g_data_lock);
     return (int)total_affected;
 }
 
