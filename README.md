@@ -32,15 +32,21 @@ On production hardware switches (e.g., Nokia 7220 IXR, 7250 IXR) or virtual appl
    
    # In bash:
    sudo dpkg -i /tmp/srl-eigrpd_0.1.0_amd64.deb
+   exit
    ```
-   > [!NOTE]
-   > The package post-installation script automatically:
-   > - Dynamically verifies Control Plane Protection (CPM) filters for IP protocol 88 (without clobbering existing filter entry IDs).
-   > - Installs the dynamic YANG schemas in `/opt/srlinux/models/srl_nokia/models/network-instance/`.
-   > - Deploys CLI plugins to `/etc/opt/srlinux/cli/plugins/`.
-   > - Registers the daemon with the SR Linux Application Manager (`/etc/opt/srlinux/appmgr/srl-eigrpd.yml`).
 
-3. **Verify Daemon & AppMgr Status**:
+> [!NOTE]
+> The package post-installation script automatically:
+>
+> - Dynamically verifies Control Plane Protection (CPM) filters for IP protocol 88 (without clobbering existing filter entry IDs).
+> - Installs the dynamic YANG schemas in `/opt/srlinux/models/srl_nokia/models/network-instance/`.
+> - Deploys CLI plugins to `/etc/opt/srlinux/cli/plugins/`.
+> - Registers the daemon with the SR Linux Application Manager (`/etc/opt/srlinux/appmgr/srl-eigrpd.yml`).
+
+3. **Reload CLI Session**:
+   **Log out of the switch and log back in** (or exit `sr_cli` and reconnect your SSH session). SR Linux `sr_cli` discovers and loads CLI plugins and YANG schemas during session initialization, so starting a fresh CLI session is required for EIGRP commands (`show ... protocols eigrp`, `tools ... protocols eigrp`) and schema nodes to be available.
+
+4. **Verify Daemon & AppMgr Status**:
    Back in `sr_cli`:
    ```text
    A:srl1# info from state system app-management application srl_eigrpd
@@ -48,7 +54,7 @@ On production hardware switches (e.g., Nokia 7220 IXR, 7250 IXR) or virtual appl
        last-start-time "..."
    ```
 
-4. **Verify CPM Filter**:
+5. **Verify CPM Filter**:
    ```text
    A:srl1# tools network-instance default protocols eigrp check-cpm
    ================================================================================
