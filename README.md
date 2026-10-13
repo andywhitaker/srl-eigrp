@@ -21,7 +21,7 @@ On standalone SR Linux switches or virtual appliances (SR Linux VM):
 
 1. **Transfer the Package**:
    ```bash
-   scp dist/srl-eigrpd_0.1.0_amd64.deb admin@<switch-ip>:/tmp/
+   scp dist/srl-eigrpd_0.1.1_amd64.deb admin@<switch-ip>:/tmp/
    ```
 
 2. **Install via Debian Package Manager**:
@@ -31,7 +31,7 @@ On standalone SR Linux switches or virtual appliances (SR Linux VM):
    A:srl1# bash
    
    # In bash:
-   sudo dpkg -i /tmp/srl-eigrpd_0.1.0_amd64.deb
+   sudo dpkg -i /tmp/srl-eigrpd_0.1.1_amd64.deb
    exit
    ```
 
@@ -73,7 +73,7 @@ topology:
   kinds:
     nokia_srlinux:
       binds:
-        - dist/srl-eigrpd_0.1.0_amd64.deb:/tmp/srl-eigrpd.deb:ro
+        - dist/srl-eigrpd_0.1.1_amd64.deb:/tmp/srl-eigrpd.deb:ro
   nodes:
     srl1:
       kind: nokia_srlinux
@@ -635,4 +635,4 @@ make all
 # Clean build artifacts
 make clean
 ```
-The output `.deb` package will be created in `dist/srl-eigrpd_0.1.0_amd64.deb`.
+The output `.deb` package will be created in `dist/srl-eigrpd_0.1.1_amd64.deb`.

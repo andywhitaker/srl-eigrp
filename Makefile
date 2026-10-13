@@ -13,9 +13,11 @@ build: cshim
 	mkdir -p bin
 	cd src/cmd/srl-eigrpd && go build -ldflags="-s -w" -a -v -o ../../../bin/srl-eigrpd .
 
+VERSION ?= 0.1.1
+
 package: build
 	mkdir -p dist
-	docker run --rm -v $(CURDIR):/tmp -w /tmp goreleaser/nfpm:latest package --config nfpm.yaml --target dist/srl-eigrpd_0.1.0_amd64.deb
+	docker run --rm -v $(CURDIR):/tmp -w /tmp goreleaser/nfpm:latest package --config nfpm.yaml --target dist/srl-eigrpd_$(VERSION)_amd64.deb
 
 deploy-srl: package
 	sudo clab deploy -t topologies/srl-srl.clab.yml --reconfigure

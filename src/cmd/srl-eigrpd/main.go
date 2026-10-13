@@ -33,7 +33,7 @@ import "C"
 const (
 	ndkSocket = "unix:///opt/srlinux/var/run/sr_sdk_service_manager:50053"
 	appName   = "srl_eigrpd"
-	version   = "0.1.0"
+	version   = "0.1.1"
 )
 
 type RouteInfo struct {

@@ -60,16 +60,16 @@ jobs:
       - name: Build Debian Package
         run: |
           mkdir -p dist
-          nfpm package --config nfpm.yaml --target dist/srl-eigrpd_0.1.0_amd64.deb
+          nfpm package --config nfpm.yaml --target dist/srl-eigrpd_0.1.1_amd64.deb
 
       - name: Verify Debian Package Structure
         run: |
-          dpkg -c dist/srl-eigrpd_0.1.0_amd64.deb
-          dpkg -I dist/srl-eigrpd_0.1.0_amd64.deb
+          dpkg -c dist/srl-eigrpd_0.1.1_amd64.deb
+          dpkg -I dist/srl-eigrpd_0.1.1_amd64.deb
 
       - name: Upload Debian Package Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: srl-eigrpd_0.1.0_amd64.deb
-          path: dist/srl-eigrpd_0.1.0_amd64.deb
+          name: srl-eigrpd_0.1.1_amd64.deb
+          path: dist/srl-eigrpd_0.1.1_amd64.deb
           if-no-files-found: error

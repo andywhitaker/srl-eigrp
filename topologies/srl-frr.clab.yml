@@ -7,7 +7,7 @@ topology:
       image: ghcr.io/nokia/srlinux:latest
       type: ixr-d2l
       binds:
-        - ../dist/srl-eigrpd_0.1.0_amd64.deb:/tmp/srl-eigrpd.deb:ro
+        - ../dist/srl-eigrpd_0.1.1_amd64.deb:/tmp/srl-eigrpd.deb:ro
         - ../configs/srl1.cli:/tmp/srl1.cli:ro
       exec:
         - dpkg -i /tmp/srl-eigrpd.deb
