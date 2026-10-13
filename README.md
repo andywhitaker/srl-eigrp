@@ -12,12 +12,12 @@ This daemon (`srl-eigrpd`) runs as an in-process protocol agent inside SR Linux,
 
 ## ⚡ Installation & Quick Start
 
-Installing EIGRP onto Nokia SR Linux takes less than two minutes whether running on physical hardware, virtual machines, or containerized lab environments.
+Installing EIGRP onto Nokia SR Linux takes less than two minutes whether running on virtual machines or containerized environments.
 
 ### Step 1: Package Installation
 
-#### Option A: Production Switches & Virtual Machines (Bare-Metal / VM / KVM / ESXi)
-On production hardware switches (e.g., Nokia 7220 IXR, 7250 IXR) or virtual appliances (SR Linux VM):
+#### Option A: Standalone Switches & Virtual Machines (VM / KVM / ESXi)
+On standalone SR Linux switches or virtual appliances (SR Linux VM):
 
 1. **Transfer the Package**:
    ```bash
@@ -120,7 +120,7 @@ commit now
 ```
 
 > [!TIP]
-> **Zero Boilerplate:** According to the YANG schema defaults, interface `admin-state` defaults directly to `enable`. Simply creating the interface under `/ network-instance <name> protocols eigrp interface <name>` immediately brings it up without requiring an explicit `admin-state enable` command. To persist across switch reboots on physical hardware, run `save startup` or `/commit save-running`.
+> **Zero Boilerplate:** According to the YANG schema defaults, interface `admin-state` defaults directly to `enable`. Simply creating the interface under `/ network-instance <name> protocols eigrp interface <name>` immediately brings it up without requiring an explicit `admin-state enable` command. To persist across switch reboots, run `save startup` or `/commit save-running`.
 
 ---
 
@@ -403,7 +403,7 @@ A:srl1# tools network-instance default protocols eigrp graceful-restart planned-
 
 ### 14. Bidirectional Forwarding Detection (BFD)
 Integrates EIGRP with the Nokia SR Linux micro-BFD engine for sub-second failure detection:
-- **Hardware-Accelerated Detection**: Offloads hello monitoring to the SR Linux BFD subsystem, detecting physical link and forwarding failures in milliseconds.
+- **Sub-Second BFD Detection**: Offloads hello monitoring to the SR Linux BFD subsystem, detecting link and forwarding failures in milliseconds.
 - **NDK BFD Service Integration**: Listens for asynchronous `BfdSessionNotification` events from the NDK manager. The daemon only transitions a neighbor's BFD state to `up` when an explicit `BFD_SESSION_STATUS_UP` notification is received from the NDK manager.
 - **Native Next-Hop Group Tracking Requirement**: In SR Linux, programmatic BFD session creation by custom NDK applications requires native next-hop group tracking (configured under `/ bfd` or via native route next-hop group tracking). When running standalone or prior to receiving an NDK BFD session event, the operational state is transparently reported as `not-tracked` rather than falsely asserting an active session.
 - **Fast Adjacency Teardown**: Upon BFD session down transition (`BFD_SESSION_STATUS_DOWN` or `BFD_SESSION_STATUS_ADMIN_DOWN`), immediately clears the neighbor adjacency and triggers DUAL recalculation without waiting for hold timer expiration.
@@ -443,7 +443,7 @@ show network-instance default ipv6 route
 ```
 
 ### 16. Actionable Operational Down Reasons
-In production environments, identifying why an adjacency failed to establish or why an interface is inactive must be instantaneous. Both the native CLI plugins and NDK State DB stream explicit `oper-down-reason` diagnostic fields:
+Identifying why an adjacency failed to establish or why an interface is inactive is critical for operational troubleshooting. Both the native CLI plugins and NDK State DB stream explicit `oper-down-reason` diagnostic fields:
 
 | State Context | Operational Down Reason | Root Cause / Resolution |
 | :--- | :--- | :--- |
@@ -451,7 +451,7 @@ In production environments, identifying why an adjacency failed to establish or 
 | **Protocol Instance** | `autonomous system not configured` | Autonomous system number is 0 or unassigned |
 | **Interface** | `interface admin disabled` | Interface has `admin-state disable` |
 | **Interface** | `no IP address configured` | Interface subinterface lacks an IPv4 or IPv6 address |
-| **Interface** | `link down or inactive` | Physical or underlying subinterface is operationally down |
+| **Interface** | `link down or inactive` | Underlying interface or subinterface is operationally down |
 | **Neighbor** | `hold-timer expired or peering down` | Peer failed to send hellos before hold-time expired |
 | **Static Neighbor** | `neighbor unreachable or inactive` | Static peer IP is not currently responding or reachable |
 
@@ -471,7 +471,7 @@ Admin State:         enable
 EIGRP DUAL computes composite metrics based on configurable interface bandwidth and delay:
 - **Traffic Steering via Delay**: Modifying `delay` on an interface immediately triggers DUAL recalculation, dynamically adjusting composite metrics without tearing down neighbor sessions or flapping interfaces.
 - **Feasible Successor Guarantee**: When alternate paths satisfy the Feasibility Condition ($RD < FD$), they are instantly designated as `Feasible Successor`.
-- **Zero-Packet-Loss Failover**: If the primary successor link fails or is administratively disabled, DUAL promotes the Feasible Successor to Successor immediately in hardware without sending queries or entering Active state.
+- **Zero-Packet-Loss Failover**: If the primary successor link fails or is administratively disabled, DUAL promotes the Feasible Successor to Successor immediately without sending queries or entering Active state.
 
 ```text
 # Steer traffic away from a link by increasing its delay:
@@ -480,8 +480,8 @@ set / network-instance default protocols eigrp interface ethernet-1/2.0 delay 20
 commit now
 ```
 
-### 18. 5-Node Enterprise Network Topology Validation
-The EIGRP engine is validated against a 5-node redundant diamond/ladder topology located in `/home/awhitaker/temp/eigrp-test/` (`srl1` <-> `srl2` <-> {`srl3`, `srl4`} <-> `srl5`):
+### 18. 5-Node Redundant Network Topology Validation
+The EIGRP engine is validated against a 5-node redundant diamond/ladder topology (`srl1` <-> `srl2` <-> {`srl3`, `srl4`} <-> `srl5`):
 
 ```text
        +------+
@@ -514,7 +514,7 @@ The EIGRP engine is validated against a 5-node redundant diamond/ladder topology
 
 ## 🛡️ Control Plane Protection (CPM Filter)
 
-Nokia SR Linux uses hardware and kernel Control Plane Protection (CPM) filters to protect the management plane and CPU from denial-of-service traffic. By default, incoming packets with unregistered IP protocols are dropped.
+Nokia SR Linux uses Control Plane Protection (CPM) filters to protect the management plane and CPU from denial-of-service traffic. By default, incoming packets with unregistered IP protocols are dropped.
 
 EIGRP uses **IP Protocol 88**.
 
@@ -582,7 +582,7 @@ Verifying Control Plane Protection (CPM Filter) for EIGRP (IP Protocol 88)...
 ### Key Architectural Highlights
 1. **Zero Core Modifications:** Upstream EIGRP engine (`src/upstream/eigrp/`) remains 100% clean and unmodified, allowing seamless synchronization with upstream improvements.
 2. **Network Namespace Isolation:** Raw sockets are created inside the specific Linux network namespace (`/var/run/netns/srbase-<netinst>`), ensuring multi-VRF isolation and avoiding host namespace leakage.
-3. **Hardware Checksum Offload Resiliency:** Computes RFC 7868 one's complement checksums explicitly for outbound frames to prevent packet drops across virtual veth interfaces and offload-enabled hardware ASICs.
+3. **Checksum Offload Resiliency:** Computes RFC 7868 one's complement checksums explicitly for outbound frames to prevent packet drops across virtual veth interfaces and offload-enabled network interfaces.
 4. **Decoupled Unix Socket IPC:** Dedicated non-blocking local IPC listener for `tools` operational commands ensures instant responsiveness without stalling the gRPC config pipeline.
 
 ---
