@@ -51,7 +51,7 @@ jobs:
       - name: Validate Python Syntax (CLI & Tests)
         run: |
           python3 -m py_compile cli/show_eigrp.py cli/tools_eigrp.py
-          python3 -m py_compile tests/test_srl_srl_peering.py tests/test_srl_frr_interop.py
+          python3 -m py_compile tests/test_srl_srl_peering.py tests/test_srl_frr_interop.py tests/test_5node_lab.py
 
       - name: Install nFPM
         run: |
@@ -60,16 +60,16 @@ jobs:
       - name: Build Debian Package
         run: |
           mkdir -p dist
-          nfpm package --config nfpm.yaml --target dist/srl-eigrpd_0.1.1_amd64.deb
+          nfpm package --config nfpm.yaml --target dist/srl-eigrpd_0.1.2_amd64.deb
 
       - name: Verify Debian Package Structure
         run: |
-          dpkg -c dist/srl-eigrpd_0.1.1_amd64.deb
-          dpkg -I dist/srl-eigrpd_0.1.1_amd64.deb
+          dpkg -c dist/srl-eigrpd_0.1.2_amd64.deb
+          dpkg -I dist/srl-eigrpd_0.1.2_amd64.deb
 
       - name: Upload Debian Package Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: srl-eigrpd_0.1.1_amd64.deb
-          path: dist/srl-eigrpd_0.1.1_amd64.deb
+          name: srl-eigrpd_0.1.2_amd64.deb
+          path: dist/srl-eigrpd_0.1.2_amd64.deb
           if-no-files-found: error

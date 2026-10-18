@@ -4,7 +4,7 @@ SHELL := /bin/bash
 all: core cshim build package
 
 core:
-	$(MAKE) -C src/upstream/eigrp/eigrp/code libeigrp-core.a
+	$(MAKE) -C src/upstream/eigrp/eigrp/code CFLAGS="-O2 -g -fPIC" libeigrp-core.a
 
 cshim: core
 	$(MAKE) -C src/cshim libsrl-cshim.a
@@ -13,7 +13,7 @@ build: cshim
 	mkdir -p bin
 	cd src/cmd/srl-eigrpd && go build -ldflags="-s -w" -a -v -o ../../../bin/srl-eigrpd .
 
-VERSION ?= 0.1.1
+VERSION ?= 0.1.2
 
 package: build
 	mkdir -p dist

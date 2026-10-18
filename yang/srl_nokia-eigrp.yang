@@ -116,23 +116,11 @@ module srl_nokia-eigrp {
         default false;
         description "Advertise this router as next hop on this interface for this address family";
       }
-      list summary-address {
-        key "prefix";
-        description "Configure summary address on this interface for this address family";
-        leaf prefix {
-          type srl_nokia-comm:ip-prefix;
-          description "Summary IP prefix to advertise";
-        }
-        leaf distance {
-          type uint8 { range "1..255"; }
-          default 5;
-          description "Administrative distance for summary discard route";
-        }
-        leaf oper-state {
-          config false;
-          type srl_nokia-comm:oper-state;
-          description "Operational state of the summary address route";
-        }
+      leaf bandwidth-percent {
+        type uint32 { range "1..999999"; }
+        default 50;
+        units "percent";
+        description "Maximum percentage of interface bandwidth that EIGRP may use for this address family";
       }
       container authentication {
         description "Packet authentication configuration for this address family";
@@ -214,6 +202,24 @@ module srl_nokia-eigrp {
           description "Remote peer address monitored by BFD";
         }
       }
+      list summary-address {
+        key "prefix";
+        description "Configure summary address on this interface for this address family";
+        leaf prefix {
+          type srl_nokia-comm:ip-prefix;
+          description "Summary IP prefix to advertise";
+        }
+        leaf distance {
+          type uint8 { range "1..255"; }
+          default 5;
+          description "Administrative distance for summary discard route";
+        }
+        leaf oper-state {
+          config false;
+          type srl_nokia-comm:oper-state;
+          description "Operational state of the summary address route";
+        }
+      }
     }
   }
 
@@ -269,6 +275,12 @@ module srl_nokia-eigrp {
         type boolean;
         default false;
         description "Advertise this router as next hop by default";
+      }
+      leaf bandwidth-percent {
+        type uint32 { range "1..999999"; }
+        default 50;
+        units "percent";
+        description "Maximum percentage of interface bandwidth that EIGRP may use by default";
       }
       container authentication {
         description "Packet authentication configuration for this address family by default";
@@ -342,7 +354,6 @@ module srl_nokia-eigrp {
   }
 
   grouping eigrp-default-interface-config {
-    uses eigrp-default-interface-address-family-config;
     leaf admin-state {
       type srl_nokia-comm:admin-state;
       default "enable";
@@ -363,10 +374,16 @@ module srl_nokia-eigrp {
       units "10-microseconds";
       description "Interface delay in 10-microsecond units by default";
     }
+    leaf bandwidth-percent {
+      type uint32 { range "1..999999"; }
+      default 50;
+      units "percent";
+      description "Maximum percentage of interface bandwidth that EIGRP may use by default";
+    }
+    uses eigrp-default-interface-address-family-config;
   }
 
   grouping eigrp-interface-config {
-    uses eigrp-interface-address-family-config;
     leaf admin-state {
       type srl_nokia-comm:admin-state;
       default "enable";
@@ -392,6 +409,23 @@ module srl_nokia-eigrp {
       units "10-microseconds";
       description "Configured interface delay in 10-microsecond units";
     }
+    leaf bandwidth-percent {
+      type uint32 { range "1..999999"; }
+      default 50;
+      units "percent";
+      description "Maximum percentage of interface bandwidth that EIGRP may use";
+    }
+    leaf ip-address {
+      config false;
+      type srl_nokia-comm:ip-address;
+      description "IPv4 address assigned to the interface";
+    }
+    leaf prefix-length {
+      config false;
+      type uint8;
+      description "IPv4 prefix length of the interface";
+    }
+    uses eigrp-interface-address-family-config;
   }
 
   grouping eigrp-top {
@@ -463,6 +497,110 @@ module srl_nokia-eigrp {
         default true;
         description "Enable RFC 7868 64-bit wide metrics";
       }
+      leaf traffic-share-balanced {
+        type boolean;
+        default false;
+        description "Distribute traffic proportionally to route metrics across unequal-cost paths";
+      }
+      leaf auto-summary {
+        type boolean;
+        default false;
+        description "Enable automatic classful network boundary route summarization";
+      }
+      leaf event-log-size {
+        type uint32 {
+          range "0..100000";
+        }
+        default 500;
+        description "Maximum number of entries in the DUAL event log";
+      }
+      leaf oper-state {
+        config false;
+        type srl_nokia-comm:oper-state;
+        description "Operational state of the EIGRP protocol instance";
+      }
+      leaf oper-down-reason {
+        config false;
+        type string;
+        description "Reason why the protocol instance is operationally down";
+      }
+      leaf total-interfaces {
+        config false;
+        type uint32;
+        description "Number of participating interfaces";
+      }
+      leaf total-neighbors {
+        config false;
+        type uint32;
+        description "Number of active EIGRP neighbors";
+      }
+      leaf total-routes {
+        config false;
+        type uint32;
+        description "Number of learned EIGRP routes";
+      }
+      container default-metric {
+        description "Default seed metric for redistributed routes";
+        leaf bandwidth {
+          type uint32 {
+            range "1..10000000";
+          }
+          default 100000;
+          units "kilobits-per-second";
+          description "Default bandwidth metric in kilobits per second (K1)";
+        }
+        leaf delay {
+          type uint32 {
+            range "1..16777215";
+          }
+          default 100;
+          units "10-microseconds";
+          description "Default delay metric in 10-microsecond units (K3)";
+        }
+        leaf reliability {
+          type uint8 {
+            range "1..255";
+          }
+          default 255;
+          description "Default reliability metric from 1 to 255 (K4)";
+        }
+        leaf load {
+          type uint8 {
+            range "1..255";
+          }
+          default 1;
+          description "Default effective load metric from 1 to 255 (K2)";
+        }
+        leaf mtu {
+          type uint32 {
+            range "1..65535";
+          }
+          default 1500;
+          description "Default Maximum Transmission Unit in bytes (K5)";
+        }
+      }
+      container maximum-prefix {
+        description "Maximum number of prefixes accepted in the EIGRP topology table";
+        leaf limit {
+          type uint32 {
+            range "1..4294967295";
+          }
+          description "Maximum number of prefixes allowed";
+        }
+        leaf threshold {
+          type uint8 {
+            range "1..100";
+          }
+          default 75;
+          units "percent";
+          description "Warning threshold percentage";
+        }
+        leaf warning-only {
+          type boolean;
+          default false;
+          description "Log warning message only when limit is exceeded without dropping routes";
+        }
+      }
       container graceful-restart {
         description "Graceful restart (Non-Stop Forwarding / NSF) configuration";
         leaf admin-state {
@@ -521,10 +659,6 @@ module srl_nokia-eigrp {
           default 0;
           description "Extended attributes weight (K6)";
         }
-      }
-      container default-interface {
-        description "Default interface configuration for EIGRP";
-        uses eigrp-default-interface-config;
       }
       container timers {
         leaf active-time {
@@ -618,6 +752,94 @@ module srl_nokia-eigrp {
           default 170;
           description "Route table preference (administrative distance) for external EIGRP routes in this address family";
         }
+        leaf traffic-share-balanced {
+          type boolean;
+          default false;
+          description "Distribute traffic proportionally to route metrics across unequal-cost paths in this address family";
+        }
+        leaf auto-summary {
+          type boolean;
+          default false;
+          description "Enable automatic classful network summarization at major network boundaries in this address family";
+        }
+        container default-metric {
+          description "Default seed metric for redistributed routes in this address family";
+          leaf bandwidth {
+            type uint32 {
+              range "1..10000000";
+            }
+            default 100000;
+            units "kilobits-per-second";
+            description "Default bandwidth metric in kilobits per second (K1)";
+          }
+          leaf delay {
+            type uint32 {
+              range "1..16777215";
+            }
+            default 100;
+            units "10-microseconds";
+            description "Default delay metric in 10-microsecond units (K3)";
+          }
+          leaf reliability {
+            type uint8 {
+              range "1..255";
+            }
+            default 255;
+            description "Default reliability metric from 1 to 255 (K4)";
+          }
+          leaf load {
+            type uint8 {
+              range "1..255";
+            }
+            default 1;
+            description "Default effective load metric from 1 to 255 (K2)";
+          }
+          leaf mtu {
+            type uint32 {
+              range "1..65535";
+            }
+            default 1500;
+            units "bytes";
+            description "Default Maximum Transmission Unit in bytes (K5)";
+          }
+        }
+        container maximum-prefix {
+          description "Maximum number of prefixes accepted in the EIGRP topology table for this address family";
+          leaf limit {
+            type uint32 {
+              range "1..4294967295";
+            }
+            description "Maximum number of prefixes allowed";
+          }
+          leaf threshold {
+            type uint8 {
+              range "1..100";
+            }
+            default 75;
+            units "percent";
+            description "Warning threshold percentage";
+          }
+          leaf warning-only {
+            type boolean;
+            default false;
+            description "Log warning message only when limit is exceeded without dropping routes";
+          }
+        }
+      }
+
+      container default-interface {
+        description "Default interface configuration for EIGRP";
+        uses eigrp-default-interface-config;
+      }
+
+      list event-log {
+        key "id";
+        config false;
+        srl_nokia-ext:unordered-state-list "true";
+        description "DUAL finite state machine and protocol event log entries";
+        leaf id { type uint32; description "Event sequence number"; }
+        leaf timestamp { type string; description "Event timestamp"; }
+        leaf message { type string; description "Formatted event description"; }
       }
 
       list interface {
@@ -628,44 +850,8 @@ module srl_nokia-eigrp {
           description "Router logical subinterface name (e.g. ethernet-1/1.0, system0.0)";
         }
         uses eigrp-interface-config;
-        leaf ip-address {
-          config false;
-          type srl_nokia-comm:ip-address;
-          description "IPv4 address assigned to the interface";
-        }
-        leaf prefix-length {
-          config false;
-          type uint8;
-          description "IPv4 prefix length of the interface";
-        }
       }
 
-      // Operational state leaves and lists directly under eigrp:
-      leaf oper-state {
-        config false;
-        type srl_nokia-comm:oper-state;
-        description "Operational state of the EIGRP protocol instance";
-      }
-      leaf oper-down-reason {
-        config false;
-        type string;
-        description "Reason why the protocol instance is operationally down";
-      }
-      leaf total-interfaces {
-        config false;
-        type uint32;
-        description "Number of participating interfaces";
-      }
-      leaf total-neighbors {
-        config false;
-        type uint32;
-        description "Number of active EIGRP neighbors";
-      }
-      leaf total-routes {
-        config false;
-        type uint32;
-        description "Number of learned EIGRP routes";
-      }
       list neighbor {
         key "ip-address";
         config false;

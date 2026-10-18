@@ -1,6 +1,6 @@
 # EIGRP for Nokia SR Linux (NDK Protocol Daemon)
 
-[![Build & Tests](https://img.shields.io/badge/tests-47%20passed-brightgreen.svg)]()
+[![Build & Tests](https://img.shields.io/badge/tests-52%20passed-brightgreen.svg)]()
 [![Platform](https://img.shields.io/badge/platform-Nokia%20SR%20Linux%2024.x%2B-blue.svg)]()
 [![License](https://img.shields.io/badge/license-GPL--2.0-yellow.svg)]()
 
@@ -21,7 +21,7 @@ On standalone SR Linux switches or virtual appliances (SR Linux VM):
 
 1. **Transfer the Package**:
    ```bash
-   scp dist/srl-eigrpd_0.1.1_amd64.deb admin@<switch-ip>:/tmp/
+   scp dist/srl-eigrpd_0.1.2_amd64.deb admin@<switch-ip>:/tmp/
    ```
 
 2. **Install via Debian Package Manager**:
@@ -31,7 +31,7 @@ On standalone SR Linux switches or virtual appliances (SR Linux VM):
    A:srl1# bash
    
    # In bash:
-   sudo dpkg -i /tmp/srl-eigrpd_0.1.1_amd64.deb
+   sudo dpkg -i /tmp/srl-eigrpd_0.1.2_amd64.deb
    exit
    ```
 
@@ -73,7 +73,7 @@ topology:
   kinds:
     nokia_srlinux:
       binds:
-        - dist/srl-eigrpd_0.1.1_amd64.deb:/tmp/srl-eigrpd.deb:ro
+        - dist/srl-eigrpd_0.1.2_amd64.deb:/tmp/srl-eigrpd.deb:ro
   nodes:
     srl1:
       kind: nokia_srlinux
@@ -167,6 +167,7 @@ The package includes native CLI plugins extending both `show` and `tools` operat
 | `show ... protocols eigrp routes` | Routes programmed in FIB, next-hops, composite metric, route type (Internal/External), and preference |
 | `show ... protocols eigrp topology` | DUAL topology table showing passive/active prefixes, successor count, Feasible Distance (FD), and Reported Distance (RD) |
 | `show ... protocols eigrp traffic` | Interface packet counters (reliable/unreliable multicast, unicast, retransmissions, CR packets) |
+| `show ... protocols eigrp event-log` | DUAL finite state machine and protocol event history log (sequence IDs, timestamps, and event descriptions) |
 | `show ... ipv4 route eigrp [prefix]` | EIGRP learned IPv4 routing table installed in FIB |
 | `show ... ipv6 route eigrp [prefix]` | EIGRP learned IPv6 routing table installed in FIB |
 | `show ... ipv4 route` | Native Nokia IPv4 route table showing installed EIGRP prefixes (rendered as `eigrp`) |
@@ -192,7 +193,11 @@ Total Routes: 1
 | `tools ... neighbor clear <peer-ip>` | Clears adjacency with a specific peer and renegotiates peering (peer IP strictly required) |
 | `tools ... neighbor reset-all` | Resets all active EIGRP neighbor sessions across the entire network instance |
 | `tools ... neighbor bfd-down <peer-ip>` | Triggers immediate neighbor teardown upon BFD session down notification |
+| `tools ... topology clear` | Clears the EIGRP DUAL topology table and triggers route resynchronization with active peers |
+| `tools ... statistics clear` | Resets all per-interface EIGRP packet traffic counters to zero |
+| `tools ... event-log clear` | Clears all recorded entries in the EIGRP protocol event log |
 | `tools ... graceful-restart planned-restart` | Initiates planned graceful restart (NSF) with hello graceful-shutdown signaling and FIB route retention |
+| `tools ... graceful-shutdown` | Sends EIGRP Goodbye (graceful shutdown) packets across active interfaces |
 | `tools ... restart` | Performs a fast protocol soft-restart / neighbor reset |
 | `tools ... check-cpm` | Verifies whether the Control Plane Protection (CPM) filter accepts IP protocol 88 |
 
@@ -242,10 +247,12 @@ set / network-instance default protocols eigrp interface ethernet-1/1.0 admin-st
 set / network-instance default protocols eigrp interface system0.0 address-family ipv4-unicast passive true
 ```
 
-### 2. Unequal-Cost Load Balancing (Variance)
-Allows EIGRP to install feasible successor routes with metrics up to `variance × FD` into the FIB:
+### 2. Unequal-Cost Load Balancing (`variance` & `traffic-share-balanced`)
+Allows EIGRP to install feasible successor routes with metrics up to `variance × FD` into the FIB, and configure proportional traffic sharing across unequal-cost paths:
 ```text
 set / network-instance default protocols eigrp variance 2
+set / network-instance default protocols eigrp traffic-share-balanced true
+set / network-instance default protocols eigrp address-family ipv4-unicast traffic-share-balanced true
 ```
 
 ### 3. Equal-Cost Multipath (ECMP Maximum Paths)
@@ -265,8 +272,8 @@ set / network-instance default protocols eigrp metrics mtu 0                   #
 set / network-instance default protocols eigrp metrics extended-attributes 0    # K6: Extended attributes
 ```
 
-### 5. Address Families & Routing Policy Redistribution (`export-policy` / `import-policy`)
-Attach standard Nokia SR Linux routing policies under `address-family ipv4-unicast` and `address-family ipv6-unicast` to redistribute routes from OSPF (OSPFv2/OSPFv3), IS-IS, BGP, or local/static interfaces into EIGRP.
+### 5. Address Families, Default Seed Metric & Routing Policy Redistribution (`export-policy` / `import-policy` / `default-metric`)
+Attach standard Nokia SR Linux routing policies under `address-family ipv4-unicast` and `address-family ipv6-unicast` to redistribute routes from OSPF (OSPFv2/OSPFv3), IS-IS, BGP, or local/static interfaces into EIGRP. You can also configure instance-wide or per-address-family `default-metric` seed values for redistributed routes when a policy statement does not specify explicit metrics.
 
 #### Route Preferences (Administrative Distance)
 In alignment with industry standards:
@@ -274,12 +281,16 @@ In alignment with industry standards:
 - **External EIGRP Routes**: Assigned route preference **`170`** (routes redistributed from OSPF, IS-IS, BGP, or static).
 
 ```text
-# 1. Define routing policy with protocol match and EIGRP metric action
+# 1. Configure default seed metric for redistributed routes (optional)
+set / network-instance default protocols eigrp default-metric bandwidth 100000 delay 100 reliability 255 load 1 mtu 1500
+set / network-instance default protocols eigrp address-family ipv4-unicast default-metric bandwidth 100000 delay 100 reliability 255 load 1 mtu 1500
+
+# 2. Define routing policy with protocol match and EIGRP metric action
 set / routing-policy policy eigrp-export statement 10 match protocol ospfv2
 set / routing-policy policy eigrp-export statement 10 action policy-result accept
 set / routing-policy policy eigrp-export statement 10 action eigrp metric bandwidth 100000 delay 100 reliability 255 load 1 mtu 1500
 
-# 2. Attach policy to EIGRP address-family
+# 3. Attach policy to EIGRP address-family
 set / network-instance default protocols eigrp address-family ipv4-unicast admin-state enable
 set / network-instance default protocols eigrp address-family ipv4-unicast export-policy eigrp-export
 set / network-instance default protocols eigrp address-family ipv4-unicast import-policy eigrp-export
@@ -307,31 +318,38 @@ set / network-instance vrf-1 protocols eigrp interface lo0.1 address-family ipv4
 ```
 All routes, FIB injection via NDK, and telemetry streaming are completely isolated per network instance and viewable via `show network-instance <name> protocols eigrp ...`.
 
-### 7. Interface Fine-Tuning & Per-Address-Family Controls
-Interface settings can be configured per address family (`address-family ipv4-unicast` / `ipv6-unicast`) or inherited from `default-interface`:
+### 7. Interface Fine-Tuning, Bandwidth Percent & Per-Address-Family Controls
+Interface settings (including `bandwidth-percent`, timers, `split-horizon`, `next-hop-self`, `passive`, `authentication`, and `bfd`) can be configured per address family (`address-family ipv4-unicast` / `ipv6-unicast`), at the interface level, or inherited from `default-interface`:
 ```text
-# Per-AFI interface parameters (timers, split-horizon, next-hop-self, passive, authentication, BFD):
+# Per-AFI interface parameters (timers, bandwidth-percent, split-horizon, next-hop-self, passive):
 set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast hello-interval 5
 set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast hold-time 15
+set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast bandwidth-percent 50
 set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast split-horizon true
 set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast next-hop-self false
 set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast passive false
 
 # Link-level interface properties:
 set / network-instance default protocols eigrp interface ethernet-1/1.0 bandwidth 1000000
+set / network-instance default protocols eigrp interface ethernet-1/1.0 bandwidth-percent 50
 set / network-instance default protocols eigrp interface ethernet-1/1.0 delay 100
 ```
 
-### 8. Protocol Timers & Hop Count Limits
-Configure DUAL Stuck-in-Active (SIA) timer and hop count limits:
+### 8. Protocol Timers, Hop Count Limits, Maximum Prefix & Event Log Size
+Configure DUAL Stuck-in-Active (SIA) timer, hop count limits, topology prefix limits (`maximum-prefix`), and protocol event log history size (`event-log-size`):
 ```text
 set / network-instance default protocols eigrp timers active-time 3
 set / network-instance default protocols eigrp maximum-hops 100
+set / network-instance default protocols eigrp event-log-size 500
+set / network-instance default protocols eigrp maximum-prefix limit 1000 threshold 75 warning-only false
+set / network-instance default protocols eigrp address-family ipv4-unicast maximum-prefix limit 1000 threshold 75 warning-only false
 ```
 
-### 9. Route Summarization
-Configure manual summary prefixes with custom administrative distance directly on interfaces under the appropriate address family:
+### 9. Route Summarization (`summary-address` & `auto-summary`)
+Configure manual summary prefixes with custom administrative distance directly on interfaces under the appropriate address family, or enable classful boundary `auto-summary`:
 ```text
+set / network-instance default protocols eigrp auto-summary false
+set / network-instance default protocols eigrp address-family ipv4-unicast auto-summary false
 set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast summary-address 10.0.0.0/16 distance 5
 ```
 
@@ -430,11 +448,12 @@ Enable dual-stack or pure IPv6 EIGRP peering using link-local multicast (`ff02::
 set / interface ethernet-1/1 subinterface 0 ipv6 admin-state enable
 set / interface ethernet-1/1 subinterface 0 ipv6 address 2001:db8:1::1/64
 
-# 2. Enable IPv6 EIGRP
-set / network-instance default protocols eigrp ipv6-unicast admin-state enable
-set / network-instance default protocols eigrp ipv6-unicast autonomous-system 100
-set / network-instance default protocols eigrp ipv6-unicast router-id 192.0.2.1
-set / network-instance default protocols eigrp ipv6-unicast interface ethernet-1/1.0 admin-state enable
+# 2. Enable IPv6 EIGRP address family
+set / network-instance default protocols eigrp admin-state enable
+set / network-instance default protocols eigrp autonomous-system 100
+set / network-instance default protocols eigrp router-id 192.0.2.1
+set / network-instance default protocols eigrp address-family ipv6-unicast admin-state enable
+set / network-instance default protocols eigrp interface ethernet-1/1.0 admin-state enable
 ```
 Verify IPv6 neighbors and routes:
 ```text
@@ -589,17 +608,17 @@ Verifying Control Plane Protection (CPM Filter) for EIGRP (IP Protocol 88)...
 
 ## 🧪 Automated Testing & Validation
 
-The project includes dual automated test suites executed with `pytest` and `containerlab`:
+The project includes automated test suites executed with `pytest` and `containerlab`:
 
-### SRL-to-SRL Peering Test Suite
+### 1. SRL-to-SRL Peering Test Suite (2-Node)
 Deploys two interconnected SR Linux nodes (`srl1` <-> `srl2`) running EIGRP:
 ```bash
 make deploy-srl
 make test-srl
 ```
-**47 Automated Tests Executed (100% Pass Rate):**
-- **IPv4 Default Instance**: Neighbor discovery, FIB route injection (preference 90), data plane ping, CLI show summary/neighbor/routes/interfaces/topology/traffic, State DB verification, CPM filter validation, tools neighbor clear & reset-all.
-- **Config & Policy Enhancements**: Default-interface configuration, passive interface inheritance, named metrics keys, routing-policy metric augmentation, dynamic interface deletion and re-addition.
+**52 Automated Tests Executed (100% Pass Rate):**
+- **IPv4 Default Instance**: Neighbor discovery, FIB route injection (preference 90), data plane ping, CLI show summary/neighbor/routes/interfaces/topology/traffic/event-log, State DB verification, CPM filter validation, tools neighbor clear, reset-all, topology clear, statistics clear & event-log clear.
+- **Config & Policy Enhancements**: Default-interface configuration, passive interface inheritance, named metrics keys, routing-policy metric augmentation, `default-metric`, `maximum-prefix`, `traffic-share-balanced`, `auto-summary`, `bandwidth-percent`, `event-log-size`, and dynamic interface deletion and re-addition.
 - **Dual Admin/Oper State & Summarization**: Dual administrative and operational state modeling across all administrative controls, and dynamic summary-address tracking in State DB.
 - **Multi-VRF (`ip-vrf`)**: Secondary VRF (`vrf-1`) neighbor peering, isolated FIB injection, dataplane ping, CLI show reports, State DB streaming, and operational tools.
 - **IPv6 EIGRP**: IPv6 enable/disable lifecycle, link-local multicast neighbor peering (`ff02::a`), IPv6 FIB route installation, IPv6 data plane ping, CLI show commands, State DB telemetry, IPv6 tools clear, and IPv6 passive interface toggling.
@@ -608,7 +627,13 @@ make test-srl
 - **Graceful Restart (NSF)**: Planned graceful restart signaling, continuous FIB forwarding route retention across restarts, and peer resynchronization.
 - **BFD Integration**: Sub-second neighbor teardown upon BFD session down transitions.
 
-### Multi-Vendor Interoperability Test Suite (SRL to FRRouting)
+### 2. 5-Node Redundant Diamond & Multi-Hop DUAL Test Suite
+Validates all EIGRP features across a 5-node redundant diamond/ladder topology (`srl1` <-> `srl2` <-> {`srl3`, `srl4`} <-> `srl5`), including Feasible Successor selection ($RD < FD$), unequal-cost load balancing (`variance` & `traffic-share-balanced`), instant Feasible Successor promotion vs. DUAL Active Query/Reply diffusion, IPv6 diamond ECMP, OSPFv2/OSPFv3/IS-IS/BGP/Static redistribution, summary addresses, `auto-summary`, VRF isolation, and operational tools:
+```bash
+python3 -m pytest -v tests/test_5node_lab.py
+```
+
+### 3. Multi-Vendor Interoperability Test Suite (SRL to FRRouting)
 Deploys an SR Linux node peering with an industry-standard FRRouting (`eigrpd`) router:
 ```bash
 make deploy-frr
@@ -635,4 +660,4 @@ make all
 # Clean build artifacts
 make clean
 ```
-The output `.deb` package will be created in `dist/srl-eigrpd_0.1.1_amd64.deb`.
+The output `.deb` package will be created in `dist/srl-eigrpd_0.1.2_amd64.deb`.

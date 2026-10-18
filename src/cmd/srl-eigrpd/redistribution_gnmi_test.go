@@ -419,4 +419,3 @@ func TestNetworkInstance_IdResolutionAndRouteMigration(t *testing.T) {
 		t.Errorf("expected prefix '10.20.20.0/24', got %q", routesVrf2[0].Prefix)
 	}
 }
-

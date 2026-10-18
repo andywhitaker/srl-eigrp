@@ -1,395 +1,25 @@
 #define _GNU_SOURCE
-#include <arpa/inet.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "eigrp_types.h"
 #include "eigrp_const.h"
 #include "eigrp_structs.h"
-#include "eigrp_log.h"
-#include "eigrp_interface.h"
-#include "eigrp_neighbor.h"
-#include "eigrp_packet.h"
-#include "eigrp_auth.h"
-#include "eigrp_md5.h"
-#include "eigrp_sha256.h"
 #include "eigrp_sys.h"
 #include "eigrp_instance.h"
+#include "eigrp_table.h"
+#include "eigrp_topology.h"
+#include "eigrp_metric.h"
+#include "eigrp_fsm.h"
+#include "eigrp_packet.h"
+#include "eigrp_prefix.h"
+#include "eigrp_summary.h"
+#include "eigrp_neighbor.h"
+#include "eigrp_eventlog.h"
+#include "eigrp_log.h"
 #include "eigrp.h"
-
-static unsigned char srl_zeropad[16] = {0};
-
-static bool srl_auth_sequence_newer(uint32_t received_wire, uint32_t stored_wire)
-{
-    uint32_t received = ntohl(received_wire);
-    uint32_t stored = ntohl(stored_wire);
-    uint32_t delta = received - stored;
-    return delta != 0 && delta < 0x80000000U;
-}
-
-static bool srl_auth_key_get(eigrp_intf_t *ei, uint32_t *key_id,
-                             char *key, size_t key_size)
-{
-    if (!ei || !key || key_size == 0)
-        return false;
-
-    if (ei->params.auth_password) {
-        size_t len = strlen(ei->params.auth_password);
-        if (len >= key_size)
-            return false;
-        memcpy(key, ei->params.auth_password, len + 1);
-        if (key_id)
-            *key_id = 0;
-        return true;
-    }
-
-    return ei->params.auth_keychain
-           && eigrp_sys_auth_key_lookup(ei->params.auth_keychain, key_id,
-                                        key, key_size);
-}
-
-static bool srl_auth_sha256_source(eigrp_intf_t *ei, eigrp_nbr_t *nbr,
-                                   char *text, size_t text_size)
-{
-    const void *address;
-    int af;
-
-    if (nbr) {
-        af = nbr->src.afi;
-        address = (af == AF_INET6) ? (const void *)&nbr->src.ip.v6
-                                   : (const void *)&nbr->src.ip.v4;
-    } else if (ei && ei->address.address.afi == EIGRP_AFI_IPV6) {
-        af = AF_INET6;
-        address = ei->address.address.bytes;
-    } else if (ei) {
-        af = AF_INET;
-        address = ei->address.address.bytes;
-    } else {
-        return false;
-    }
-
-    return inet_ntop(af, address, text, text_size) != NULL;
-}
-
-int __wrap_eigrp_make_md5_digest(eigrp_intf_t *ei, eigrp_stream_t *s, uint8_t flags)
-{
-    char key_string[PLAINTEXT_LENGTH + 1] = {0};
-    uint32_t key_id = 0;
-    unsigned char digest[EIGRP_AUTH_TYPE_MD5_LEN];
-    eigrp_md5_ctx_t ctx;
-    uint8_t *ibuf;
-    size_t backup_get, backup_end;
-    struct TLV_MD5_Authentication_Type *auth_TLV;
-
-    ibuf = s->data;
-    backup_end = s->endp;
-    backup_get = s->getp;
-
-    auth_TLV = eigrp_auth_tlv_md5_create();
-
-    eigrp_stream_set_getp(s, EIGRP_HEADER_LEN);
-    eigrp_stream_get(auth_TLV, s, EIGRP_AUTH_MD5_TLV_SIZE);
-    eigrp_stream_set_getp(s, backup_get);
-
-    if (!srl_auth_key_get(ei, &key_id, key_string, sizeof(key_string))) {
-        eigrp_auth_tlv_md5_delete(auth_TLV);
-        explicit_bzero(key_string, sizeof(key_string));
-        return EIGRP_AUTH_TYPE_NONE;
-    }
-
-    memset(&ctx, 0, sizeof(ctx));
-    eigrp_md5_init(&ctx);
-
-    if (flags & EIGRP_AUTH_BASIC_HELLO_FLAG) {
-        eigrp_md5_update(&ctx, ibuf, EIGRP_MD5_BASIC_COMPUTE);
-        eigrp_md5_update(&ctx, key_string, strlen(key_string));
-        if (strlen(key_string) < 16)
-            eigrp_md5_update(&ctx, srl_zeropad, 16 - strlen(key_string));
-    } else if (flags & EIGRP_AUTH_UPDATE_INIT_FLAG) {
-        eigrp_md5_update(&ctx, ibuf, EIGRP_MD5_UPDATE_INIT_COMPUTE);
-    } else if (flags & EIGRP_AUTH_UPDATE_FLAG) {
-        eigrp_md5_update(&ctx, ibuf, EIGRP_MD5_BASIC_COMPUTE);
-        eigrp_md5_update(&ctx, key_string, strlen(key_string));
-        if (strlen(key_string) < 16)
-            eigrp_md5_update(&ctx, srl_zeropad, 16 - strlen(key_string));
-        if (backup_end > (EIGRP_HEADER_LEN + EIGRP_AUTH_MD5_TLV_SIZE)) {
-            eigrp_md5_update(&ctx,
-                      ibuf + (EIGRP_HEADER_LEN + EIGRP_AUTH_MD5_TLV_SIZE),
-                      backup_end - 20 - (EIGRP_HEADER_LEN + EIGRP_AUTH_MD5_TLV_SIZE));
-        }
-    }
-
-    eigrp_md5_final(digest, &ctx);
-
-    memcpy(auth_TLV->digest, digest, EIGRP_AUTH_TYPE_MD5_LEN);
-
-    eigrp_stream_set_endp(s, EIGRP_HEADER_LEN);
-    eigrp_stream_put(s, auth_TLV, EIGRP_AUTH_MD5_TLV_SIZE);
-    eigrp_stream_set_endp(s, backup_end);
-
-    eigrp_auth_tlv_md5_delete(auth_TLV);
-    explicit_bzero(key_string, sizeof(key_string));
-    return EIGRP_AUTH_TYPE_MD5_LEN;
-}
-
-int __wrap_eigrp_check_md5_digest(eigrp_stream_t *s,
-                                  struct TLV_MD5_Authentication_Type *authTLV,
-                                  eigrp_nbr_t *nbr, uint8_t flags)
-{
-    eigrp_md5_ctx_t ctx;
-    unsigned char digest[EIGRP_AUTH_TYPE_MD5_LEN];
-    unsigned char orig[EIGRP_AUTH_TYPE_MD5_LEN];
-    char key_string[PLAINTEXT_LENGTH + 1] = {0};
-    uint32_t key_id = 0;
-    uint8_t *ibuf;
-    size_t backup_end;
-    struct TLV_MD5_Authentication_Type *auth_TLV;
-    struct eigrp_header *eigrph;
-    uint16_t saved_checksum;
-
-    (void)flags;
-    if (nbr->crypt_seqnum != 0 &&
-        !srl_auth_sequence_newer(authTLV->key_sequence, nbr->crypt_seqnum)) {
-        eigrp_log(EIGRP_LOG_WARNING,
-            "interface %s: eigrp_check_md5 bad sequence %d (expect %d)",
-            eigrp_intf_name_string(nbr->ei), ntohl(authTLV->key_sequence),
-            ntohl(nbr->crypt_seqnum));
-        return 0;
-    }
-
-    eigrph = (struct eigrp_header *)s->data;
-    saved_checksum = eigrph->checksum;
-    eigrph->checksum = 0;
-
-    auth_TLV = (struct TLV_MD5_Authentication_Type *)(s->data + EIGRP_HEADER_LEN);
-    memcpy(orig, auth_TLV->digest, EIGRP_AUTH_TYPE_MD5_LEN);
-    memset(digest, 0, EIGRP_AUTH_TYPE_MD5_LEN);
-    memset(auth_TLV->digest, 0, EIGRP_AUTH_TYPE_MD5_LEN);
-
-    ibuf = s->data;
-    backup_end = s->endp;
-    key_id = authTLV ? ntohl(authTLV->key_id) : 0;
-
-    if (!srl_auth_key_get(nbr->ei, &key_id, key_string, sizeof(key_string))) {
-        eigrp_log(EIGRP_LOG_WARNING,
-            "Interface %s: Expected key value not found in config",
-            nbr->ei->name);
-        memcpy(auth_TLV->digest, orig, EIGRP_AUTH_TYPE_MD5_LEN);
-        eigrph->checksum = saved_checksum;
-        explicit_bzero(key_string, sizeof(key_string));
-        return 0;
-    }
-
-    memset(&ctx, 0, sizeof(ctx));
-    eigrp_md5_init(&ctx);
-
-    if (flags & EIGRP_AUTH_BASIC_HELLO_FLAG) {
-        eigrp_md5_update(&ctx, ibuf, EIGRP_MD5_BASIC_COMPUTE);
-        eigrp_md5_update(&ctx, key_string, strlen(key_string));
-        if (strlen(key_string) < 16)
-            eigrp_md5_update(&ctx, srl_zeropad, 16 - strlen(key_string));
-    } else if (flags & EIGRP_AUTH_UPDATE_INIT_FLAG) {
-        eigrp_md5_update(&ctx, ibuf, EIGRP_MD5_UPDATE_INIT_COMPUTE);
-    } else if (flags & EIGRP_AUTH_UPDATE_FLAG) {
-        eigrp_md5_update(&ctx, ibuf, EIGRP_MD5_BASIC_COMPUTE);
-        eigrp_md5_update(&ctx, key_string, strlen(key_string));
-        if (strlen(key_string) < 16)
-            eigrp_md5_update(&ctx, srl_zeropad, 16 - strlen(key_string));
-        if (backup_end > (EIGRP_HEADER_LEN + EIGRP_AUTH_MD5_TLV_SIZE)) {
-            eigrp_md5_update(&ctx,
-                      ibuf + (EIGRP_HEADER_LEN + EIGRP_AUTH_MD5_TLV_SIZE),
-                      backup_end - 20 - (EIGRP_HEADER_LEN + EIGRP_AUTH_MD5_TLV_SIZE));
-        }
-    }
-
-    eigrp_md5_final(digest, &ctx);
-
-    memcpy(auth_TLV->digest, orig, EIGRP_AUTH_TYPE_MD5_LEN);
-    eigrph->checksum = saved_checksum;
-
-    int match = (memcmp(orig, digest, EIGRP_AUTH_TYPE_MD5_LEN) == 0);
-    explicit_bzero(key_string, sizeof(key_string));
-    if (!match) {
-        eigrp_log(EIGRP_LOG_WARNING, "interface %s: eigrp_check_md5 checksum mismatch",
-              eigrp_intf_name_string(nbr->ei));
-        return 0;
-    }
-
-    nbr->crypt_seqnum = authTLV->key_sequence;
-    return 1;
-}
-
-int __wrap_eigrp_make_sha256_digest(eigrp_intf_t *ei, eigrp_stream_t *s, uint8_t flags)
-{
-    char key_string[PLAINTEXT_LENGTH + 1] = {0};
-    uint32_t key_id = 0;
-    char source_ip[INET6_ADDRSTRLEN] = {0};
-    unsigned char digest[EIGRP_AUTH_TYPE_SHA256_LEN];
-    unsigned char key_buffer[1 + PLAINTEXT_LENGTH + INET6_ADDRSTRLEN] = {0};
-    eigrp_hmac_sha256_ctx_t ctx;
-    size_t backup_get, backup_end, key_len;
-    struct TLV_SHA256_Authentication_Type *auth_tlv;
-
-    (void)flags;
-    if (!ei || !s || s->endp < EIGRP_HEADER_LEN + EIGRP_AUTH_SHA256_TLV_SIZE)
-        return 0;
-    backup_end = s->endp;
-    backup_get = s->getp;
-    auth_tlv = eigrp_auth_tlv_sha256_create();
-    if (!auth_tlv)
-        return 0;
-
-    eigrp_stream_set_getp(s, EIGRP_HEADER_LEN);
-    eigrp_stream_get(auth_tlv, s, EIGRP_AUTH_SHA256_TLV_SIZE);
-    eigrp_stream_set_getp(s, backup_get);
-    if (!srl_auth_key_get(ei, &key_id, key_string, sizeof(key_string))
-        || !srl_auth_sha256_source(ei, NULL, source_ip, sizeof(source_ip))) {
-        eigrp_auth_tlv_sha256_delete(auth_tlv);
-        explicit_bzero(key_string, sizeof(key_string));
-        return 0;
-    }
-
-    memset(auth_tlv->digest, 0, sizeof(auth_tlv->digest));
-    eigrp_stream_set_endp(s, EIGRP_HEADER_LEN);
-    eigrp_stream_put(s, auth_tlv, EIGRP_AUTH_SHA256_TLV_SIZE);
-    eigrp_stream_set_endp(s, backup_end);
-
-    key_buffer[0] = '\n';
-    key_len = strlen(key_string);
-    memcpy(key_buffer + 1, key_string, key_len);
-    memcpy(key_buffer + 1 + key_len, source_ip, strlen(source_ip));
-    eigrp_hmac_sha256_init(&ctx, key_buffer, 1 + key_len + strlen(source_ip));
-    eigrp_hmac_sha256_update(&ctx, s->data, backup_end);
-    eigrp_hmac_sha256_final(digest, &ctx);
-
-    memcpy(auth_tlv->digest, digest, sizeof(digest));
-    eigrp_stream_set_endp(s, EIGRP_HEADER_LEN);
-    eigrp_stream_put(s, auth_tlv, EIGRP_AUTH_SHA256_TLV_SIZE);
-    eigrp_stream_set_endp(s, backup_end);
-    eigrp_auth_tlv_sha256_delete(auth_tlv);
-    explicit_bzero(key_string, sizeof(key_string));
-    explicit_bzero(key_buffer, sizeof(key_buffer));
-    return EIGRP_AUTH_TYPE_SHA256_LEN;
-}
-
-int __wrap_eigrp_check_sha256_digest(eigrp_stream_t *s,
-                                     struct TLV_SHA256_Authentication_Type *authTLV,
-                                     eigrp_nbr_t *nbr, uint8_t flags)
-{
-    char key_string[PLAINTEXT_LENGTH + 1] = {0};
-    char source_ip[INET6_ADDRSTRLEN] = {0};
-    unsigned char digest[EIGRP_AUTH_TYPE_SHA256_LEN];
-    unsigned char original[EIGRP_AUTH_TYPE_SHA256_LEN];
-    unsigned char key_buffer[1 + PLAINTEXT_LENGTH + INET6_ADDRSTRLEN] = {0};
-    eigrp_hmac_sha256_ctx_t ctx;
-    struct eigrp_header *header;
-    uint32_t key_id = 0;
-    uint16_t saved_checksum;
-    size_t key_len;
-    int valid;
-
-    (void)flags;
-    if (!s || !authTLV || !nbr || !nbr->ei
-        || s->endp < EIGRP_HEADER_LEN + EIGRP_AUTH_SHA256_TLV_SIZE)
-        return 0;
-    if (ntohs(authTLV->type) != EIGRP_TLV_AUTH
-        || ntohs(authTLV->length) != EIGRP_AUTH_SHA256_TLV_SIZE
-        || ntohs(authTLV->auth_type) != EIGRP_AUTH_TYPE_SHA256
-        || ntohs(authTLV->auth_length) != EIGRP_AUTH_TYPE_SHA256_LEN)
-        return 0;
-    if (nbr->crypt_seqnum != 0 &&
-        !srl_auth_sequence_newer(authTLV->key_sequence, nbr->crypt_seqnum))
-        return 0;
-    key_id = authTLV ? ntohl(authTLV->key_id) : 0;
-    if (!srl_auth_key_get(nbr->ei, &key_id, key_string, sizeof(key_string))
-        || !srl_auth_sha256_source(nbr->ei, nbr, source_ip, sizeof(source_ip))) {
-        explicit_bzero(key_string, sizeof(key_string));
-        return 0;
-    }
-
-    header = (struct eigrp_header *)s->data;
-    saved_checksum = header->checksum;
-    header->checksum = 0;
-    memcpy(original, authTLV->digest, sizeof(original));
-    memset(authTLV->digest, 0, sizeof(authTLV->digest));
-
-    key_buffer[0] = '\n';
-    key_len = strlen(key_string);
-    memcpy(key_buffer + 1, key_string, key_len);
-    memcpy(key_buffer + 1 + key_len, source_ip, strlen(source_ip));
-    eigrp_hmac_sha256_init(&ctx, key_buffer, 1 + key_len + strlen(source_ip));
-    eigrp_hmac_sha256_update(&ctx, s->data, s->endp);
-    eigrp_hmac_sha256_final(digest, &ctx);
-
-    memcpy(authTLV->digest, original, sizeof(original));
-    header->checksum = saved_checksum;
-    valid = memcmp(original, digest, sizeof(original)) == 0;
-    if (valid)
-        nbr->crypt_seqnum = authTLV->key_sequence;
-    explicit_bzero(key_string, sizeof(key_string));
-    explicit_bzero(key_buffer, sizeof(key_buffer));
-    return valid;
-}
-
-uint16_t __wrap_eigrp_auth_tlv_md5_encode(eigrp_stream_t *s, eigrp_intf_t *ei)
-{
-    char key_string[PLAINTEXT_LENGTH + 1] = {0};
-    uint32_t key_id = 0;
-    struct TLV_MD5_Authentication_Type *authTLV;
-
-    authTLV = eigrp_auth_tlv_md5_create();
-    authTLV->type = htons(EIGRP_TLV_AUTH);
-    authTLV->length = htons(EIGRP_AUTH_MD5_TLV_SIZE);
-    authTLV->auth_type = htons(EIGRP_AUTH_TYPE_MD5);
-    authTLV->auth_length = htons(EIGRP_AUTH_TYPE_MD5_LEN);
-    authTLV->key_sequence = htonl(++ei->crypt_seqnum);
-    memset(authTLV->Nullpad, 0, sizeof(authTLV->Nullpad));
-
-    if (srl_auth_key_get(ei, &key_id, key_string, sizeof(key_string))) {
-        authTLV->key_id = htonl(key_id);
-        memset(authTLV->digest, 0, EIGRP_AUTH_TYPE_MD5_LEN);
-        eigrp_stream_put(s, authTLV, sizeof(struct TLV_MD5_Authentication_Type));
-        eigrp_auth_tlv_md5_delete(authTLV);
-        explicit_bzero(key_string, sizeof(key_string));
-        return EIGRP_AUTH_MD5_TLV_SIZE;
-    }
-
-    eigrp_auth_tlv_md5_delete(authTLV);
-    explicit_bzero(key_string, sizeof(key_string));
-    return 0;
-}
-
-uint16_t __wrap_eigrp_auth_tlv_sha256_encode(eigrp_stream_t *s, eigrp_intf_t *ei)
-{
-    char key_string[PLAINTEXT_LENGTH + 1] = {0};
-    uint32_t key_id = 0;
-    struct TLV_SHA256_Authentication_Type *authTLV;
-
-    authTLV = eigrp_auth_tlv_sha256_create();
-    authTLV->type = htons(EIGRP_TLV_AUTH);
-    authTLV->length = htons(EIGRP_AUTH_SHA256_TLV_SIZE);
-    authTLV->auth_type = htons(EIGRP_AUTH_TYPE_SHA256);
-    authTLV->auth_length = htons(EIGRP_AUTH_TYPE_SHA256_LEN);
-    authTLV->key_sequence = htonl(++ei->crypt_seqnum);
-    memset(authTLV->Nullpad, 0, sizeof(authTLV->Nullpad));
-
-    if (srl_auth_key_get(ei, &key_id, key_string, sizeof(key_string))) {
-        authTLV->key_id = 0;
-        memset(authTLV->digest, 0, EIGRP_AUTH_TYPE_SHA256_LEN);
-        eigrp_stream_put(s, authTLV, sizeof(struct TLV_SHA256_Authentication_Type));
-        eigrp_auth_tlv_sha256_delete(authTLV);
-        explicit_bzero(key_string, sizeof(key_string));
-        return EIGRP_AUTH_SHA256_TLV_SIZE;
-    }
-
-    eigrp_auth_tlv_sha256_delete(authTLV);
-    explicit_bzero(key_string, sizeof(key_string));
-    return 0;
-}
 
 void __wrap_eigrp_sys_intf_update(eigrp_vrf_id_t vrf_id, const eigrp_intf_runtime_state_t *state)
 {
@@ -409,4 +39,302 @@ void __wrap_eigrp_sys_intf_update(eigrp_vrf_id_t vrf_id, const eigrp_intf_runtim
         }
     }
     pthread_mutex_unlock(&eigrp_process.hierarchy_lock);
+}
+
+static void srl_topology_route_queue_resort(eigrp_list_t *routes)
+{
+    eigrp_list_item_t *a, *b;
+    bool changed;
+
+    if (!routes)
+        return;
+    do {
+        changed = false;
+        for (a = routes->head; a && a->next; a = a->next) {
+            b = a->next;
+            if (((eigrp_route_descriptor_t *)a->data)->distance
+                <= ((eigrp_route_descriptor_t *)b->data)->distance)
+                continue;
+            void *tmp = a->data;
+            a->data = b->data;
+            b->data = tmp;
+            changed = true;
+        }
+    } while (changed);
+}
+
+void __wrap_eigrp_topology_metric_update(eigrp_instance_t *eigrp)
+{
+    eigrp_table_node_t *rn;
+    eigrp_prefix_descriptor_t *prefix;
+    eigrp_route_descriptor_t *route, *best;
+    eigrp_topology_route_iterator_t iterator;
+
+    if (!eigrp || !eigrp->topology_table)
+        return;
+    for (rn = eigrp_table_first(eigrp->topology_table); rn;
+         rn = eigrp_table_next(rn)) {
+        prefix = rn->info;
+        if (!prefix || prefix->state != EIGRP_FSM_STATE_PASSIVE)
+            continue;
+        for (route = eigrp_topology_route_iterator_first(prefix, &iterator); route;
+             route = eigrp_topology_route_iterator_next(&iterator)) {
+            if (route->adv_router == eigrp->neighbor_self) {
+                route->reported_distance = 0;
+                if (route->metric.delay == EIGRP_MAX_METRIC) {
+                    route->distance = EIGRP_MAX_METRIC;
+                } else if (route->ei && route->type == eigrp->af_vectors.classic_internal_tlv_type) {
+                    eigrp_metrics_t m;
+                    memset(&m, 0, sizeof(m));
+                    m.bandwidth = eigrp_bandwidth_to_scaled(route->ei->params.bandwidth);
+                    m.delay = eigrp_delay_to_scaled(route->ei->params.delay);
+                    m.load = route->ei->params.load;
+                    m.reliability = route->ei->params.reliability;
+                    m.mtu[0] = 0xDC;
+                    m.mtu[1] = 0x05;
+                    m.mtu[2] = 0x00;
+                    m.hop_count = 0;
+                    route->metric = m;
+                    route->reported_metric = m;
+                    route->total_metric = m;
+                    route->distance = eigrp_metric_calculate(eigrp, m);
+                } else if (!route->ei && route->type == eigrp->af_vectors.classic_external_tlv_type) {
+                    eigrp_metrics_t scaled_m = route->metric;
+                    scaled_m.delay = eigrp_delay_to_scaled(route->metric.delay);
+                    route->distance = eigrp_metric_calculate(eigrp, scaled_m);
+                } else {
+                    route->distance = eigrp_metric_calculate(eigrp, route->total_metric);
+                }
+            } else {
+                route->reported_distance = eigrp_metric_calculate(eigrp, route->reported_metric);
+                if (route->ei)
+                    route->distance = eigrp_metric_total_calculate(eigrp, route);
+                else
+                    route->distance = eigrp_metric_calculate(eigrp, route->total_metric);
+            }
+        }
+        srl_topology_route_queue_resort(prefix->internal_routes);
+        srl_topology_route_queue_resort(prefix->external_routes);
+        best = eigrp_topology_route_read(prefix);
+        if (best) {
+            prefix->distance = best->distance;
+            prefix->fdistance = best->distance;
+            prefix->rdistance = best->distance;
+            prefix->reported_metric = best->total_metric;
+        }
+        eigrp_topology_update_node_flags(eigrp, prefix);
+        eigrp_update_routing_table(eigrp, prefix);
+        prefix->req_action |= EIGRP_FSM_NEED_UPDATE;
+        if (!eigrp_list_lookup(eigrp->topology_changes, prefix))
+            eigrp_list_add(eigrp->topology_changes, prefix);
+    }
+    eigrp_update_send_all(eigrp, NULL);
+}
+
+extern bool __real_eigrp_summary_route_build(eigrp_instance_t *eigrp, eigrp_intf_t *ei,
+                                             const eigrp_prefix_descriptor_t *prefix,
+                                             const eigrp_route_descriptor_t *route,
+                                             eigrp_prefix_descriptor_t *summary_prefix,
+                                             eigrp_route_descriptor_t *summary_route);
+
+extern bool __real_eigrp_summary_query_route_build(eigrp_instance_t *eigrp, eigrp_intf_t *ei,
+                                                   const eigrp_prefix_t *destination,
+                                                   eigrp_prefix_descriptor_t *summary_prefix,
+                                                   eigrp_route_descriptor_t *summary_route);
+
+static void srl_fixup_summary_route(eigrp_instance_t *eigrp, eigrp_intf_t *ei,
+                                    eigrp_prefix_descriptor_t *summary_prefix,
+                                    eigrp_route_descriptor_t *summary_route)
+{
+    if (!eigrp || !summary_prefix || !summary_route)
+        return;
+
+    eigrp_route_descriptor_t *best_route = NULL;
+    uint32_t selected_distance = EIGRP_MAX_METRIC;
+
+    if (eigrp->topology_table) {
+        eigrp_table_node_t *rn;
+        for (rn = eigrp_table_first(eigrp->topology_table); rn;
+             rn = eigrp_table_next(rn)) {
+            eigrp_prefix_descriptor_t *candidate = rn->info;
+            eigrp_route_descriptor_t *candidate_route;
+            if (!candidate
+                || candidate->destination.address.afi != summary_prefix->destination.address.afi
+                || candidate->destination.prefix_length <= summary_prefix->destination.prefix_length
+                || !eigrp_prefix_address_match(&summary_prefix->destination,
+                                               &candidate->destination.address))
+                continue;
+            candidate_route = eigrp_topology_route_read(candidate);
+            if (!candidate_route || candidate->distance == EIGRP_MAX_METRIC
+                || candidate_route->metric.delay == EIGRP_MAX_METRIC)
+                continue;
+            /* Do not summarize a route learned from a neighbor on ei back out ei */
+            if (ei && candidate_route->ei == ei && candidate_route->adv_router != eigrp->neighbor_self)
+                continue;
+            /* Prefer components not on the outgoing interface when distances tie */
+            if (!best_route || candidate->distance < selected_distance
+                || (ei && best_route->ei == ei && candidate_route->ei != ei
+                    && candidate->distance == selected_distance)) {
+                best_route = candidate_route;
+                selected_distance = candidate->distance;
+            }
+        }
+    }
+
+    summary_route->ei = NULL;
+    summary_route->adv_router = eigrp->neighbor_self;
+    summary_route->type = eigrp->af_vectors.classic_internal_tlv_type;
+    memset(&summary_route->nexthop, 0, sizeof(summary_route->nexthop));
+    summary_route->prefix = summary_prefix;
+    summary_route->dest = summary_prefix->destination;
+
+    if (best_route && selected_distance != EIGRP_MAX_METRIC) {
+        summary_route->metric = best_route->total_metric;
+        summary_route->reported_metric = summary_route->metric;
+        summary_route->total_metric = summary_route->metric;
+        summary_route->distance = selected_distance;
+        summary_route->reported_distance = 0;
+        summary_prefix->reported_metric = summary_route->metric;
+        summary_prefix->distance = selected_distance;
+        summary_prefix->fdistance = selected_distance;
+    } else {
+        summary_route->metric.delay = EIGRP_MAX_METRIC;
+        summary_route->reported_metric.delay = EIGRP_MAX_METRIC;
+        summary_route->total_metric.delay = EIGRP_MAX_METRIC;
+        summary_route->distance = EIGRP_MAX_METRIC;
+        summary_prefix->reported_metric.delay = EIGRP_MAX_METRIC;
+    }
+}
+
+bool __wrap_eigrp_summary_route_build(eigrp_instance_t *eigrp, eigrp_intf_t *ei,
+                                      const eigrp_prefix_descriptor_t *prefix,
+                                      const eigrp_route_descriptor_t *route,
+                                      eigrp_prefix_descriptor_t *summary_prefix,
+                                      eigrp_route_descriptor_t *summary_route)
+{
+    if (!__real_eigrp_summary_route_build(eigrp, ei, prefix, route, summary_prefix, summary_route))
+        return false;
+    srl_fixup_summary_route(eigrp, ei, summary_prefix, summary_route);
+    return true;
+}
+
+bool __wrap_eigrp_summary_query_route_build(eigrp_instance_t *eigrp, eigrp_intf_t *ei,
+                                            const eigrp_prefix_t *destination,
+                                            eigrp_prefix_descriptor_t *summary_prefix,
+                                            eigrp_route_descriptor_t *summary_route)
+{
+    if (__real_eigrp_summary_query_route_build(eigrp, ei, destination, summary_prefix, summary_route)) {
+        srl_fixup_summary_route(eigrp, ei, summary_prefix, summary_route);
+        return true;
+    }
+    if (!eigrp || !ei || !destination || !summary_prefix || !summary_route)
+        return false;
+    /* If the queried destination is a specific prefix covered by a summary on ei
+     * and not leaked, answer the QUERY with unreachable so the neighbor does not
+     * re-install the suppressed specific route. */
+    if (eigrp_summary_covers(eigrp, ei, destination)
+        && !eigrp_summary_specific_leak(eigrp, ei, destination)) {
+        if (ei->address.address.afi == destination->address.afi
+            && ei->address.prefix_length == destination->prefix_length
+            && eigrp_prefix_address_match(&ei->address, &destination->address))
+            return false;
+        memset(summary_prefix, 0, sizeof(*summary_prefix));
+        summary_prefix->destination = *destination;
+        summary_prefix->state = EIGRP_FSM_STATE_PASSIVE;
+        summary_prefix->reported_metric.delay = EIGRP_MAX_METRIC;
+        memset(summary_route, 0, sizeof(*summary_route));
+        summary_route->prefix = summary_prefix;
+        summary_route->dest = *destination;
+        summary_route->type = eigrp->af_vectors.classic_internal_tlv_type;
+        summary_route->metric.delay = EIGRP_MAX_METRIC;
+        summary_route->reported_metric.delay = EIGRP_MAX_METRIC;
+        summary_route->total_metric.delay = EIGRP_MAX_METRIC;
+        summary_route->distance = EIGRP_MAX_METRIC;
+        return true;
+    }
+    return false;
+}
+
+extern bool __real_eigrp_nbr_prefix_admit(eigrp_instance_t *runtime, eigrp_nbr_t *neighbor,
+                                          const eigrp_prefix_t *prefix);
+
+static uint32_t srl_active_topology_prefix_count(eigrp_instance_t *runtime)
+{
+    eigrp_table_node_t *node;
+    uint32_t count = 0;
+
+    if (!runtime || !runtime->topology_table)
+        return 0;
+    for (node = eigrp_table_first(runtime->topology_table); node;
+         node = eigrp_table_next(node)) {
+        eigrp_prefix_descriptor_t *pfx = node->info;
+        if (!pfx)
+            continue;
+        eigrp_route_descriptor_t *best = eigrp_topology_route_read(pfx);
+        if (best && best->distance != EIGRP_MAX_METRIC && best->metric.delay != EIGRP_MAX_METRIC)
+            count++;
+    }
+    return count;
+}
+
+bool __wrap_eigrp_topology_prefix_admit(eigrp_instance_t *runtime,
+                                        const eigrp_prefix_t *prefix)
+{
+    eigrp_af_config_t *af;
+    const eigrp_prefix_limit_t *limit;
+    eigrp_prefix_descriptor_t *existing;
+
+    if (!runtime || !prefix)
+        return false;
+    existing = eigrp_topology_table_lookup(runtime->topology_table, prefix);
+    if (existing) {
+        eigrp_route_descriptor_t *best = eigrp_topology_route_read(existing);
+        if (best && best->distance != EIGRP_MAX_METRIC && best->metric.delay != EIGRP_MAX_METRIC)
+            return true;
+    }
+    af = eigrp_af_config_runtime_read(runtime);
+    if (!af || !af->topology_maximum_prefix_configured)
+        return true;
+    limit = &af->topology_maximum_prefix;
+    uint32_t count = srl_active_topology_prefix_count(runtime);
+    if (eigrp_prefix_limit_threshold_crossed(limit, count))
+        eigrp_log(EIGRP_LOG_WARNING,
+                  "EIGRP topology maximum-prefix threshold reached (%u/%u)",
+                  count + 1U, limit->maximum);
+    if (!eigrp_prefix_limit_allows(limit, count, false)) {
+        (void)eigrp_eventlog_msg_add(runtime, EIGRP_EVENTLOG_OPCODE_PREFIX_LIMIT_REJECT,
+                                     prefix, EIGRP_EVENTLOG_PREFIX_LIMIT_TOPOLOGY,
+                                     count + 1U, limit->maximum, 0);
+        return false;
+    }
+    return true;
+}
+
+bool __wrap_eigrp_nbr_prefix_admit(eigrp_instance_t *runtime, eigrp_nbr_t *neighbor,
+                                   const eigrp_prefix_t *prefix)
+{
+    if (!__real_eigrp_nbr_prefix_admit(runtime, neighbor, prefix))
+        return false;
+    return __wrap_eigrp_topology_prefix_admit(runtime, prefix);
+}
+
+extern void __real_eigrp_update_receive(eigrp_instance_t *eigrp, eigrp_nbr_t *nbr,
+                                        struct eigrp_header *eigrph, eigrp_stream_t *pkt,
+                                        eigrp_intf_t *ei, int length);
+
+void __wrap_eigrp_update_receive(eigrp_instance_t *eigrp, eigrp_nbr_t *nbr,
+                                 struct eigrp_header *eigrph, eigrp_stream_t *pkt,
+                                 eigrp_intf_t *ei, int length)
+{
+    if (nbr && eigrph) {
+        uint32_t flags = ntohl(eigrph->flags);
+        uint32_t seq = ntohl(eigrph->sequence);
+        if (!(flags & EIGRP_INIT_FLAG) && seq != 0 && nbr->peer_init_sequence_number != 0) {
+            nbr->peer_init_sequence_number = UINT32_MAX;
+        }
+    }
+    __real_eigrp_update_receive(eigrp, nbr, eigrph, pkt, ei, length);
+    if (nbr && (nbr->state == EIGRP_NEIGHBOR_PENDING || nbr->state == EIGRP_NEIGHBOR_UP) && !nbr->t_holddown) {
+        eigrp_nbr_holddown_update(nbr);
+    }
 }

@@ -214,13 +214,14 @@ func (d *EigrpDaemon) OnRouteAdd(netinst string, prefix string, nexthop string, 
 	inst := d.GetOrCreateInstance(netinst)
 	d.mu.Lock()
 	inst.routes[prefix] = &RouteInfo{
-		Prefix:     prefix,
-		NextHop:    primaryNh,
-		Interface:  primaryIf,
-		Metric:     metric,
-		WideMetric: wideMetric,
-		External:   isExt,
-		Preference: uint8(pref),
+		Prefix:                prefix,
+		NextHop:               primaryNh,
+		Interface:             primaryIf,
+		Metric:                metric,
+		WideMetric:            wideMetric,
+		External:              isExt,
+		Preference:            uint8(pref),
+		RefreshedAfterRestart: inst.restarting,
 	}
 	d.mu.Unlock()
 	d.mu.RLock()
@@ -364,7 +365,9 @@ func (d *EigrpDaemon) OnRouteDel(netinst string, prefix string) {
 	inst := d.GetInstance(netinst)
 	if inst != nil {
 		d.mu.RLock()
-		isPreserved := inst.restarting && inst.gracefulRestart != nil && inst.gracefulRestart.AdminState == "enable"
+		existingRoute := inst.routes[prefix]
+		alreadyRefreshed := existingRoute != nil && existingRoute.RefreshedAfterRestart
+		isPreserved := inst.restarting && !alreadyRefreshed && inst.gracefulRestart != nil && inst.gracefulRestart.AdminState == "enable"
 		d.mu.RUnlock()
 		if isPreserved {
 			log.Info().Str("netinst", netinst).Str("prefix", prefix).Msg("Graceful restart active: preserving FIB forwarding route during restart")

@@ -2,7 +2,7 @@ package main
 
 /*
 #cgo CFLAGS: -I../../upstream/eigrp/eigrp/code -I../../cshim
-#cgo LDFLAGS: -rdynamic -L../../cshim -L../../upstream/eigrp/eigrp/code -Wl,--wrap=eigrp_sys_intf_update -Wl,--wrap=eigrp_check_md5_digest -Wl,--wrap=eigrp_check_sha256_digest -Wl,--wrap=eigrp_auth_tlv_md5_encode -Wl,--wrap=eigrp_auth_tlv_sha256_encode -Wl,--wrap=eigrp_make_md5_digest -Wl,--wrap=eigrp_make_sha256_digest -Wl,--start-group -leigrp-core -lsrl-cshim -Wl,--end-group -lpthread -ldl -lstdc++
+#cgo LDFLAGS: -rdynamic -L../../cshim -L../../upstream/eigrp/eigrp/code -Wl,--wrap=eigrp_sys_intf_update -Wl,--wrap=eigrp_topology_metric_update -Wl,--wrap=eigrp_summary_route_build -Wl,--wrap=eigrp_summary_query_route_build -Wl,--wrap=eigrp_topology_prefix_admit -Wl,--wrap=eigrp_nbr_prefix_admit -Wl,--wrap=eigrp_update_receive -Wl,--start-group -leigrp-core -lsrl-cshim -Wl,--end-group -lpthread -ldl -lstdc++
 #include <stdlib.h>
 #include "srl_cshim.h"
 */
@@ -464,4 +464,86 @@ func ShimInterfacesReport(netinst string) {
 	cNetinst := C.CString(netinst)
 	defer C.free(unsafe.Pointer(cNetinst))
 	C.srlShimInterfacesReport(cNetinst)
+}
+
+//export srlGoEventLogReport
+func srlGoEventLogReport(netinst *C.char, eventNum C.uint32_t, timestampMs C.uint64_t, msg *C.char) {
+	if daemonApp != nil {
+		daemonApp.OnEventLogReport(C.GoString(netinst), uint32(eventNum), uint64(timestampMs), C.GoString(msg))
+	}
+}
+
+// ShimInterfaceBandwidthPercentUpdate updates the interface bandwidth-percent configuration.
+func ShimInterfaceBandwidthPercentUpdate(netinst, ifname, afiName string, percent uint32) int {
+	cNetinst := C.CString(netinst)
+	defer C.free(unsafe.Pointer(cNetinst))
+	cIfname := C.CString(ifname)
+	defer C.free(unsafe.Pointer(cIfname))
+	var cAfi *C.char
+	if afiName != "" {
+		cAfi = C.CString(afiName)
+		defer C.free(unsafe.Pointer(cAfi))
+	}
+	return int(C.srlShimInterfaceBandwidthPercentUpdate(cNetinst, cIfname, cAfi, C.uint32_t(percent)))
+}
+
+// ShimTrafficShareBalancedUpdate updates traffic-share balanced mode for a network instance.
+func ShimTrafficShareBalancedUpdate(netinst string, balanced bool) int {
+	cNetinst := C.CString(netinst)
+	defer C.free(unsafe.Pointer(cNetinst))
+	return int(C.srlShimTrafficShareBalancedUpdate(cNetinst, nil, C.bool(balanced)))
+}
+
+// ShimAutoSummaryUpdate updates auto-summary configuration for a network instance.
+func ShimAutoSummaryUpdate(netinst string, enabled bool) int {
+	cNetinst := C.CString(netinst)
+	defer C.free(unsafe.Pointer(cNetinst))
+	return int(C.srlShimAutoSummaryUpdate(cNetinst, nil, C.bool(enabled)))
+}
+
+// ShimDefaultMetricUpdate updates the default redistribution metric for a network instance.
+func ShimDefaultMetricUpdate(netinst string, bw, delay uint32, reliability, load uint8, mtu uint32) int {
+	cNetinst := C.CString(netinst)
+	defer C.free(unsafe.Pointer(cNetinst))
+	return int(C.srlShimDefaultMetricUpdate(cNetinst, nil, C.uint32_t(bw), C.uint32_t(delay), C.uint8_t(reliability), C.uint8_t(load), C.uint32_t(mtu)))
+}
+
+// ShimMaxPrefixUpdate updates the topology maximum-prefix limit for a network instance.
+func ShimMaxPrefixUpdate(netinst string, maxPrefixes uint32, threshold uint8, warningOnly bool) int {
+	cNetinst := C.CString(netinst)
+	defer C.free(unsafe.Pointer(cNetinst))
+	return int(C.srlShimMaxPrefixUpdate(cNetinst, nil, C.uint32_t(maxPrefixes), C.uint8_t(threshold), C.bool(warningOnly)))
+}
+
+// ShimTopologyClear clears topology entries for a network instance.
+func ShimTopologyClear(netinst, prefix string) int {
+	cNetinst := C.CString(netinst)
+	defer C.free(unsafe.Pointer(cNetinst))
+	var cPfx *C.char
+	if prefix != "" {
+		cPfx = C.CString(prefix)
+		defer C.free(unsafe.Pointer(cPfx))
+	}
+	return int(C.srlShimTopologyClear(cNetinst, cPfx))
+}
+
+// ShimEventLogSizeUpdate updates the DUAL event log size for a network instance.
+func ShimEventLogSizeUpdate(netinst string, size uint32) int {
+	cNetinst := C.CString(netinst)
+	defer C.free(unsafe.Pointer(cNetinst))
+	return int(C.srlShimEventLogSizeUpdate(cNetinst, C.uint32_t(size)))
+}
+
+// ShimEventLogClear clears the DUAL event log for a network instance.
+func ShimEventLogClear(netinst string) int {
+	cNetinst := C.CString(netinst)
+	defer C.free(unsafe.Pointer(cNetinst))
+	return int(C.srlShimEventLogClear(cNetinst))
+}
+
+// ShimEventLogReport triggers DUAL event log reporting for a network instance.
+func ShimEventLogReport(netinst string) {
+	cNetinst := C.CString(netinst)
+	defer C.free(unsafe.Pointer(cNetinst))
+	C.srlShimEventLogReport(cNetinst)
 }

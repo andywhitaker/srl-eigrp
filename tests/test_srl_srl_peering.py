@@ -1845,6 +1845,324 @@ def test_per_afi_interface_state_ip(srl_exec):
     assert "10.0.0.1/30" in out_cli, f"CLI missing per-AFI IPv4 IP address: {out_cli}"
 
 
+def test_traffic_share_balanced_and_auto_summary(srl_exec):
+    """Verify traffic-share-balanced and auto-summary configuration, inheritance to AF, classful summarization, and CLI summary."""
+    try:
+        cfg = """sr_cli << 'EOF'
+enter candidate
+discard stay
+set / network-instance default protocols eigrp traffic-share-balanced true
+set / network-instance default protocols eigrp auto-summary true
+commit now
+EOF"""
+        out_commit = srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg])
+        assert "committed" in out_commit.lower(), f"Commit failed: {out_commit}"
+
+        ok = False
+        out_state = ""
+        for _ in range(15):
+            time.sleep(1)
+            out_state = srl_exec("clab-srl-srl-eigrp-srl1", [
+                "sr_cli", "info from state network-instance default protocols eigrp"
+            ])
+            if "traffic-share-balanced true" in out_state and "auto-summary true" in out_state:
+                ok = True
+                break
+        assert ok, f"State DB did not reflect traffic-share-balanced/auto-summary true: {out_state}"
+
+        out_sum = srl_exec("clab-srl-srl-eigrp-srl1", [
+            "sr_cli", "show network-instance default protocols eigrp summary"
+        ])
+        assert "Traffic Share Balanced" in out_sum and "enabled" in out_sum, f"Summary CLI missing Traffic Share Balanced enabled: {out_sum}"
+        assert "Auto Summary" in out_sum and "enabled" in out_sum, f"Summary CLI missing Auto Summary enabled: {out_sum}"
+
+        # Verify classful auto-summary: srl1's 192.0.2.1/32 across 10.0.0.1/30 boundary is advertised as 192.0.2.0/24 to srl2
+        auto_sum_ok = False
+        out_srl2_routes = ""
+        for _ in range(20):
+            time.sleep(1)
+            out_srl2_routes = srl_exec("clab-srl-srl-eigrp-srl2", [
+                "sr_cli", "show network-instance default protocols eigrp routes"
+            ])
+            if "192.0.2.0/24" in out_srl2_routes:
+                auto_sum_ok = True
+                break
+        assert auto_sum_ok, f"SRL2 did not receive classful auto-summary 192.0.2.0/24 from SRL1: {out_srl2_routes}"
+    finally:
+        clean = """sr_cli << 'EOF'
+enter candidate
+discard stay
+delete / network-instance default protocols eigrp traffic-share-balanced
+delete / network-instance default protocols eigrp auto-summary
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", clean])
+
+    reverted = False
+    for _ in range(20):
+        time.sleep(1)
+        out_state = srl_exec("clab-srl-srl-eigrp-srl1", [
+            "sr_cli", "info from state network-instance default protocols eigrp"
+        ])
+        out_srl2_routes = srl_exec("clab-srl-srl-eigrp-srl2", [
+            "sr_cli", "show network-instance default protocols eigrp routes"
+        ])
+        if (
+            "traffic-share-balanced false" in out_state
+            and "auto-summary false" in out_state
+            and "192.0.2.0/24" not in out_srl2_routes
+            and "192.0.2.1/32" in out_srl2_routes
+        ):
+            reverted = True
+            break
+    assert reverted, f"Did not revert traffic-share-balanced/auto-summary and classful route: state={out_state} routes={out_srl2_routes}"
+
+
+def test_default_metric_and_maximum_prefix(srl_exec):
+    """Verify default-metric and maximum-prefix configuration, inheritance to AF, active prefix limit enforcement, and CLI summary."""
+    try:
+        cfg = """sr_cli << 'EOF'
+enter candidate
+discard stay
+set / network-instance default protocols eigrp default-metric bandwidth 250000 delay 250 reliability 250 load 2 mtu 1400
+set / network-instance default protocols eigrp maximum-prefix limit 500 threshold 80 warning-only true
+commit now
+EOF"""
+        out_commit = srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg])
+        assert "committed" in out_commit.lower(), f"Commit failed: {out_commit}"
+
+        ok = False
+        out_state = ""
+        for _ in range(15):
+            time.sleep(1)
+            out_state = srl_exec("clab-srl-srl-eigrp-srl1", [
+                "sr_cli", "info from state network-instance default protocols eigrp"
+            ])
+            if (
+                "bandwidth 250000" in out_state
+                and "delay 250" in out_state
+                and "limit 500" in out_state
+                and "threshold 80" in out_state
+                and "warning-only true" in out_state
+            ):
+                ok = True
+                break
+        assert ok, f"State DB did not reflect default-metric and maximum-prefix: {out_state}"
+
+        out_sum = srl_exec("clab-srl-srl-eigrp-srl1", [
+            "sr_cli", "show network-instance default protocols eigrp summary"
+        ])
+        assert "Maximum Prefix Limit" in out_sum and "500" in out_sum and "80%" in out_sum, (
+            f"Summary CLI missing Maximum Prefix Limit details: {out_sum}"
+        )
+
+        # Now enforce a strict maximum-prefix limit of 2 (warning-only false) on SRL1
+        # SRL1 has 2 local connected prefixes (10.0.0.0/30 and 192.0.2.1/32), so remote 192.0.2.2/32 exceeds limit 2
+        cfg_strict = """sr_cli << 'EOF'
+enter candidate
+discard stay
+set / network-instance default protocols eigrp maximum-prefix limit 2 threshold 50 warning-only false
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_strict])
+
+        enforced = False
+        out_top = ""
+        for _ in range(15):
+            time.sleep(1)
+            out_top = srl_exec("clab-srl-srl-eigrp-srl1", [
+                "sr_cli", "show network-instance default protocols eigrp topology"
+            ])
+            if "192.0.2.2/32" not in out_top:
+                enforced = True
+                break
+        assert enforced, f"Strict maximum-prefix limit 2 did not drop excess remote prefix 192.0.2.2/32: {out_top}"
+    finally:
+        clean = """sr_cli << 'EOF'
+enter candidate
+discard stay
+delete / network-instance default protocols eigrp default-metric
+delete / network-instance default protocols eigrp maximum-prefix
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", clean])
+        srl_exec("clab-srl-srl-eigrp-srl1", [
+            "sr_cli", "tools network-instance default protocols eigrp topology clear"
+        ])
+
+    reverted = False
+    for _ in range(20):
+        time.sleep(1)
+        out_state = srl_exec("clab-srl-srl-eigrp-srl1", [
+            "sr_cli", "info from state network-instance default protocols eigrp"
+        ])
+        out_top = srl_exec("clab-srl-srl-eigrp-srl1", [
+            "sr_cli", "show network-instance default protocols eigrp topology"
+        ])
+        if (
+            "bandwidth 100000" in out_state
+            and "threshold 75" in out_state
+            and "limit 500" not in out_state
+            and "192.0.2.2/32" in out_top
+        ):
+            reverted = True
+            break
+    assert reverted, f"Did not revert default-metric/maximum-prefix and recover 192.0.2.2/32: state={out_state} top={out_top}"
+
+
+def test_bandwidth_percent_hierarchy(srl_exec):
+    """Verify bandwidth-percent inheritance across default-interface, interface, and interface address-family (including values > 100)."""
+    try:
+        # 1. Configure only default-interface bandwidth-percent 65 and verify interface inherits 65%
+        cfg_def = """sr_cli << 'EOF'
+enter candidate
+discard stay
+set / network-instance default protocols eigrp default-interface bandwidth-percent 65
+commit now
+EOF"""
+        out_commit = srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_def])
+        assert "committed" in out_commit.lower(), f"Commit failed: {out_commit}"
+
+        inherited_def = False
+        out_if = ""
+        for _ in range(15):
+            time.sleep(1)
+            out_if = srl_exec("clab-srl-srl-eigrp-srl1", [
+                "sr_cli", "show network-instance default protocols eigrp interfaces ethernet-1/1.0"
+            ])
+            if "65%" in out_if:
+                inherited_def = True
+                break
+        assert inherited_def, f"Interface did not inherit default-interface bandwidth-percent 65%: {out_if}"
+
+        # 2. Override at interface level (75%) and interface address-family ipv4-unicast level (300%)
+        cfg = """sr_cli << 'EOF'
+enter candidate
+discard stay
+set / network-instance default protocols eigrp interface ethernet-1/1.0 bandwidth-percent 75
+set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast bandwidth-percent 300
+commit now
+EOF"""
+        out_commit = srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg])
+        assert "committed" in out_commit.lower(), f"Commit failed: {out_commit}"
+
+        ok = False
+        out_state = ""
+        for _ in range(15):
+            time.sleep(1)
+            out_state = srl_exec("clab-srl-srl-eigrp-srl1", [
+                "sr_cli", "info from state network-instance default protocols eigrp"
+            ])
+            if (
+                "bandwidth-percent 65" in out_state
+                and "bandwidth-percent 75" in out_state
+                and "bandwidth-percent 300" in out_state
+            ):
+                ok = True
+                break
+        assert ok, f"State DB did not reflect bandwidth-percent hierarchy: {out_state}"
+
+        out_if = srl_exec("clab-srl-srl-eigrp-srl1", [
+            "sr_cli", "show network-instance default protocols eigrp interfaces ethernet-1/1.0"
+        ])
+        assert "300%" in out_if, f"Interface detail CLI missing bandwidth-percent 300%: {out_if}"
+    finally:
+        clean = """sr_cli << 'EOF'
+enter candidate
+discard stay
+delete / network-instance default protocols eigrp default-interface bandwidth-percent
+delete / network-instance default protocols eigrp interface ethernet-1/1.0 bandwidth-percent
+delete / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast bandwidth-percent
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", clean])
+
+    reverted = False
+    for _ in range(15):
+        time.sleep(1)
+        out_if = srl_exec("clab-srl-srl-eigrp-srl1", [
+            "sr_cli", "show network-instance default protocols eigrp interfaces ethernet-1/1.0"
+        ])
+        if "50%" in out_if and "300%" not in out_if:
+            reverted = True
+            break
+    assert reverted, f"Bandwidth percent did not revert to default 50%: {out_if}"
+
+
+def test_event_log_and_tools_clear(srl_exec):
+    """Verify event-log-size configuration, show event-log CLI, State DB event-log list, and tools event-log clear."""
+    try:
+        cfg = """sr_cli << 'EOF'
+enter candidate
+discard stay
+set / network-instance default protocols eigrp event-log-size 250
+commit now
+EOF"""
+        out_commit = srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg])
+        assert "committed" in out_commit.lower(), f"Commit failed: {out_commit}"
+
+        size_ok = False
+        out_state = ""
+        for _ in range(15):
+            time.sleep(1)
+            out_state = srl_exec("clab-srl-srl-eigrp-srl1", [
+                "sr_cli", "info from state network-instance default protocols eigrp"
+            ])
+            if "event-log-size 250" in out_state and "event-log " in out_state:
+                size_ok = True
+                break
+        assert size_ok, f"State DB missing event-log-size 250 or event-log entries: {out_state}"
+
+        out_ev = srl_exec("clab-srl-srl-eigrp-srl1", [
+            "sr_cli", "show network-instance default protocols eigrp event-log"
+        ])
+        assert "EIGRP Event Log for Network-Instance: default" in out_ev, f"Event log title missing: {out_ev}"
+        assert "Total Events:" in out_ev, f"Total Events footer missing: {out_ev}"
+        # Verify no duplicate timestamp prefix ("YYYY-MM-DDTHH:MM:SS.mmmZ HH:MM:SS.mmm ")
+        import re
+        assert not re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\s+\d{2}:\d{2}:\d{2}\.\d{3}\s+", out_ev), (
+            f"Duplicate timestamp prefix found in event-log output: {out_ev}"
+        )
+
+        out_clear = srl_exec("clab-srl-srl-eigrp-srl1", [
+            "sr_cli", "tools network-instance default protocols eigrp event-log clear"
+        ])
+        assert "Success" in out_clear and "cleared eigrp event log" in out_clear.lower(), f"Tools event-log clear failed: {out_clear}"
+    finally:
+        clean = """sr_cli << 'EOF'
+enter candidate
+discard stay
+delete / network-instance default protocols eigrp event-log-size
+commit now
+EOF"""
+        srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", clean])
+
+
+def test_tools_topology_clear(srl_exec):
+    """Verify tools network-instance default protocols eigrp topology clear operational command and route recovery."""
+    out_clear = srl_exec("clab-srl-srl-eigrp-srl1", [
+        "sr_cli", "tools network-instance default protocols eigrp topology clear"
+    ])
+    assert "Success" in out_clear and "cleared eigrp topology table" in out_clear.lower(), f"Tools topology clear failed: {out_clear}"
+
+    recovered = False
+    out_top = ""
+    for _ in range(20):
+        time.sleep(1)
+        out_top = srl_exec("clab-srl-srl-eigrp-srl1", [
+            "sr_cli", "show network-instance default protocols eigrp topology"
+        ])
+        if "192.0.2.2/32" in out_top and "Successor" in out_top:
+            recovered = True
+            break
+    assert recovered, f"Topology table did not recover 192.0.2.2/32 after topology clear: {out_top}"
+
+    out_fib = srl_exec("clab-srl-srl-eigrp-srl1", [
+        "sr_cli", "show network-instance default ipv4 route 192.0.2.2/32"
+    ])
+    assert "192.0.2.2/32" in out_fib and "10.0.0.2" in out_fib, f"FIB route missing after topology clear: {out_fib}"
+
+
 
 
 

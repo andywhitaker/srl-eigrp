@@ -33,17 +33,18 @@ import "C"
 const (
 	ndkSocket = "unix:///opt/srlinux/var/run/sr_sdk_service_manager:50053"
 	appName   = "srl_eigrpd"
-	version   = "0.1.1"
+	version   = "0.1.2"
 )
 
 type RouteInfo struct {
-	Prefix     string `json:"prefix"`
-	NextHop    string `json:"next-hop"`
-	Metric     uint32 `json:"metric"`
-	WideMetric uint64 `json:"wide-metric"`
-	External   bool   `json:"external"`
-	Preference uint8  `json:"preference,omitempty"`
-	Interface  string `json:"interface,omitempty"`
+	Prefix                string `json:"prefix"`
+	NextHop               string `json:"next-hop"`
+	Metric                uint32 `json:"metric"`
+	WideMetric            uint64 `json:"wide-metric"`
+	External              bool   `json:"external"`
+	Preference            uint8  `json:"preference,omitempty"`
+	Interface             string `json:"interface,omitempty"`
+	RefreshedAfterRestart bool   `json:"-"`
 }
 
 type NeighborInfo struct {
@@ -105,6 +106,12 @@ type TrafficInfo struct {
 	CRPackets       uint64 `json:"cr-packets"`
 }
 
+type EventLogInfo struct {
+	ID        uint32 `json:"id"`
+	Timestamp string `json:"timestamp"`
+	Message   string `json:"message"`
+}
+
 type IPCRequest struct {
 	Action   string `json:"action"`
 	Netinst  string `json:"netinst"`
@@ -135,6 +142,11 @@ type EigrpInstance struct {
 	preference           uint8
 	externalPreference   uint8
 	wideMetrics          bool
+	trafficShareBalanced bool
+	autoSummary          bool
+	eventLogSize         uint32
+	defaultMetric        *PolicyMetricConfig
+	maximumPrefix        *MaxPrefixConfig
 	hasV6                bool
 	gracefulRestart      *GracefulRestartConfig
 	metrics              *MetricsConfig
@@ -153,12 +165,14 @@ type EigrpInstance struct {
 	interfaces map[string]*InterfaceInfo
 	topology   map[string]*TopologyPrefixInfo
 	traffic    map[string]*TrafficInfo
+	eventLog   []*EventLogInfo
 	currentPfx *TopologyPrefixInfo
 
 	tempNeighbors  map[string]*NeighborInfo
 	tempInterfaces map[string]*InterfaceInfo
 	tempTopology   map[string]*TopologyPrefixInfo
 	tempTraffic    map[string]*TrafficInfo
+	tempEventLog   []*EventLogInfo
 	collecting     bool
 }
 
@@ -166,18 +180,12 @@ func (inst *EigrpInstance) IsAfiEnabled(afi string) bool {
 	if inst.adminState == "disable" || inst.asn == 0 {
 		return false
 	}
-	if len(inst.addressFamily) > 0 {
-		for _, af := range inst.addressFamily {
-			if af.Name == afi {
-				if af.AdminState != "" {
-					return af.AdminState != "disable"
-				}
-				return true
-			}
+	for _, af := range inst.addressFamily {
+		if af.Name == afi && af.AdminState != "" {
+			return af.AdminState != "disable"
 		}
-		return false
 	}
-	// Default enabled for both ipv4-unicast and ipv6-unicast if no address-family explicitly configured
+	// Default enabled for both ipv4-unicast and ipv6-unicast unless explicitly disabled
 	return true
 }
 
@@ -238,10 +246,23 @@ func (inst *EigrpInstance) SetAfiImportPolicy(afi string, policy string) {
 	})
 }
 
+func isDefaultPolicyMetric(dm *PolicyMetricConfig) bool {
+	if dm == nil {
+		return true
+	}
+	return (dm.Bandwidth == 0 || dm.Bandwidth == 100000) &&
+		(dm.Delay == 0 || dm.Delay == 100) &&
+		(dm.Reliability == 0 || dm.Reliability == 255) &&
+		(dm.Load == 0 || dm.Load == 1) &&
+		(dm.Mtu == 0 || dm.Mtu == 1500)
+}
+
 func (inst *EigrpInstance) GetAfiPreference(afi string) uint8 {
 	for _, af := range inst.addressFamily {
 		if af.Name == afi && af.Preference > 0 {
-			return af.Preference
+			if af.Preference != 90 || inst.preference == 0 {
+				return af.Preference
+			}
 		}
 	}
 	if inst.preference > 0 {
@@ -266,7 +287,9 @@ func (inst *EigrpInstance) SetAfiPreference(afi string, pref uint8) {
 func (inst *EigrpInstance) GetAfiExternalPreference(afi string) uint8 {
 	for _, af := range inst.addressFamily {
 		if af.Name == afi && af.ExternalPreference > 0 {
-			return af.ExternalPreference
+			if af.ExternalPreference != 170 || inst.externalPreference == 0 {
+				return af.ExternalPreference
+			}
 		}
 	}
 	if inst.externalPreference > 0 {
@@ -307,6 +330,104 @@ func (inst *EigrpInstance) SetAfiPreferences(afi string, pref, extPref uint8) {
 	})
 }
 
+func (inst *EigrpInstance) GetAfiTrafficShareBalanced(afi string) bool {
+	for _, af := range inst.addressFamily {
+		if af.Name == afi && af.TrafficShareBalanced != nil {
+			return *af.TrafficShareBalanced
+		}
+	}
+	return inst.trafficShareBalanced
+}
+
+func (inst *EigrpInstance) SetAfiTrafficShareBalanced(afi string, val *bool) {
+	for i, af := range inst.addressFamily {
+		if af.Name == afi {
+			inst.addressFamily[i].TrafficShareBalanced = val
+			return
+		}
+	}
+	inst.addressFamily = append(inst.addressFamily, AddressFamilyConfig{
+		Name:                 afi,
+		TrafficShareBalanced: val,
+	})
+}
+
+func (inst *EigrpInstance) GetAfiAutoSummary(afi string) bool {
+	for _, af := range inst.addressFamily {
+		if af.Name == afi && af.AutoSummary != nil {
+			return *af.AutoSummary
+		}
+	}
+	return inst.autoSummary
+}
+
+func (inst *EigrpInstance) SetAfiAutoSummary(afi string, val *bool) {
+	for i, af := range inst.addressFamily {
+		if af.Name == afi {
+			inst.addressFamily[i].AutoSummary = val
+			return
+		}
+	}
+	inst.addressFamily = append(inst.addressFamily, AddressFamilyConfig{
+		Name:        afi,
+		AutoSummary: val,
+	})
+}
+
+func (inst *EigrpInstance) GetAfiDefaultMetric(afi string) *PolicyMetricConfig {
+	for _, af := range inst.addressFamily {
+		if af.Name == afi && af.DefaultMetric != nil {
+			if !isDefaultPolicyMetric(af.DefaultMetric) || isDefaultPolicyMetric(inst.defaultMetric) {
+				return af.DefaultMetric
+			}
+		}
+	}
+	return inst.defaultMetric
+}
+
+func (inst *EigrpInstance) SetAfiDefaultMetric(afi string, dm *PolicyMetricConfig) {
+	for i, af := range inst.addressFamily {
+		if af.Name == afi {
+			inst.addressFamily[i].DefaultMetric = dm
+			return
+		}
+	}
+	inst.addressFamily = append(inst.addressFamily, AddressFamilyConfig{
+		Name:          afi,
+		DefaultMetric: dm,
+	})
+}
+
+func (inst *EigrpInstance) GetAfiMaximumPrefix(afi string) *MaxPrefixConfig {
+	for _, af := range inst.addressFamily {
+		if af.Name == afi && af.MaximumPrefix != nil && af.MaximumPrefix.Limit > 0 {
+			return af.MaximumPrefix
+		}
+	}
+	if inst.maximumPrefix != nil && inst.maximumPrefix.Limit > 0 {
+		return inst.maximumPrefix
+	}
+	for _, af := range inst.addressFamily {
+		if af.Name == afi && af.MaximumPrefix != nil {
+			return af.MaximumPrefix
+		}
+	}
+	return inst.maximumPrefix
+}
+
+func (inst *EigrpInstance) SetAfiMaximumPrefix(afi string, mp *MaxPrefixConfig) {
+	for i, af := range inst.addressFamily {
+		if af.Name == afi {
+			inst.addressFamily[i].MaximumPrefix = mp
+			return
+		}
+	}
+	inst.addressFamily = append(inst.addressFamily, AddressFamilyConfig{
+		Name:          afi,
+		MaximumPrefix: mp,
+	})
+}
+
 func newEigrpInstance(netinst string) *EigrpInstance {
 	return &EigrpInstance{
 		netinst:              netinst,
@@ -319,6 +440,7 @@ func newEigrpInstance(netinst string) *EigrpInstance {
 		preference:           90,
 		externalPreference:   170,
 		wideMetrics:          true,
+		eventLogSize:         500,
 		configuredInterfaces: make(map[string]*InterfaceConfig),
 		staticNeighbors:      make(map[string]*StaticNeighborConfig),
 		routes:               make(map[string]*RouteInfo),
@@ -326,10 +448,12 @@ func newEigrpInstance(netinst string) *EigrpInstance {
 		interfaces:           make(map[string]*InterfaceInfo),
 		topology:             make(map[string]*TopologyPrefixInfo),
 		traffic:              make(map[string]*TrafficInfo),
+		eventLog:             make([]*EventLogInfo, 0),
 		tempNeighbors:        make(map[string]*NeighborInfo),
 		tempInterfaces:       make(map[string]*InterfaceInfo),
 		tempTopology:         make(map[string]*TopologyPrefixInfo),
 		tempTraffic:          make(map[string]*TrafficInfo),
+		tempEventLog:         make([]*EventLogInfo, 0),
 		bfdSessions:          make(map[string]string),
 		redistributedRoutes:  make(map[string]string),
 		redistributedHashes:  make(map[string]string),
@@ -341,6 +465,7 @@ func (inst *EigrpInstance) PrepareTelemetryCollection() {
 	inst.tempInterfaces = make(map[string]*InterfaceInfo)
 	inst.tempTopology = make(map[string]*TopologyPrefixInfo)
 	inst.tempTraffic = make(map[string]*TrafficInfo)
+	inst.tempEventLog = make([]*EventLogInfo, 0)
 	inst.collecting = true
 }
 
@@ -365,10 +490,16 @@ func (inst *EigrpInstance) CommitTelemetryCollection() {
 	} else if inst.traffic == nil {
 		inst.traffic = make(map[string]*TrafficInfo)
 	}
+	if inst.tempEventLog != nil {
+		inst.eventLog = inst.tempEventLog
+	} else if inst.eventLog == nil {
+		inst.eventLog = make([]*EventLogInfo, 0)
+	}
 	inst.tempNeighbors = nil
 	inst.tempInterfaces = nil
 	inst.tempTopology = nil
 	inst.tempTraffic = nil
+	inst.tempEventLog = nil
 	inst.collecting = false
 }
 
@@ -587,9 +718,11 @@ func (d *EigrpDaemon) CollectAndPublish(ctx context.Context) {
 			C.srlShimNeighborsReport(cNetinst)
 			C.srlShimTopologyReport(cNetinst)
 			C.srlShimTrafficReport(cNetinst)
+			C.srlShimEventLogReport(cNetinst)
 		} else {
 			d.mu.Lock()
 			inst.routes = make(map[string]*RouteInfo)
+			inst.eventLog = make([]*EventLogInfo, 0)
 			d.mu.Unlock()
 		}
 		C.free(unsafe.Pointer(cNetinst))
@@ -933,6 +1066,37 @@ func (d *EigrpDaemon) OnTrafficReport(netinst, ifname string, rmcast, umcast, ru
 	}
 }
 
+func (d *EigrpDaemon) OnEventLogReport(netinst string, eventNum uint32, timestampMs uint64, msg string) {
+	inst := d.GetOrCreateInstance(netinst)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	ts := fmt.Sprintf("%.3fs", float64(timestampMs)/1000.0)
+	if timestampMs > 1000000000000 {
+		t := time.UnixMilli(int64(timestampMs)).UTC()
+		ts = t.Format(time.RFC3339Nano)
+	}
+	entry := &EventLogInfo{
+		ID:        eventNum,
+		Timestamp: ts,
+		Message:   msg,
+	}
+	maxSize := int(inst.eventLogSize)
+	if maxSize <= 0 {
+		maxSize = 500
+	}
+	if inst.collecting {
+		inst.tempEventLog = append(inst.tempEventLog, entry)
+		if len(inst.tempEventLog) > maxSize {
+			inst.tempEventLog = inst.tempEventLog[len(inst.tempEventLog)-maxSize:]
+		}
+	} else {
+		inst.eventLog = append(inst.eventLog, entry)
+		if len(inst.eventLog) > maxSize {
+			inst.eventLog = inst.eventLog[len(inst.eventLog)-maxSize:]
+		}
+	}
+}
+
 func (d *EigrpDaemon) StartIPCServer(ctx context.Context) {
 	sockPath := "/var/run/srl_eigrpd_ipc.sock"
 	_ = os.Remove(sockPath)
@@ -1048,6 +1212,56 @@ func (d *EigrpDaemon) handleIPC(conn net.Conn) {
 		})
 		go d.CollectAndPublish(context.Background())
 
+	case "clear-topology":
+		cNetinst := C.CString(netinst)
+		C.srlShimTopologyClear(cNetinst, nil)
+		C.free(unsafe.Pointer(cNetinst))
+		_ = json.NewEncoder(conn).Encode(IPCResponse{
+			Status:  "ok",
+			Message: fmt.Sprintf("Cleared EIGRP topology table in network-instance %s", netinst),
+		})
+		go d.CollectAndPublish(context.Background())
+
+	case "clear-event-log":
+		cNetinst := C.CString(netinst)
+		C.srlShimEventLogClear(cNetinst)
+		C.free(unsafe.Pointer(cNetinst))
+		if inst := d.GetInstance(netinst); inst != nil {
+			d.mu.Lock()
+			inst.eventLog = make([]*EventLogInfo, 0)
+			d.mu.Unlock()
+		}
+		_ = json.NewEncoder(conn).Encode(IPCResponse{
+			Status:  "ok",
+			Message: fmt.Sprintf("Cleared EIGRP event log in network-instance %s", netinst),
+		})
+		go d.CollectAndPublish(context.Background())
+
+	case "clear-statistics":
+		cNetinst := C.CString(netinst)
+		C.srlShimStatisticsClear(cNetinst)
+		C.free(unsafe.Pointer(cNetinst))
+		if inst := d.GetInstance(netinst); inst != nil {
+			d.mu.Lock()
+			inst.traffic = make(map[string]*TrafficInfo)
+			d.mu.Unlock()
+		}
+		_ = json.NewEncoder(conn).Encode(IPCResponse{
+			Status:  "ok",
+			Message: fmt.Sprintf("Cleared EIGRP traffic statistics in network-instance %s", netinst),
+		})
+		go d.CollectAndPublish(context.Background())
+
+	case "graceful-shutdown":
+		cNetinst := C.CString(netinst)
+		C.srlShimGracefulShutdown(cNetinst)
+		C.free(unsafe.Pointer(cNetinst))
+		_ = json.NewEncoder(conn).Encode(IPCResponse{
+			Status:  "ok",
+			Message: fmt.Sprintf("Sent EIGRP graceful-shutdown Goodbye Hellos in network-instance %s", netinst),
+		})
+		go d.CollectAndPublish(context.Background())
+
 	case "restart":
 		cNetinst := C.CString(netinst)
 		cNbr := C.CString("all")
@@ -1094,6 +1308,11 @@ func (d *EigrpDaemon) handleIPC(conn net.Conn) {
 		inst := d.GetOrCreateInstance(netinst)
 		d.mu.Lock()
 		inst.restarting = true
+		for _, r := range inst.routes {
+			if r != nil {
+				r.RefreshedAfterRestart = false
+			}
+		}
 		restartTimeSec := 120
 		if inst.gracefulRestart != nil && inst.gracefulRestart.RestartTime > 0 {
 			restartTimeSec = int(inst.gracefulRestart.RestartTime)

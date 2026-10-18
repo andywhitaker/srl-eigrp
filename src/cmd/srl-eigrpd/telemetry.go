@@ -40,41 +40,44 @@ func extractNetinstFromJsPath(jsPath string) string {
 }
 
 func schemaRank(jsPath string) int {
-	if strings.Contains(jsPath, ".default-interface.address-family{") {
+	if strings.Contains(jsPath, ".address-family{") && !strings.Contains(jsPath, ".interface{") && !strings.Contains(jsPath, ".default-interface") {
 		return 1
 	}
-	if strings.Contains(jsPath, ".address-family{") && !strings.Contains(jsPath, ".interface{") && !strings.Contains(jsPath, ".default-interface{") {
+	if strings.Contains(jsPath, ".default-interface.address-family{") {
 		return 2
+	}
+	if strings.Contains(jsPath, ".event-log{") {
+		return 3
 	}
 	if strings.Contains(jsPath, ".interface{") {
 		if strings.Contains(jsPath, ".address-family{") {
 			if strings.Contains(jsPath, ".summary-address{") {
-				return 6
+				return 7
 			}
-			return 5
+			return 6
 		}
 		if strings.Contains(jsPath, ".summary-address{") {
-			return 4
+			return 5
 		}
-		return 3
+		return 4
 	}
 	if strings.Contains(jsPath, ".neighbor{") {
-		return 7
-	}
-	if strings.Contains(jsPath, ".route{") && !strings.Contains(jsPath, ".topology{") {
 		return 8
 	}
-	if strings.Contains(jsPath, ".static-neighbor{") {
+	if strings.Contains(jsPath, ".route{") && !strings.Contains(jsPath, ".topology{") {
 		return 9
+	}
+	if strings.Contains(jsPath, ".static-neighbor{") {
+		return 10
 	}
 	if strings.Contains(jsPath, ".topology{") {
 		if strings.Contains(jsPath, "}.route{") {
-			return 11
+			return 12
 		}
-		return 10
+		return 11
 	}
 	if strings.Contains(jsPath, ".traffic{") {
-		return 12
+		return 13
 	}
 	return 0
 }
@@ -104,10 +107,20 @@ func buildInterfaceData(
 		}
 	}
 
+	bwPct := uint32(50)
+	if ic != nil && ic.BandwidthPercent != nil && *ic.BandwidthPercent > 0 && *ic.BandwidthPercent != 50 {
+		bwPct = *ic.BandwidthPercent
+	} else if defIntf != nil && defIntf.BandwidthPercent != nil && *defIntf.BandwidthPercent > 0 {
+		bwPct = *defIntf.BandwidthPercent
+	} else if ic != nil && ic.BandwidthPercent != nil && *ic.BandwidthPercent > 0 {
+		bwPct = *ic.BandwidthPercent
+	}
+
 	data := map[string]interface{}{
-		"interface-name": normName,
-		"admin-state":    adminState,
-		"oper-state":     operState,
+		"interface-name":    normName,
+		"admin-state":       adminState,
+		"oper-state":        operState,
+		"bandwidth-percent": bwPct,
 	}
 
 	if operState != "up" {
@@ -195,6 +208,7 @@ func publishInterfaceSublists(
 		}
 		helloInterval := uint16(5)
 		holdTime := uint16(15)
+		bwPct := uint32(50)
 		splitHorizon := true
 		nextHopSelf := false
 		if ic != nil {
@@ -202,11 +216,13 @@ func publishInterfaceSublists(
 			afPassive = ic.IsAfiPassive(afName, afPassive)
 			helloInterval = ic.GetAfiHelloInterval(afName, defIntf)
 			holdTime = ic.GetAfiHoldTime(afName, defIntf)
+			bwPct = ic.GetAfiBandwidthPercent(afName, defIntf)
 			splitHorizon = ic.GetAfiSplitHorizon(afName, defIntf)
 			nextHopSelf = ic.GetAfiNextHopSelf(afName, defIntf)
 		} else if defIntf != nil {
 			helloInterval = defIntf.GetAfiHelloInterval(afName)
 			holdTime = defIntf.GetAfiHoldTime(afName)
+			bwPct = defIntf.GetAfiBandwidthPercent(afName)
 			splitHorizon = defIntf.GetAfiSplitHorizon(afName)
 			nextHopSelf = defIntf.GetAfiNextHopSelf(afName)
 		}
@@ -227,14 +243,15 @@ func publishInterfaceSublists(
 		}
 
 		afData := map[string]interface{}{
-			"name":           afName,
-			"admin-state":    adminStateStr,
-			"oper-state":     operStateStr,
-			"passive":        afPassive,
-			"hello-interval": helloInterval,
-			"hold-time":      holdTime,
-			"split-horizon":  splitHorizon,
-			"next-hop-self":  nextHopSelf,
+			"name":              afName,
+			"admin-state":       adminStateStr,
+			"oper-state":        operStateStr,
+			"passive":           afPassive,
+			"hello-interval":    helloInterval,
+			"hold-time":         holdTime,
+			"bandwidth-percent": bwPct,
+			"split-horizon":     splitHorizon,
+			"next-hop-self":     nextHopSelf,
 		}
 		if operStateStr != "up" {
 			if adminStateStr == "disable" {
@@ -440,12 +457,17 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 		preference           uint8
 		externalPreference   uint8
 		wideMetrics          bool
+		trafficShareBalanced bool
+		autoSummary          bool
+		eventLogSize         uint32
 		exportPolicy         string
 		importPolicy         string
 		gracefulRestart      *GracefulRestartConfig
 		timers               *TimersConfig
 		metrics              *MetricsConfig
 		metricWeights        *MetricsConfig
+		defaultMetric        *PolicyMetricConfig
+		maximumPrefix        *MaxPrefixConfig
 		authentication       *AuthConfig
 		defaultIntf          *DefaultInterfaceConfig
 		configuredInterfaces map[string]*InterfaceConfig
@@ -456,6 +478,7 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 		intfList             []*InterfaceInfo
 		topoList             []*TopologyPrefixInfo
 		trafficList          []*TrafficInfo
+		eventLog             []*EventLogInfo
 	}
 	allInstData := make([]instData, 0, len(d.instances))
 	for ni, inst := range d.instances {
@@ -576,6 +599,13 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 			tfCopy := *tf
 			trafficList = append(trafficList, &tfCopy)
 		}
+		eventLogList := make([]*EventLogInfo, 0, len(inst.eventLog))
+		for _, ev := range inst.eventLog {
+			if ev != nil {
+				evCopy := *ev
+				eventLogList = append(eventLogList, &evCopy)
+			}
+		}
 		networks := make([]string, len(inst.networks))
 		copy(networks, inst.networks)
 
@@ -675,6 +705,10 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 		if extPref == 0 {
 			extPref = 170
 		}
+		evLogSize := inst.eventLogSize
+		if evLogSize == 0 {
+			evLogSize = 500
+		}
 
 		cfgIntfs := make(map[string]*InterfaceConfig, len(inst.configuredInterfaces))
 		for k, v := range inst.configuredInterfaces {
@@ -726,6 +760,16 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 			c := *inst.metricWeights
 			metricWeightsCopy = &c
 		}
+		var defMetricCopy *PolicyMetricConfig
+		if inst.defaultMetric != nil {
+			c := *inst.defaultMetric
+			defMetricCopy = &c
+		}
+		var maxPrefixCopy *MaxPrefixConfig
+		if inst.maximumPrefix != nil {
+			c := *inst.maximumPrefix
+			maxPrefixCopy = &c
+		}
 		var authCopy *AuthConfig
 		if inst.authentication != nil {
 			c := *inst.authentication
@@ -756,12 +800,17 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 			preference:           pref,
 			externalPreference:   extPref,
 			wideMetrics:          inst.wideMetrics,
+			trafficShareBalanced: inst.trafficShareBalanced,
+			autoSummary:          inst.autoSummary,
+			eventLogSize:         evLogSize,
 			exportPolicy:         inst.exportPolicy,
 			importPolicy:         inst.importPolicy,
 			gracefulRestart:      grCopy,
 			timers:               timersCopy,
 			metrics:              metricsCopy,
 			metricWeights:        metricWeightsCopy,
+			defaultMetric:        defMetricCopy,
+			maximumPrefix:        maxPrefixCopy,
 			authentication:       authCopy,
 			defaultIntf:          defIntfCopy,
 			configuredInterfaces: cfgIntfs,
@@ -772,6 +821,7 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 			intfList:             intfList,
 			topoList:             topoList,
 			trafficList:          trafficList,
+			eventLog:             eventLogList,
 		})
 	}
 	d.mu.RUnlock()
@@ -782,35 +832,42 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 
 	for _, item := range allInstData {
 		instSnapshot := map[string]interface{}{
-			"network-instance":    item.ni,
-			"autonomous-system":   item.asn,
-			"router-id":           item.routerId,
-			"admin-state":         item.adminState,
-			"oper-state":          item.operState,
-			"variance":            item.variance,
-			"maximum-paths":       item.maximumPaths,
-			"maximum-hops":        item.maximumHops,
-			"rib-scale":           item.ribScale,
-			"preference":          item.preference,
-			"external-preference": item.externalPreference,
-			"wide-metrics":        item.wideMetrics,
-			"export-policy":       item.exportPolicy,
-			"import-policy":       item.importPolicy,
-			"graceful-restart":    item.gracefulRestart,
-			"default-interface":   item.defaultIntf,
-			"timers":              item.timers,
-			"metrics":             item.metrics,
-			"networks":            item.networks,
-			"static-neighbors":    item.staticNeighbors,
-			"static-neighbor":     item.staticNeighbors,
-			"interfaces":          item.intfList,
-			"interface":           item.intfList,
-			"neighbors":           item.nbrList,
-			"neighbor":            item.nbrList,
-			"routes":              item.routeList,
-			"route":               item.routeList,
-			"topology":            item.topoList,
-			"traffic":             item.trafficList,
+			"network-instance":       item.ni,
+			"autonomous-system":      item.asn,
+			"router-id":              item.routerId,
+			"admin-state":            item.adminState,
+			"oper-state":             item.operState,
+			"variance":               item.variance,
+			"maximum-paths":          item.maximumPaths,
+			"maximum-hops":           item.maximumHops,
+			"rib-scale":              item.ribScale,
+			"preference":             item.preference,
+			"external-preference":    item.externalPreference,
+			"wide-metrics":           item.wideMetrics,
+			"traffic-share-balanced": item.trafficShareBalanced,
+			"auto-summary":           item.autoSummary,
+			"event-log-size":         item.eventLogSize,
+			"export-policy":          item.exportPolicy,
+			"import-policy":          item.importPolicy,
+			"graceful-restart":       item.gracefulRestart,
+			"default-interface":      item.defaultIntf,
+			"timers":                 item.timers,
+			"metrics":                item.metrics,
+			"default-metric":         item.defaultMetric,
+			"maximum-prefix":         item.maximumPrefix,
+			"address-family":         item.addressFamily,
+			"networks":               item.networks,
+			"static-neighbors":       item.staticNeighbors,
+			"static-neighbor":        item.staticNeighbors,
+			"interfaces":             item.intfList,
+			"interface":              item.intfList,
+			"neighbors":              item.nbrList,
+			"neighbor":               item.nbrList,
+			"routes":                 item.routeList,
+			"route":                  item.routeList,
+			"topology":               item.topoList,
+			"traffic":                item.trafficList,
+			"event-log":              item.eventLog,
 		}
 		instancesState[item.ni] = instSnapshot
 		if item.ni == "default" {
@@ -867,11 +924,15 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 
 		// Default interface data
 		defIntfAdmin := "enable"
+		defIntfBwPct := uint32(50)
 		var defIntfBw *uint32
 		var defIntfDelay *uint32
 		if item.defaultIntf != nil {
 			if item.defaultIntf.AdminState != "" {
 				defIntfAdmin = item.defaultIntf.AdminState
+			}
+			if item.defaultIntf.BandwidthPercent != nil && *item.defaultIntf.BandwidthPercent > 0 {
+				defIntfBwPct = *item.defaultIntf.BandwidthPercent
 			}
 			defIntfBw = item.defaultIntf.Bandwidth
 			defIntfDelay = item.defaultIntf.Delay
@@ -881,8 +942,9 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 			defOper = "down"
 		}
 		defIntfData := map[string]interface{}{
-			"admin-state": defIntfAdmin,
-			"oper-state":  defOper,
+			"admin-state":       defIntfAdmin,
+			"oper-state":        defOper,
+			"bandwidth-percent": defIntfBwPct,
 		}
 		if defIntfBw != nil && *defIntfBw > 0 {
 			defIntfData["bandwidth"] = *defIntfBw
@@ -899,6 +961,7 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 			defAfPass := false
 			defAfHello := uint16(5)
 			defAfHold := uint16(15)
+			defAfBwPct := defIntfBwPct
 			defAfSplit := true
 			defAfNextHop := false
 			if item.defaultIntf != nil {
@@ -908,6 +971,7 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 				defAfPass = item.defaultIntf.IsAfiPassive(afName)
 				defAfHello = item.defaultIntf.GetAfiHelloInterval(afName)
 				defAfHold = item.defaultIntf.GetAfiHoldTime(afName)
+				defAfBwPct = item.defaultIntf.GetAfiBandwidthPercent(afName)
 				defAfSplit = item.defaultIntf.GetAfiSplitHorizon(afName)
 				defAfNextHop = item.defaultIntf.GetAfiNextHopSelf(afName)
 			}
@@ -916,14 +980,15 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 				defAfOper = "down"
 			}
 			defAfData := map[string]interface{}{
-				"name":           afName,
-				"admin-state":    defAfAdmin,
-				"oper-state":     defAfOper,
-				"passive":        defAfPass,
-				"hello-interval": defAfHello,
-				"hold-time":      defAfHold,
-				"split-horizon":  defAfSplit,
-				"next-hop-self":  defAfNextHop,
+				"name":              afName,
+				"admin-state":       defAfAdmin,
+				"oper-state":        defAfOper,
+				"passive":           defAfPass,
+				"hello-interval":    defAfHello,
+				"hold-time":         defAfHold,
+				"bandwidth-percent": defAfBwPct,
+				"split-horizon":     defAfSplit,
+				"next-hop-self":     defAfNextHop,
 			}
 			if defAfOper != "up" {
 				if defAfAdmin == "disable" {
@@ -1068,26 +1133,83 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 			"extended-attributes": extAttr,
 		}
 
+		// Default metric data
+		dmBw := uint32(100000)
+		dmDelay := uint32(100)
+		dmRel := uint8(255)
+		dmLoad := uint8(1)
+		dmMtu := uint32(1500)
+		if item.defaultMetric != nil {
+			if item.defaultMetric.Bandwidth > 0 {
+				dmBw = item.defaultMetric.Bandwidth
+			}
+			if item.defaultMetric.Delay > 0 {
+				dmDelay = item.defaultMetric.Delay
+			}
+			if item.defaultMetric.Reliability > 0 {
+				dmRel = item.defaultMetric.Reliability
+			}
+			if item.defaultMetric.Load > 0 {
+				dmLoad = item.defaultMetric.Load
+			}
+			if item.defaultMetric.Mtu > 0 {
+				dmMtu = item.defaultMetric.Mtu
+			}
+		}
+		defMetricData := map[string]interface{}{
+			"bandwidth":   dmBw,
+			"delay":       dmDelay,
+			"reliability": dmRel,
+			"load":        dmLoad,
+			"mtu":         dmMtu,
+		}
+
+		// Maximum prefix data
+		mpThresh := uint8(75)
+		mpWarnOnly := false
+		var mpLimit uint32
+		if item.maximumPrefix != nil {
+			mpLimit = item.maximumPrefix.Limit
+			if item.maximumPrefix.Threshold > 0 {
+				mpThresh = item.maximumPrefix.Threshold
+			}
+			if item.maximumPrefix.WarningOnly != nil {
+				mpWarnOnly = *item.maximumPrefix.WarningOnly
+			}
+		}
+		maxPrefixData := map[string]interface{}{
+			"threshold":    mpThresh,
+			"warning-only": mpWarnOnly,
+		}
+		if mpLimit > 0 {
+			maxPrefixData["limit"] = mpLimit
+		}
+
 		// Top-level delivery node (.network_instance{.name==ni}.protocols.eigrp)
 		topKey := fmt.Sprintf(".network_instance{.name==\"%s\"}.protocols.eigrp", ni)
 		currentKeys[topKey] = struct{}{}
 		topData := map[string]interface{}{
-			"admin-state":         item.adminState,
-			"oper-state":          item.operState,
-			"variance":            item.variance,
-			"maximum-paths":       item.maximumPaths,
-			"maximum-hops":        item.maximumHops,
-			"rib-scale":           item.ribScale,
-			"preference":          item.preference,
-			"external-preference": item.externalPreference,
-			"wide-metrics":        item.wideMetrics,
-			"total-neighbors":     len(item.nbrList),
-			"total-routes":        len(item.routeList),
-			"total-interfaces":    len(item.intfList),
-			"graceful-restart":    grData,
-			"default-interface":   defIntfData,
-			"timers":              timersData,
-			"metrics":             metricsData,
+			"admin-state":            item.adminState,
+			"oper-state":             item.operState,
+			"variance":               item.variance,
+			"maximum-paths":          item.maximumPaths,
+			"maximum-hops":           item.maximumHops,
+			"rib-scale":              item.ribScale,
+			"preference":             item.preference,
+			"external-preference":    item.externalPreference,
+			"wide-metrics":           item.wideMetrics,
+			"traffic-share-balanced": item.trafficShareBalanced,
+			"auto-summary":           item.autoSummary,
+			"event-log-size":         item.eventLogSize,
+			"total-neighbors":        len(item.nbrList),
+			"total-routes":           len(item.routeList),
+			"total-interfaces":       len(item.intfList),
+			"graceful-restart":       grData,
+			"default-interface":      defIntfData,
+			"timers":                 timersData,
+			"metrics":                metricsData,
+			"default-metric":         defMetricData,
+			"maximum-prefix":         maxPrefixData,
 		}
 		if item.operState != "up" {
 			if item.adminState == "disable" {
@@ -1384,23 +1506,82 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 			}
 			afPref := item.preference
 			afExtPref := item.externalPreference
+			afTrafficShare := item.trafficShareBalanced
+			afAutoSummary := item.autoSummary
+			afDmBw := dmBw
+			afDmDelay := dmDelay
+			afDmRel := dmRel
+			afDmLoad := dmLoad
+			afDmMtu := dmMtu
+			afMpLimit := mpLimit
+			afMpThresh := mpThresh
+			afMpWarnOnly := mpWarnOnly
 			for _, af := range item.addressFamily {
 				if af.Name == afName {
-					if af.Preference > 0 {
+					if af.Preference > 0 && (af.Preference != 90 || item.preference == 0) {
 						afPref = af.Preference
 					}
-					if af.ExternalPreference > 0 {
+					if af.ExternalPreference > 0 && (af.ExternalPreference != 170 || item.externalPreference == 0) {
 						afExtPref = af.ExternalPreference
+					}
+					if af.TrafficShareBalanced != nil {
+						afTrafficShare = *af.TrafficShareBalanced
+					}
+					if af.AutoSummary != nil {
+						afAutoSummary = *af.AutoSummary
+					}
+					if af.DefaultMetric != nil && !isDefaultPolicyMetric(af.DefaultMetric) {
+						if af.DefaultMetric.Bandwidth > 0 {
+							afDmBw = af.DefaultMetric.Bandwidth
+						}
+						if af.DefaultMetric.Delay > 0 {
+							afDmDelay = af.DefaultMetric.Delay
+						}
+						if af.DefaultMetric.Reliability > 0 {
+							afDmRel = af.DefaultMetric.Reliability
+						}
+						if af.DefaultMetric.Load > 0 {
+							afDmLoad = af.DefaultMetric.Load
+						}
+						if af.DefaultMetric.Mtu > 0 {
+							afDmMtu = af.DefaultMetric.Mtu
+						}
+					}
+					if af.MaximumPrefix != nil && af.MaximumPrefix.Limit > 0 {
+						afMpLimit = af.MaximumPrefix.Limit
+						if af.MaximumPrefix.Threshold > 0 {
+							afMpThresh = af.MaximumPrefix.Threshold
+						}
+						if af.MaximumPrefix.WarningOnly != nil {
+							afMpWarnOnly = *af.MaximumPrefix.WarningOnly
+						}
 					}
 					break
 				}
 			}
+			afMaxPrefixData := map[string]interface{}{
+				"threshold":    afMpThresh,
+				"warning-only": afMpWarnOnly,
+			}
+			if afMpLimit > 0 {
+				afMaxPrefixData["limit"] = afMpLimit
+			}
 			afData := map[string]interface{}{
-				"name":                afName,
-				"admin-state":         afAdmin,
-				"oper-state":          afOper,
-				"preference":          afPref,
-				"external-preference": afExtPref,
+				"name":                   afName,
+				"admin-state":            afAdmin,
+				"oper-state":             afOper,
+				"preference":             afPref,
+				"external-preference":    afExtPref,
+				"traffic-share-balanced": afTrafficShare,
+				"auto-summary":           afAutoSummary,
+				"default-metric": map[string]interface{}{
+					"bandwidth":   afDmBw,
+					"delay":       afDmDelay,
+					"reliability": afDmRel,
+					"load":        afDmLoad,
+					"mtu":         afDmMtu,
+				},
+				"maximum-prefix": afMaxPrefixData,
 			}
 			if afOper != "up" {
 				if afAdmin == "disable" {
@@ -1482,6 +1663,30 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 						Data: &ndk.TelemetryData{JsonContent: string(b)},
 					})
 				}
+			}
+		}
+
+		// Event log (publish latest 32 entries separately to NDK telemetry)
+		evStart := 0
+		if len(item.eventLog) > 32 {
+			evStart = len(item.eventLog) - 32
+		}
+		for _, ev := range item.eventLog[evStart:] {
+			if ev == nil || ev.ID == 0 {
+				continue
+			}
+			evKey := fmt.Sprintf(".network_instance{.name==\"%s\"}.protocols.eigrp.event-log{.id==%d}", ni, ev.ID)
+			currentKeys[evKey] = struct{}{}
+			evData := map[string]interface{}{
+				"id":        ev.ID,
+				"timestamp": ev.Timestamp,
+				"message":   ev.Message,
+			}
+			if b, err := json.Marshal(evData); err == nil {
+				states = append(states, &ndk.TelemetryInfo{
+					Key:  &ndk.TelemetryKey{JsPath: evKey},
+					Data: &ndk.TelemetryData{JsonContent: string(b)},
+				})
 			}
 		}
 	}

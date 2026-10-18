@@ -2,674 +2,339 @@
 
 **Target Subsystem:** OpenEIGRP C Core Library (`src/upstream/eigrp/eigrp/code/`)  
 **Target Repository:** Donnie V. Savage's OpenEIGRP Core (`https://github.com/diivious/eigrp`)  
-**Base Commit:** [`81bcb88fc04f84e6d6ed3d7c25f6295ebf437331`](https://github.com/diivious/eigrp/commit/81bcb88fc04f84e6d6ed3d7c25f6295ebf437331) (*origin/master*)  
-**Patch Commit:** [`acbc0ad992d9f62a0b62ffe603a0b54f4731f74f`](https://github.com/diivious/eigrp/commit/acbc0ad992d9f62a0b62ffe603a0b54f4731f74f)  
+**Evaluated Upstream Commit:** [`951d7549beb447b8f9c42b4f253638b392729491`](https://github.com/diivious/eigrp/commit/951d7549beb447b8f9c42b4f253638b392729491) (*origin/master*)  
 **Author / Contributor:** Andy Whitaker (`32944047+andywhitaker@users.noreply.github.com`)  
-**Applicable Standards:** RFC 7868 (*Cisco's Enhanced Interior Gateway Routing Protocol*), RFC 5880 (*Bidirectional Forwarding Detection*)  
+**Applicable Standards:** RFC 7868 (*Cisco's Enhanced Interior Gateway Routing Protocol*)  
 **Affected Address Families:** `ipv4-unicast`, `ipv6-unicast`
 
 ---
 
-## 1. Executive Summary & Impact Analysis
+## 1. Executive Summary
 
-During production integration, multi-vendor interoperability validation (SR Linux NDK shim and FRRouting), and rigorous conformance stress testing of Donnie V. Savage's OpenEIGRP C core library, five critical architectural and algorithmic defects were identified in the core protocol engine.
+During end-to-end 2-node, FRR-interop, and 5-node Containerlab validation of `srl-eigrp` against unmodified upstream OpenEIGRP (`diivious/eigrp` commit [`951d754`](https://github.com/diivious/eigrp/commit/951d7549beb447b8f9c42b4f253638b392729491)), previously reported defects that were resolved upstream were verified and removed from this report:
+- **Resolved Upstream in [`5f43feb`](https://github.com/diivious/eigrp/commit/5f43feb):** Throughput bottleneck bandwidth comparison in [`eigrp_metric_total_calculate()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_metric.c#L168-L171).
+- **Resolved Upstream in [`366e29b`](https://github.com/diivious/eigrp/commit/366e29b):** DUAL FSM `ACTIVE_1` / `ACTIVE_3` `EIGRP_OPC_REPLY` handling on route withdrawal and metric increase in [`eigrp_fsm.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_fsm.c#L524-L605).
 
-These defects span:
-1. **DUAL Finite State Machine Convergence:** An infinite Query-Reply broadcast storm triggered by handling incoming `REPLY` packets as Distance Increase (`DINC`) events under route withdrawal or metric inflation ([`eigrp_fsm.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_fsm.c)).
-2. **Feasibility Condition for Self-Originated Routes:** Collapse of successor selection ($RD == FD$) causing local connected, static, and redistributed routes to fail Feasibility Condition ($RD < FD$) checks during periodic topology sweeps ([`eigrp_topology.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_topology.c)).
-3. **Composite Metric Throughput Calculation:** An arithmetic inversion in the bottleneck link comparison logic that computed composite path distance using maximum throughput instead of minimum bottleneck bandwidth, causing Calculated Distance to fall below Reported Distance ($CD < RD$) ([`eigrp_metric.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_metric.c)).
-4. **Query Diffusing Computation Deadlock:** Addition of the query-originating neighbor to the expected reply list (`prefix->rij`), inducing permanent Active state deadlocks and Stuck-In-Active (SIA) neighbor resets ([`eigrp_packetizer.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_packetizer.c)).
-5. **Redistribution Metric Scaling Asymmetry:** Redundant classic delay pre-scaling applied during redistribution route ingestion that diverged from downstream topology sweep recomputations ([`eigrp_topology.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_topology.c)).
+Six remaining upstream defects in `diivious/eigrp` (`951d754`) were identified during comprehensive feature testing. In `srl-eigrp`, we currently work around these without modifying the upstream submodule by using GCC linker `--wrap` overrides in [`src/cshim/srl_cshim_overrides.c`](file:///home/awhitaker/dev/srl-eigrp/src/cshim/srl_cshim_overrides.c):
 
-All 5 defects have been fixed in commit [`acbc0ad992d9f62a0b62ffe603a0b54f4731f74f`](https://github.com/diivious/eigrp/commit/acbc0ad992d9f62a0b62ffe603a0b54f4731f74f). The upstream pytest test suite passes **185/185 clean** (`pytest src/upstream/eigrp/eigrp/test`), and the full UUT scenario harness passes **31/31 clean** (`make -C src/upstream/eigrp/eigrp/test/uut all-scenarios`).
-
-This document provides exact technical breakdowns, RFC references, reproduction scenarios, runnable test cases, and patch diffs to facilitate seamless upstream review and merging.
+1. **Peer Restart Ignored When Restarted Neighbor Reuses `INIT` Sequence `1`** ([`eigrp_update.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_update.c#L159-L168))
+2. **Dual-Stack (`ipv4-unicast` + `ipv6-unicast`) Interface State Updates Clobber `ei->address` Across Address Families** ([`eigrp_network.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_network.c#L323-L343), [`eigrp_interface.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_interface.c#L1200-L1207))
+3. **Self-Originated Route Feasibility Collapse ($RD == FD$) and Metric Miscalculation in `eigrp_topology_metric_update()`** ([`eigrp_topology.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_topology.c#L1245-L1283))
+4. **Topology-Level `maximum-prefix` Admission (`eigrp_topology_prefix_admit`) Never Called by TLV Decoders and Counts Poisoned Nodes** ([`eigrp_topology.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_topology.c#L2273-L2315), [`eigrp_tlv1.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_tlv1.c), [`eigrp_tlv2.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_tlv2.c))
+5. **Summary Route Component Selection (Split-Horizon, Metric, and Origin) & Suppressed-Component Query Handling** ([`eigrp_summary.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_summary.c#L221-L330))
+6. **Query Origin Added to Reply-Status Table (`prefix->rij`) When `split-horizon` Is Disabled or on Shared Segments** ([`eigrp_packetizer.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_packetizer.c#L332-L346))
 
 ---
 
-## 2. Defect 1: DUAL FSM Infinite Query-Reply Storm on Route Withdrawal / Metric Increase
+## 2. Defect 1: Peer Restart Ignored When Restarted Neighbor Reuses `INIT` Sequence `1`
 
 ### 2.1 Affected Source Location
-* **File:** [`src/upstream/eigrp/eigrp/code/eigrp_fsm.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_fsm.c#L515-L605)
-* **Function:** [`eigrp_fsm_event_select()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_fsm.c#L425)
-* **Upstream Line Numbers:**
-  * State `EIGRP_FSM_STATE_ACTIVE_1`: Lines 525–528
-  * State `EIGRP_FSM_STATE_ACTIVE_3`: Lines 593–596
+* **File:** [`src/upstream/eigrp/eigrp/code/eigrp_update.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_update.c#L159-L267)
+* **Function:** [`eigrp_update_receive()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_update.c#L136)
+* **Upstream Line Numbers:** Lines 159–168 and Lines 251–266
 
 ### 2.2 RFC Standard Requirement
-* **RFC 7868 §3.5 (DUAL Finite State Machine)**:
-  * In the Diffusing Update Algorithm (DUAL), when an active computation is underway ($o_{ij} = 1$), receipt of a `REPLY` packet from neighbor $k$ must only remove $k$ from the set of neighbors from which a reply is expected ($r_{ij} \leftarrow r_{ij} \setminus \{k\}$).
-  * If the reply set is not yet empty ($r_{ij} \neq \emptyset$), the router **MUST** remain in the active state without triggering new diffusing computations or generating queries.
-  * When the final reply is received ($r_{ij} = \emptyset$), the FSM evaluates the transition event `LR` (Last Reply), transitioning to Passive state if a feasible successor is available or resetting distance.
-  * A `REPLY` packet **MUST NEVER** generate a Distance Increase (`DINC`) event. `DINC` is exclusively an input event triggered by a metric increase reported in an `UPDATE` packet from the current successor while in Passive state, or an interface cost change.
+* **RFC 7868 §5.3.4 (INIT Flag)**:
+  * When a router receives an `UPDATE` with the `INIT` flag set from a neighbor that is already in the `UP` state, it indicates that the neighbor has restarted before its hold timer expired and is establishing a new adjacency.
+  * The receiving router must tear down/resynchronize stale topology state learned from that neighbor, transition the neighbor through `PENDING`, and send its own `INIT` `UPDATE` so both peers resynchronize their topology tables.
 
 ### 2.3 Flawed Behavior & Event Sequence
-In upstream [`eigrp_fsm.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_fsm.c), the message evaluator for `ACTIVE_1` and `ACTIVE_3` contained:
+In [`eigrp_update.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_update.c#L159-L168), lines 159–168 check whether an incoming `INIT` `UPDATE` is a retransmission of the neighbor's initial `INIT`:
 
 ```c
-/* Upstream eigrp_fsm.c lines 519-530 */
-} else if (msg->packet_type == EIGRP_OPC_REPLY) {
-    eigrp_fsm_reply_status_remove(prefix, route->adv_router);
-    (void)eigrp_eventlog_msg_add(msg->eigrp, EIGRP_EVENTLOG_OPCODE_REPLY_STATUS,
-        &prefix->destination, prefix->rij ? prefix->rij->count : 0,
-        route->ei ? route->ei->ifindex : 0, 0, 0);
-
-    if (change == METRIC_INCREASE
-        && (route->flags
-        & EIGRP_ROUTE_DESCRIPTOR_SUCCESSOR_FLAG)) {
-        return EIGRP_FSM_EVENT_DINC;  /* <-- DEFECT: Premature DINC triggered by REPLY */
-    } else if (prefix->rij->count) {
-        return EIGRP_FSM_KEEP_STATE;
-    } else {
-        eigrp_log(EIGRP_LOG_INFO, "All reply received");
-        return EIGRP_FSM_EVENT_LR;
-    }
+/* Upstream eigrp_update.c lines 159-168 */
+if (flags == EIGRP_INIT_FLAG
+    && ntohl(eigrph->sequence) != 0
+    && nbr->peer_init_sequence_number == ntohl(eigrph->sequence)) {
+    eigrp_hello_send_ack_sequence(nbr, ntohl(eigrph->sequence));
+    return;
 }
+peer_init_previously_seen = nbr->peer_init_sequence_number != 0;
+if (flags == EIGRP_INIT_FLAG && !peer_init_previously_seen)
+    nbr->peer_init_sequence_number = ntohl(eigrph->sequence);
 ```
 
 #### Failure Cascade:
-1. Destination $P$ becomes unreachable at the successor or experiences metric inflation.
-2. Router enters `ACTIVE_1` or `ACTIVE_3` and transmits `QUERY` packets to all peers, populating `prefix->rij`.
-3. Peer $k$ (which was the former successor or held the successor flag) transmits a `REPLY` containing an unreachable metric (`EIGRP_MAX_METRIC`) or increased distance.
-4. `eigrp_topology_update_distance()` runs on the incoming reply message and computes `change = METRIC_INCREASE`.
-5. Because `(route->flags & EIGRP_ROUTE_DESCRIPTOR_SUCCESSOR_FLAG)` is set, `eigrp_fsm_event_select()` evaluates the `change == METRIC_INCREASE` block **before** testing `prefix->rij->count`.
-6. `eigrp_fsm_event_select()` returns `EIGRP_FSM_EVENT_DINC`.
-7. Receiving `DINC` while already active causes the FSM to re-initialize an active computation, re-broadcast `QUERY` packets to all neighbors, and reset `prefix->rij`.
-8. Neighbors answer with another `REPLY`. The reply is again classified as `METRIC_INCREASE`, returning `DINC` once more.
-9. **Outcome:** A self-sustaining, infinite Query-Reply storm. Control plane CPU utilization reaches 100%, bandwidth is saturated by RTP packets, and the route never converges to Passive state.
+1. Every newly created OpenEIGRP instance initializes `eigrp->sequence_number = 1` ([`eigrp_instance.c:262`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_instance.c#L262)).
+2. When Neighbor B first forms an adjacency with Router A, Neighbor B's initial `INIT` `UPDATE` carries `sequence = 1`. Router A records `nbr->peer_init_sequence_number = 1`.
+3. The adjacency reaches `EIGRP_NEIGHBOR_UP`, and Neighbor B sends subsequent non-`INIT` Updates (`sequence = 2, 3, ...`), proving that the initial `INIT` handshake has completed. However, `nbr->peer_init_sequence_number` remains `1`.
+4. Neighbor B's EIGRP process restarts while Router A's hold timer for Neighbor B is still active.
+5. Upon restart, Neighbor B initializes a fresh instance with `eigrp->sequence_number = 1` and sends a new `INIT` `UPDATE` carrying `sequence = 1`.
+6. Router A receives `flags == EIGRP_INIT_FLAG` with `ntohl(eigrph->sequence) == 1`. Because `nbr->peer_init_sequence_number == 1`, lines 159–164 treat the restarted peer's `INIT` as a duplicate retransmission of the original `INIT`, send an ACK, and **return early** without ever executing the `peer restarted` resynchronization block at lines 251–266!
+7. **Outcome:** Neighbor B waits for Router A's `INIT` `UPDATE` (which is never sent), leaving the restarted neighbor wedged in `PENDING` state or missing Router A's routes until hold timers expire.
 
-### 2.4 Reproduction Instructions & Minimal Topology
-
-#### Topology
-```
-[R1] (AS 100) ---- eth1 ---- (AS 100) [R2] (AS 100) ---- eth2 ---- (AS 100) [R3]
-                                                                        |
-                                                                   10.10.10.0/24
-```
-
-#### Steps to Reproduce
-1. Configure three routers running OpenEIGRP on `ipv4-unicast` or `ipv6-unicast`.
-2. Router R3 advertises prefix `10.10.10.0/24`. R1 and R2 install R3 as successor.
-3. On R3, withdraw the route or shut down the originating loopback interface.
-4. R2 detects metric increase / withdrawal and sends `QUERY` to R1. R1 sends `QUERY` upstream.
-5. R2 receives `REPLY` from R3 with metric $\infty$.
-6. **Observed upstream behavior:** R2 logs `Metric change: increase` and triggers `FSM event DINC`. R2 continuously emits queries to R1 every few milliseconds. R1 replies; R2 immediately queries again. R2 CPU reaches 100% in `eigrp_fsm_event()`.
-7. **Expected RFC 7868 behavior:** R2 marks R3's reply received, decrements `prefix->rij->count`, waits for remaining replies (if any), logs `All reply received`, processes `LR`, and transitions to `PASSIVE`.
-
-#### Minimal Programmatic Reproduction Test Case (C / UUT)
-Execute the query storm scenario from the UUT emulator harness:
-```bash
-make -C src/upstream/eigrp/eigrp/test/uut SCENARIOS=mesh-topology/scenario-k6-e-query-storm-watch.yaml
-```
-In unpatched upstream code:
-- When a link/prefix withdrawal occurs, `validate-packet` asserts that delivered queries per neighbor group must not exceed 3 (`max_per_group: 3`).
-- Unpatched code generates recursive `DINC` transitions on each incoming `REPLY`, causing the query counter to rapidly exceed 3 and fail with unbounded diffusing queries.
-With the patch applied, replies only decrement `prefix->rij->count`, and the scenario passes cleanly.
-
-### 2.5 Code Patch
-Remove the erroneous `change == METRIC_INCREASE` evaluation from the `EIGRP_OPC_REPLY` branch in both `ACTIVE_1` and `ACTIVE_3`. Note that `EIGRP_OPC_UPDATE` already handles `METRIC_INCREASE` properly in both states (lines 531–536 and 595–600).
+### 2.4 Proposed Upstream Patch
+Once a neighbor sends any non-`INIT` `UPDATE` (`!(flags & EIGRP_INIT_FLAG)` with `sequence != 0`), its initial `INIT` exchange is complete. Advancing `nbr->peer_init_sequence_number` to a non-zero sentinel (`UINT32_MAX`) preserves `peer_init_previously_seen == true` while ensuring that a subsequent restart reusing `sequence = 1` triggers the `peer restarted` resynchronization path:
 
 ```diff
---- a/eigrp/code/eigrp_fsm.c
-+++ b/eigrp/code/eigrp_fsm.c
-@@ -522,11 +522,7 @@ eigrp_fsm_event_select(eigrp_fsm_action_message_t *msg)
- 				&prefix->destination, prefix->rij ? prefix->rij->count : 0,
- 				route->ei ? route->ei->ifindex : 0, 0, 0);
- 
--			if (change == METRIC_INCREASE
--			    && (route->flags
--				& EIGRP_ROUTE_DESCRIPTOR_SUCCESSOR_FLAG)) {
--				return EIGRP_FSM_EVENT_DINC;
--			} else if (prefix->rij->count) {
-+			if (prefix->rij->count) {
- 				return EIGRP_FSM_KEEP_STATE;
- 			} else {
- 				eigrp_log(EIGRP_LOG_INFO, "All reply received");
-@@ -590,11 +586,7 @@ eigrp_fsm_event_select(eigrp_fsm_action_message_t *msg)
- 				&prefix->destination, prefix->rij ? prefix->rij->count : 0,
- 				route->ei ? route->ei->ifindex : 0, 0, 0);
- 
--			if (change == METRIC_INCREASE
--			    && (route->flags
--				& EIGRP_ROUTE_DESCRIPTOR_SUCCESSOR_FLAG)) {
--				return EIGRP_FSM_EVENT_DINC;
--			} else if (prefix->rij->count) {
-+			if (prefix->rij->count) {
- 				return EIGRP_FSM_KEEP_STATE;
- 			} else {
- 				eigrp_log(EIGRP_LOG_INFO, "All reply received");
+--- a/eigrp/code/eigrp_update.c
++++ b/eigrp/code/eigrp_update.c
+@@ -156,6 +156,9 @@ void eigrp_update_receive(eigrp_instance_t *eigrp, eigrp_nbr_t *nbr,
+ 	 * that field tracks the most recently processed packet, not the INIT
+ 	 * for this adjacency.  An already accepted INIT must be ACKed, not
+ 	 * interpreted as a fresh peer restart or delivered to DUAL again. */
++	if (!(flags & EIGRP_INIT_FLAG) && ntohl(eigrph->sequence) != 0
++	    && nbr->peer_init_sequence_number != 0)
++		nbr->peer_init_sequence_number = UINT32_MAX;
+ 	if (flags == EIGRP_INIT_FLAG
+ 	    && ntohl(eigrph->sequence) != 0
+ 	    && nbr->peer_init_sequence_number == ntohl(eigrph->sequence)) {
 ```
 
 ---
 
-## 3. Defect 2: Self-Originated Route Feasibility Condition Collapse ($RD == FD$) During Periodic Topology Metric Updates
+## 3. Defect 2: Dual-Stack (`ipv4-unicast` + `ipv6-unicast`) Interface State Updates Clobber `ei->address` Across Address Families
 
 ### 3.1 Affected Source Location
-* **File:** [`src/upstream/eigrp/eigrp/code/eigrp_topology.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_topology.c)
-* **Functions & Exact Line Numbers:**
-  * [`eigrp_topology_route_select()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_topology.c#L328) (**Line 350**; diff hunk starting at line 347): Strict Reported Distance comparison (`route->reported_distance >= prefix->fdistance`) rejected self routes when $RD$ collapsed to equal $FD$.
-  * [`eigrp_topology_update_node_flags()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_topology.c#L1128) (**Line 1148** / line 1151; diff hunk starting at line 1148): Feasibility evaluation (`bool feasible = route->reported_distance < dest->fdistance;`) evaluated to `false` for self routes when $RD == FD$, stripping successor flags.
-  * [`eigrp_topology_metric_update()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_topology.c#L1245) (**Line 1261**; diff hunk starting at line 1258): Periodic metric sweep unconditionally recomputed `route->reported_distance = eigrp_metric_calculate(eigrp, route->reported_metric);`, overwriting $RD = 0$ with the interface metric ($RD = CD = FD$).
+* **Files & Functions:**
+  * [`src/upstream/eigrp/eigrp/code/eigrp_network.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_network.c#L323-L343) — [`eigrp_sys_intf_update()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_network.c#L323) (Lines 323–343)
+  * [`src/upstream/eigrp/eigrp/code/eigrp_interface.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_interface.c#L1200-L1207) — [`eigrp_intf_runtime_state_update()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_interface.c#L1182) (Lines 1200–1207) and [`eigrp_intf_runtime_update()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_interface.c#L1316) (Lines 1339–1345)
 
-### 3.2 RFC Standard Requirement
-* **RFC 7868 §5.1 (Basic Concepts) & §5.6.1 (Feasibility Condition)**:
-  * The Feasibility Condition (FC) requires that a candidate successor $N$ for destination $D$ satisfy:
-    $$RD(N, D) < FD(D)$$
-  * For routes originated locally by the router itself (connected interfaces, locally redistributed prefixes, and locally configured summary aggregates), the advertising router is `eigrp->neighbor_self`.
-  * The Reported Distance ($RD$) of a self-originated route to the local router is by definition **0**:
-    $$RD(\text{self}, D) \equiv 0$$
-  * A router always has a zero-cost reported path to its own interfaces. Consequently, a self-originated route must always satisfy feasibility as long as its composite distance is less than infinity ($CD < \infty$).
-
-### 3.3 Flawed Behavior & Event Sequence
-When connected interfaces or redistributed routes are initially initialized (e.g. in [`eigrp_interface.c:1495`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_interface.c#L1495) or [`eigrp_topology.c:763`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_topology.c#L763)), `route->reported_distance` is correctly initialized to 0.
-
-However, during routine operation, timer events or interface metric modifications trigger [`eigrp_topology_metric_update()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_topology.c#L1245):
+### 3.2 Flawed Behavior & Event Sequence
+In [`eigrp_network.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_network.c#L323-L343), `eigrp_sys_intf_update()` broadcasts host interface updates to every address-family instance in the VRF without checking whether `state->address.address.afi` matches `eigrp->af_vectors.afi`:
 
 ```c
-/* Upstream eigrp_topology.c line 1256-1266 */
+/* Upstream eigrp_network.c lines 334-342 */
+pthread_mutex_lock(&eigrp_process.hierarchy_lock);
+for (EIGRP_LIST_ITERATE_RO(eigrp_process.virt_router, vr_node, virt_router)) {
+    for (EIGRP_LIST_ITERATE_RO(virt_router->af_instance, af_node, eigrp)) {
+        if (eigrp->vrf_id != vrf_id || eigrp->shutdown)
+            continue;
+        (void)eigrp_instance_intf_update_event_enqueue(eigrp, state);
+    }
+}
+pthread_mutex_unlock(&eigrp_process.hierarchy_lock);
+```
+
+And if `eigrp_intf_runtime_update()` is invoked when an `eigrp_intf_t *ei` already exists for `state->ifindex` (`eigrp_intf_lookup_by_ifindex(eigrp, state->ifindex)`), [`eigrp_intf_runtime_state_update()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_interface.c#L1200-L1207) unconditionally overwrites `ei->address = state->address` even if `state->address.address.afi != eigrp->af_vectors.afi`.
+
+#### Failure Cascade:
+1. A router runs both `ipv4-unicast` and `ipv6-unicast` on the same interface (`ifindex = 5`).
+2. When the host shim reports an IPv6 link-local address update (`EIGRP_AFI_IPV6`) via `eigrp_sys_intf_update()`, the event is enqueued to both the IPv4 and IPv6 instances.
+3. If `eigrp_intf_runtime_update()` is called directly or via runtime state refresh, the IPv4 instance's `ei->address` is overwritten with the `EIGRP_AFI_IPV6` prefix (or vice versa), breaking source-address validation and connected prefix origination.
+
+### 3.3 Proposed Upstream Patch
+Filter `eigrp_sys_intf_update()` by `eigrp->af_vectors.afi == state->address.address.afi` and guard `ei->address` updates in `eigrp_intf_runtime_state_update()`:
+
+```diff
+--- a/eigrp/code/eigrp_network.c
++++ b/eigrp/code/eigrp_network.c
+@@ -334,7 +334,8 @@ void eigrp_sys_intf_update(
+ 	pthread_mutex_lock(&eigrp_process.hierarchy_lock);
+ 	for (EIGRP_LIST_ITERATE_RO(eigrp_process.virt_router, vr_node, virt_router)) {
+ 		for (EIGRP_LIST_ITERATE_RO(virt_router->af_instance, af_node, eigrp)) {
+-			if (eigrp->vrf_id != vrf_id || eigrp->shutdown)
++			if (eigrp->vrf_id != vrf_id || eigrp->shutdown
++			    || eigrp->af_vectors.afi != state->address.address.afi)
+ 				continue;
+ 			(void)eigrp_instance_intf_update_event_enqueue(eigrp, state);
+ 		}
+```
+
+---
+
+## 4. Defect 3: Self-Originated Route Feasibility Collapse ($RD == FD$) and Metric Miscalculation in `eigrp_topology_metric_update()`
+
+### 4.1 Affected Source Location
+* **File:** [`src/upstream/eigrp/eigrp/code/eigrp_topology.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_topology.c#L1245-L1283)
+* **Functions:**
+  * [`eigrp_topology_metric_update()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_topology.c#L1245) (Lines 1245–1283)
+  * [`eigrp_topology_route_select()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_topology.c#L331) (Lines 350–351)
+  * [`eigrp_topology_update_node_flags()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_topology.c#L1125) (Lines 1151–1157)
+
+### 4.2 RFC Standard Requirement
+* **RFC 7868 §5.1, §5.5, & §5.6.1**:
+  * Locally originated routes (`route->adv_router == eigrp->neighbor_self`, including connected interfaces and redistributed routes) have a Reported Distance of **0** ($RD = 0$) and always satisfy the Feasibility Condition ($RD < FD$).
+  * A locally connected subnet (`route->adv_router == eigrp->neighbor_self && route->ei != NULL`) has `hop_count = 0` and its composite metric is derived once from `route->ei->params.{bandwidth, delay, load, reliability}`.
+  * When advertising the best route for a prefix to neighbors, the outgoing `prefix->reported_metric` must reflect the local router's `best->total_metric` (which includes the ingress link cost for learned routes).
+
+### 4.3 Flawed Behavior & Event Sequence
+In [`eigrp_topology.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_topology.c#L1259-L1275):
+
+```c
+/* Upstream eigrp_topology.c lines 1259-1275 */
 for (route = eigrp_topology_route_iterator_first(prefix, &iterator); route;
      route = eigrp_topology_route_iterator_next(&iterator)) {
-    route->reported_distance = eigrp_metric_calculate(eigrp, route->reported_metric); /* <-- Line 1261 */
+    route->reported_distance = eigrp_metric_calculate(eigrp, route->reported_metric);
     if (route->ei)
         route->distance = eigrp_metric_total_calculate(eigrp, route);
     else
         route->distance = eigrp_metric_calculate(eigrp, route->total_metric);
 }
-```
-
-#### Failure Cascade:
-1. For self-originated routes, `route->reported_metric` holds the local interface metric vector (e.g. 100 Mbps bandwidth, 10 delay).
-2. Line 1261 unconditionally recalculates `route->reported_distance = eigrp_metric_calculate(eigrp, route->reported_metric)`.
-3. Because the local interface metric equals the reported metric, `route->reported_distance` is set equal to `route->distance` ($RD = CD$).
-4. When `prefix->fdistance` is updated to the best route distance, $FD = CD$, meaning:
-   $$RD == FD$$
-5. Next, [`eigrp_topology_update_node_flags()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_topology.c#L1128) evaluates feasibility at Line 1151:
-   ```c
-   bool feasible = route->reported_distance < dest->fdistance;
-   ```
-   Because $RD == FD$, the strict inequality evaluates to **`false`**!
-6. In [`eigrp_topology_route_select()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_topology.c#L328) at Line 350:
-   ```c
-   if (route->reported_distance >= prefix->fdistance)
-       continue;
-   ```
-   The self-originated route is rejected!
-7. **Outcome:** The local router strips `EIGRP_ROUTE_DESCRIPTOR_SUCCESSOR_FLAG` from its own connected or redistributed interfaces, withdraws the route from the host RIB, and enters DUAL Active state or drops the prefix entirely.
-
-### 3.4 Reproduction Instructions & Minimal Topology
-
-#### Topology
-Single OpenEIGRP node with a loopback or physical interface:
-```
-[ Router R1 ] eth0: 192.168.1.1/24 (bandwidth 1000000, delay 10)
-```
-
-#### Steps to Reproduce
-1. Start OpenEIGRP on R1 enabling `ipv4-unicast` on `eth0`.
-2. Inspect topology table: `192.168.1.0/24` has $FD = 1310720$, $RD = 0$, Successor = 1 (Passive).
-3. Trigger a metric update (e.g., change interface delay, bandwidth, or invoke `eigrp_topology_metric_update(&eigrp)`).
-4. Inspect topology table again.
-5. **Observed upstream behavior:** $RD$ becomes $1310720$ ($RD == FD$). Route flags drop successor status (`successors: 0`). The route is withdrawn from the kernel/RIB.
-6. **Expected RFC 7868 behavior:** Self-originated routes maintain $RD = 0$. The route remains a valid Feasible Successor and active Successor.
-
-#### Minimal Programmatic Reproduction Test Case (C)
-```c
-void test_reproduce_self_originated_fc_collapse(eigrp_instance_t *eigrp)
-{
-    /* 1. Locate self-originated connected route */
-    prefix = eigrp_topology_table_lookup_ipv4(eigrp, "192.168.1.0/24");
-    route = prefix->internal_routes->head->data;
-    assert(route->adv_router == eigrp->neighbor_self);
-    assert(route->reported_distance == 0);
-    assert(route->flags & EIGRP_ROUTE_DESCRIPTOR_SUCCESSOR_FLAG);
-
-    /* 2. Execute periodic topology metric refresh */
-    eigrp_topology_metric_update(eigrp);
-
-    /* 3. In unpatched upstream:
-     * Line 1261 sets route->reported_distance = 1310720.
-     * Line 1151 evaluates route->reported_distance < dest->fdistance (1310720 < 1310720 => false).
-     * Line 350 rejects route in eigrp_topology_route_select().
-     */
-    assert(route->reported_distance == 0); /* FAILS in unpatched: route->reported_distance == 1310720 */
-    assert(route->flags & EIGRP_ROUTE_DESCRIPTOR_SUCCESSOR_FLAG); /* FAILS in unpatched: flags == 0 */
+eigrp_topology_route_queue_resort(prefix->internal_routes);
+eigrp_topology_route_queue_resort(prefix->external_routes);
+best = eigrp_topology_route_read(prefix);
+if (best) {
+    prefix->distance = best->distance;
+    prefix->fdistance = best->distance;
+    prefix->rdistance = best->reported_distance;
+    prefix->reported_metric = best->reported_metric;
 }
 ```
 
-### 3.5 Code Patch
-Preserve $RD = 0$ for routes where `adv_router == eigrp->neighbor_self`, exempt self routes in `eigrp_topology_update_node_flags()`, and permit $RD == 0$ in `eigrp_topology_route_select()`:
+When an interface bandwidth/delay or K-value is modified at runtime and `eigrp_topology_metric_update()` executes, four separate bugs occur:
+1. **Self-Originated Feasibility Collapse ($RD == FD$)**: Line 1261 overwrites `route->reported_distance` (which was `0` for `neighbor_self`) with `eigrp_metric_calculate(eigrp, route->reported_metric)`. For a local route, `reported_distance` becomes equal to `distance` ($RD == FD$), causing `eigrp_topology_update_node_flags()` (`route->reported_distance < dest->fdistance`) and `eigrp_topology_route_select()` (`route->reported_distance >= prefix->fdistance`) to strip `EIGRP_ROUTE_DESCRIPTOR_SUCCESSOR_FLAG` from the router's own connected and redistributed routes.
+2. **Connected Route Delay Double-Counting & Hop Increment**: For a connected route (`route->adv_router == eigrp->neighbor_self && route->ei != NULL`), line 1263 calls `eigrp_metric_total_calculate(eigrp, route)`. That function starts from `route->reported_metric` (which already contains the interface's initial delay), **adds** `eigrp_delay_to_scaled(ei->params.delay)` a second time, increments `hop_count++` on a local 0-hop subnet, and fails to update `route->reported_metric` if `ei->params.delay` was reduced or `ei->params.bandwidth` was increased.
+3. **Redistributed Seed Delay Unscaled During Metric Sweep**: For locally redistributed external routes (`!route->ei && route->adv_router == eigrp->neighbor_self`), `eigrp_topology_redistributed_route_update()` stores `route->total_metric.delay` in raw 10-microsecond units and computes initial distance via `eigrp_topology_redistributed_distance()` (which scales delay via `eigrp_delay_to_scaled()`). However, line 1265 calls `eigrp_metric_calculate(eigrp, route->total_metric)` directly without `eigrp_topology_redistributed_distance()`, causing the redistributed route's distance to drop by $256\times$ on the delay component during any metric sweep.
+4. **Outgoing Advertised Metric Missing Ingress Link Cost**: Line 1274 sets `prefix->reported_metric = best->reported_metric` instead of `best->total_metric`, causing outgoing Updates for neighbor-learned routes to advertise the upstream neighbor's reported metric without the local router's ingress link cost.
 
+### 4.4 Proposed Upstream Patch
 ```diff
 --- a/eigrp/code/eigrp_topology.c
 +++ b/eigrp/code/eigrp_topology.c
-@@ -347,7 +342,8 @@ eigrp_topology_route_select(eigrp_prefix_descriptor_t *prefix)
- 		for (EIGRP_LIST_ITERATE_RO(routes, node, route)) {
- 			if (route->distance == EIGRP_MAX_METRIC)
- 				continue;
--			if (route->reported_distance >= prefix->fdistance)
-+			if (route->reported_distance >= prefix->fdistance
-+			    && route->reported_distance != 0)
- 				continue;
- 			return route;
- 		}
-@@ -1148,7 +1144,8 @@ void eigrp_topology_update_node_flags(eigrp_instance_t *eigrp,
- 
- 	for (EIGRP_LIST_ITERATE_RO(eligible, node, route)) {
- 		uint32_t old_flags = route->flags;
--		bool feasible = route->reported_distance < dest->fdistance;
-+		bool is_self = (eigrp->neighbor_self != NULL && route->adv_router == eigrp->neighbor_self);
-+		bool feasible = (route->reported_distance < dest->fdistance) || is_self;
- 		bool within_variance =
- 			route->distance != EIGRP_MAX_METRIC
- 			&& (uint64_t)route->distance
-@@ -1258,7 +1255,10 @@ void eigrp_topology_metric_update(eigrp_instance_t *eigrp)
+@@ -1257,11 +1257,34 @@ void eigrp_topology_metric_update(eigrp_instance_t *eigrp)
+ 		if (!prefix || prefix->state != EIGRP_FSM_STATE_PASSIVE)
  			continue;
  		for (route = eigrp_topology_route_iterator_first(prefix, &iterator); route;
  		     route = eigrp_topology_route_iterator_next(&iterator)) {
 -			route->reported_distance = eigrp_metric_calculate(eigrp, route->reported_metric);
-+			if (route->adv_router == eigrp->neighbor_self)
+-			if (route->ei)
+-				route->distance = eigrp_metric_total_calculate(eigrp, route);
+-			else
+-				route->distance = eigrp_metric_calculate(eigrp, route->total_metric);
++			if (route->adv_router == eigrp->neighbor_self) {
 +				route->reported_distance = 0;
-+			else
++				if (route->metric.delay == EIGRP_MAX_METRIC) {
++					route->distance = EIGRP_MAX_METRIC;
++				} else if (route->ei && route->type == eigrp->af_vectors.classic_internal_tlv_type) {
++					eigrp_metrics_t m = {0};
++					m.bandwidth = eigrp_bandwidth_to_scaled(route->ei->params.bandwidth);
++					m.delay = eigrp_delay_to_scaled(route->ei->params.delay);
++					m.load = route->ei->params.load;
++					m.reliability = route->ei->params.reliability;
++					m.mtu[0] = 0xDC;
++					m.mtu[1] = 0x05;
++					route->metric = m;
++					route->reported_metric = m;
++					route->total_metric = m;
++					route->distance = eigrp_metric_calculate(eigrp, m);
++				} else if (!route->ei && route->type == eigrp->af_vectors.classic_external_tlv_type) {
++					route->distance = eigrp_topology_redistributed_distance(eigrp, &route->metric);
++				} else {
++					route->distance = eigrp_metric_calculate(eigrp, route->total_metric);
++				}
++			} else {
 +				route->reported_distance = eigrp_metric_calculate(eigrp, route->reported_metric);
- 			if (route->ei)
- 				route->distance = eigrp_metric_total_calculate(eigrp, route);
- 			else
++				if (route->ei)
++					route->distance = eigrp_metric_total_calculate(eigrp, route);
++				else
++					route->distance = eigrp_metric_calculate(eigrp, route->total_metric);
++			}
+ 		}
+ 		eigrp_topology_route_queue_resort(prefix->internal_routes);
+ 		eigrp_topology_route_queue_resort(prefix->external_routes);
+@@ -1269,8 +1292,8 @@ void eigrp_topology_metric_update(eigrp_instance_t *eigrp)
+ 		if (best) {
+ 			prefix->distance = best->distance;
+ 			prefix->fdistance = best->distance;
+-			prefix->rdistance = best->reported_distance;
+-			prefix->reported_metric = best->reported_metric;
++			prefix->rdistance = best->distance;
++			prefix->reported_metric = best->total_metric;
+ 		}
+ 		eigrp_topology_update_node_flags(eigrp, prefix);
 ```
 
 ---
 
-## 4. Defect 3: Throughput Bottleneck Calculation Inversion in Composite Metric Selection ($CD < RD$)
-
-### 4.1 Affected Source Location
-* **File:** [`src/upstream/eigrp/eigrp/code/eigrp_metric.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_metric.c#L160-L175)
-* **Function:** [`eigrp_metric_total_calculate()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_metric.c#L139)
-* **Upstream Line Numbers:** Line 169 (diff chunk lines 168–171)
-
-### 4.2 RFC Standard Requirement
-* **RFC 7868 §5.5 (Metric Calculation) & §5.5.1.1 (Throughput)**:
-  * Path throughput is governed by the minimum bandwidth link along the path from source to destination:
-    $$\text{Path Bandwidth} = \min(\text{Interface Bandwidth}, \text{Reported Path Bandwidth})$$
-  * In EIGRP's metric scalar representation ([`eigrp_metric.c:57`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_metric.c#L57)), the stored bandwidth metric is inversely proportional to physical link rate:
-    $$\text{scaled\_bandwidth} = \frac{10^7 \times 256}{\text{bandwidth\_kbps}}$$
-  * Therefore:
-    * A **higher bandwidth** link (e.g. 10 Gbps) produces a **smaller** scaled metric value.
-    * A **lower bandwidth** link (a bottleneck, e.g. 100 Mbps) produces a **larger** scaled metric value.
-  * To select the bottleneck (lowest physical throughput), the metric calculation **MUST take the MAXIMUM scaled bandwidth value**:
-    $$\text{total.bandwidth} = \max(\text{interface.scaled\_bandwidth}, \text{entry.scaled\_bandwidth})$$
-  * **RFC 7868 §5.6.1 (Monotonicity Requirement):**
-    The calculated composite distance ($CD$) through neighbor $N$ must always satisfy $CD \ge RD(N)$. A router can never have a distance to destination through neighbor $N$ that is strictly less than $N$'s advertised distance to that destination.
-
-### 4.3 Flawed Behavior & Event Sequence
-In upstream [`eigrp_metric.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_metric.c) at line 169:
-
-```c
-/* Upstream eigrp_metric.c lines 168-171 */
-bw = eigrp_bandwidth_to_scaled(ei->params.bandwidth);
-entry->total_metric.bandwidth = entry->total_metric.bandwidth > bw
-                    ? bw
-                    : entry->total_metric.bandwidth;
-```
-
-#### Failure Cascade:
-1. Suppose a route traverses a remote 10 Mbps bottleneck link. The reported scaled bandwidth is $256{,}000$.
-2. The route is received locally across a 1 Gbps link (`ei->params.bandwidth` = 1,000,000 kbps), giving `bw` = $2{,}560$.
-3. Upstream checks: `entry->total_metric.bandwidth > bw` ($256{,}000 > 2{,}560$), which is `true`.
-4. It sets `entry->total_metric.bandwidth = bw` ($2{,}560$)!
-5. By choosing the smaller scalar, the algorithm selected the **1 Gbps link rate** rather than the **10 Mbps bottleneck**!
-6. When `eigrp_metric_calculate()` computes the composite metric:
-   $$\text{throughput} = K_1 \times \text{metric.bandwidth} \times \text{scale}$$
-   The calculated composite throughput uses 1 Gbps instead of 10 Mbps.
-7. If the incoming link delay is small, the router computes a Total Distance ($CD$) that is **smaller than the Reported Distance ($RD$)** from the neighbor:
-   $$CD < RD$$
-8. This directly violates distance-vector monotonicity, corrupts equal-cost and unequal-cost multi-path (UCMP) variance calculations, and causes incorrect summary route metrics.
-9. **Direct Impact in Test Suite:** In the UUT test `scenario-summary-static-metric.yaml` (summary route `10.30.0.0/16` with configured seed bandwidth 500,000 kbps received over a 100,000 kbps link), the flawed calculation selected the 500 Mbps metric instead of the 100 Mbps bottleneck, producing an erroneous metric of `2094080` instead of the mathematically correct `7336960` (differing by exactly $(25600 - 5120) \times 256 = 5{,}242{,}880$).
-
-### 4.4 Reproduction Instructions & Minimal Topology
-
-#### Topology
-```
-[R1] ---- (100 Mbps, delay 10) ---- [R2] ---- (1 Gbps, delay 10) ---- [R3: 10.50.0.0/24]
-```
-
-#### Steps to Reproduce
-1. Configure R3 to advertise `10.50.0.0/24` with 1 Gbps bandwidth, delay 10.
-2. Link R2-R3 has 1 Gbps bandwidth.
-3. Link R1-R2 has 100 Mbps bandwidth (`bandwidth 100000`).
-4. On R1, inspect `show eigrp topology 10.50.0.0/24`.
-5. **Observed upstream behavior:** R1's total bandwidth metric shows $2{,}560$ (the 1 Gbps rate) instead of $25{,}600$ (the 100 Mbps bottleneck).
-6. **Expected RFC 7868 behavior:** The end-to-end path throughput must be constrained by the 100 Mbps bottleneck link ($25{,}600$).
-
-#### Minimal Programmatic Reproduction Test Case (C / UUT)
-Run the summary static metric UUT integration test:
-```bash
-make -C src/upstream/eigrp/eigrp/test/uut SCENARIOS=summary-topology/scenario-summary-static-metric.yaml
-```
-In C unit test format:
-```c
-void test_reproduce_bottleneck_inversion(eigrp_instance_t *eigrp)
-{
-    eigrp_intf_t ei;
-    ei.params.bandwidth = 100000; /* 100 Mbps incoming interface */
-
-    eigrp_route_descriptor_t entry;
-    memset(&entry, 0, sizeof(entry));
-    /* Upstream advertised 500 Mbps path */
-    entry.total_metric.bandwidth = eigrp_bandwidth_to_scaled(500000); /* 5120 */
-
-    uint32_t bw = eigrp_bandwidth_to_scaled(ei.params.bandwidth); /* 25600 */
-
-    /* In unpatched eigrp_metric.c:169: */
-    entry.total_metric.bandwidth = entry.total_metric.bandwidth > bw
-                                     ? bw
-                                     : entry.total_metric.bandwidth;
-
-    /* Flawed code evaluates (5120 > 25600) -> false, preserving 5120 (500 Mbps)! */
-    assert(entry.total_metric.bandwidth == 25600); /* FAILS in unpatched: was 5120 */
-}
-```
-
-### 4.5 Code Patch
-Invert the condition so that the larger scaled bandwidth value (minimum physical throughput) is retained:
-
-```diff
---- a/eigrp/code/eigrp_metric.c
-+++ b/eigrp/code/eigrp_metric.c
-@@ -166,7 +166,7 @@ eigrp_metric_t eigrp_metric_total_calculate(eigrp_instance_t *eigrp,
- 		entry->total_metric.delay = EIGRP_METRIC_MAX;
- 
- 	bw = eigrp_bandwidth_to_scaled(ei->params.bandwidth);
--	entry->total_metric.bandwidth = entry->total_metric.bandwidth > bw
-+	entry->total_metric.bandwidth = (bw > entry->total_metric.bandwidth)
- 						? bw
- 						: entry->total_metric.bandwidth;
-```
-
----
-
-## 5. Defect 4: Query Origin Deadlock Trapping FSM Active State in Reply-Status Table (`query_rij`)
+## 5. Defect 4: Topology-Level `maximum-prefix` Admission (`eigrp_topology_prefix_admit`) Never Called by TLV Decoders and Counts Poisoned Nodes
 
 ### 5.1 Affected Source Location
-* **File:** [`src/upstream/eigrp/eigrp/code/eigrp_packetizer.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_packetizer.c#L329-L345)
-* **Function:** [`eigrp_packetizer_query_rij_add()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_packetizer.c#L329)
-* **Upstream Line Numbers:** Line 338 (diff chunk lines 338–344)
+* **Files & Functions:**
+  * [`src/upstream/eigrp/eigrp/code/eigrp_topology.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_topology.c#L2273-L2315) — [`eigrp_topology_prefix_count()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_topology.c#L2273) and [`eigrp_topology_prefix_admit()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_topology.c#L2287) (Lines 2273–2315)
+  * [`src/upstream/eigrp/eigrp/code/eigrp_tlv1.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_tlv1.c) & [`src/upstream/eigrp/eigrp/code/eigrp_tlv2.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_tlv2.c)
 
-### 5.2 RFC Standard Requirement
-* **RFC 7868 §3.5 & §5.3.1 (Diffusing Computations)**:
-  * When router $i$ receives a `QUERY` packet from neighbor $k$ regarding destination $j$, neighbor $k$ is designated as the **query origin** (`prefix->query_origin = k`).
-  * Router $i$ transitions to Active state ($o_{ij} = 1$) and diffuses queries to all eligible neighbors **excluding neighbor $k$**.
-  * Router $i$ must build its reply expectations ($r_{ij}$) consisting solely of the neighbors to which it sent queries.
-  * Neighbor $k$ is awaiting a reply from router $i$; neighbor $k$ **will NEVER send a reply to router $i$**.
-  * Therefore, neighbor $k$ must **never** be added to $r_{ij}$ (`prefix->rij`).
+### 5.2 Flawed Behavior & Event Sequence
+1. **Uncalled Admission Function:** Upstream defines `eigrp_topology_prefix_admit(eigrp_instance_t *runtime, const eigrp_prefix_t *prefix)` in `eigrp_topology.c` to enforce the instance/topology-level `maximum-prefix` configuration (`af->topology_maximum_prefix`), log threshold warnings, and emit `EIGRP_EVENTLOG_OPCODE_PREFIX_LIMIT_REJECT`. However, **nothing in `eigrp/code/` ever calls `eigrp_topology_prefix_admit()`**—the TLV1 and TLV2 decoders only call `eigrp_nbr_prefix_admit(eigrp, nbr, &dest)` (which checks per-neighbor `maximum-prefix`).
+2. **Poisoned Entries Counted Against Limit:** `eigrp_topology_prefix_count()` counts every non-NULL `node->info` in `runtime->topology_table`, including poisoned/unreachable prefixes (`distance == EIGRP_MAX_METRIC` or `metric.delay == EIGRP_MAX_METRIC`) that are being withdrawn.
 
-### 5.3 Flawed Behavior & Event Sequence
-In upstream [`eigrp_packetizer.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_packetizer.c) at line 338:
-
-```c
-/* Upstream eigrp_packetizer.c lines 329-344 */
-static void eigrp_packetizer_query_rij_add(eigrp_prefix_descriptor_t *prefix,
-                        eigrp_intf_t *ei)
-{
-    eigrp_nbr_t *nbr;
-    eigrp_list_item_t *node;
-
-    if (!prefix || !prefix->rij || !ei)
-        return;
-
-    for (EIGRP_LIST_ITERATE_RO(ei->nbrs, node, nbr)) {
-        if (nbr->state != EIGRP_NEIGHBOR_UP)
-            continue;
-        /* DEFECT: Missing check for prefix->query_origin */
-        eigrp_fsm_reply_status_add(prefix, nbr);
-    }
-}
-```
-
-#### Failure Cascade:
-1. In multi-access networks (e.g., Ethernet segments with multiple peers) or topologies where interfaces share broadcast domains, Router A receives a `QUERY` from Router B.
-2. Router A enters `ACTIVE_2` or `ACTIVE_3`, sets `prefix->query_origin = Router_B`, and schedules outgoing queries.
-3. During query packetization, [`eigrp_packetizer_query_rij_add()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_packetizer.c#L329) iterates over all neighbors on the interface (`ei->nbrs`).
-4. Because there is no check for `prefix->query_origin`, Router B is added to `prefix->rij`.
-5. Router A transmits queries to the segment and awaits replies from all neighbors in `prefix->rij`, including Router B.
-6. Router B never sends a reply to Router A because Router B is the query origin waiting for Router A's reply.
-7. Router A remains stuck in Active state waiting for Router B forever.
-8. **Outcome:** When the Stuck-In-Active (SIA) timer expires (default: 180 seconds), Router A transmits `SIA-QUERY`, fails to clear the adjacency, resets the neighbor relationship, and drops all routes associated with Router B.
-
-### 5.4 Reproduction Instructions & Minimal Topology
-
-#### Topology
-```
-           [Router B] (Query Originator)
-               |
-        --- Shared LAN Segment (eth0) ---
-         |                             |
-     [Router A]                    [Router C]
-```
-
-#### Steps to Reproduce
-1. Connect Routers A, B, and C to a shared Ethernet broadcast network.
-2. Router B originates a query for prefix `172.16.1.0/24`.
-3. Router A receives the query from Router B. Router A has no Feasible Successor and enters Active state.
-4. Inspect `show eigrp topology 172.16.1.0/24` on Router A.
-5. **Observed upstream behavior:** Under `Replies expected:`, Router A lists both Router C and Router B! Even after Router C replies, Router A remains in Active state with 1 outstanding reply expected from Router B until SIA timeout.
-6. **Expected RFC 7868 behavior:** Under `Replies expected:`, only Router C is listed. When Router C replies, Router A completes active computation and sends its `REPLY` to Router B.
-
-#### Minimal Programmatic Reproduction Test Case (C)
-```c
-void test_reproduce_query_origin_deadlock(eigrp_instance_t *eigrp)
-{
-    eigrp_prefix_descriptor_t *prefix = eigrp_topology_prefix_create(...);
-    prefix->rij = eigrp_list_create();
-
-    eigrp_intf_t *ei = ...;
-    eigrp_nbr_t *nbr_b = ...; /* Query originator */
-    eigrp_nbr_t *nbr_c = ...; /* Other neighbor */
-    prefix->query_origin = nbr_b;
-
-    /* Upstream call without origin filtering */
-    eigrp_packetizer_query_rij_add(prefix, ei);
-
-    /* In unpatched upstream:
-     * nbr_b is added to prefix->rij.
-     * prefix->rij->count == 2.
-     */
-    assert(prefix->rij->count == 1); /* FAILS in unpatched: was 2 */
-    assert(eigrp_list_lookup(prefix->rij, nbr_b) == NULL); /* FAILS in unpatched */
-}
-```
-
-### 5.5 Code Patch
-Filter out `prefix->query_origin` when populating the reply status table:
+### 5.3 Proposed Upstream Patch
+Invoke `eigrp_topology_prefix_admit()` from `eigrp_nbr_prefix_admit()` (or directly in the TLV1/TLV2 decoders alongside `eigrp_nbr_prefix_admit()`), and ignore unreachable (`EIGRP_MAX_METRIC`) entries when counting active topology prefixes:
 
 ```diff
---- a/eigrp/code/eigrp_packetizer.c
-+++ b/eigrp/code/eigrp_packetizer.c
-@@ -338,6 +338,8 @@ static void eigrp_packetizer_query_rij_add(eigrp_prefix_descriptor_t *prefix,
- 	for (EIGRP_LIST_ITERATE_RO(ei->nbrs, node, nbr)) {
- 		if (nbr->state != EIGRP_NEIGHBOR_UP)
- 			continue;
-+		if (prefix->query_origin && nbr == prefix->query_origin)
+--- a/eigrp/code/eigrp_topology.c
++++ b/eigrp/code/eigrp_topology.c
+@@ -2278,10 +2278,15 @@ static uint32_t eigrp_topology_prefix_count(eigrp_instance_t *runtime)
+ 	if (!runtime || !runtime->topology_table)
+ 		return 0;
+ 	for (node = eigrp_table_first(runtime->topology_table); node;
+-	     node = eigrp_table_next(node))
+-		if (node->info)
++	     node = eigrp_table_next(node)) {
++		eigrp_prefix_descriptor_t *pfx = node->info;
++		if (!pfx)
 +			continue;
- 		eigrp_fsm_reply_status_add(prefix, nbr);
- 	}
++		eigrp_route_descriptor_t *best = eigrp_topology_route_read(pfx);
++		if (best && best->distance != EIGRP_MAX_METRIC
++		    && best->metric.delay != EIGRP_MAX_METRIC)
+ 			count++;
++	}
+ 	return count;
  }
 ```
 
 ---
 
-## 6. Defect 5: Redundant Delay Metric Scaling on Redistribution Route Ingestion
+## 6. Defect 5: Summary Route Component Selection (Split-Horizon, Metric, and Origin) & Suppressed-Component Query Handling
 
 ### 6.1 Affected Source Location
-* **File:** [`src/upstream/eigrp/eigrp/code/eigrp_topology.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_topology.c#L147-L162)
-* **Function:** [`eigrp_topology_redistributed_distance()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_topology.c#L147)
-* **Upstream Line Numbers:** Line 156 (diff chunk lines 156–161)
+* **File:** [`src/upstream/eigrp/eigrp/code/eigrp_summary.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_summary.c#L221-L330)
+* **Functions:**
+  * [`eigrp_summary_route_build()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_summary.c#L221) (Lines 221–294)
+  * [`eigrp_summary_query_route_build()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_summary.c#L297) (Lines 297–330)
 
-### 6.2 RFC Standard Requirement
-* **RFC 7868 §5.5 (Metric Calculation)**:
-  * Internal topology calculations and redistribution seed metrics must maintain internal consistency and idempotency.
-  * In the OpenEIGRP architecture:
-    * Vector metric structures store bandwidth and delay in normalized units.
-    * When [`eigrp_topology_metric_update()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_topology.c#L1245) recalculates distances for external/redistributed routes (where `route->ei == NULL`), it executes:
-      ```c
-      route->distance = eigrp_metric_calculate(eigrp, route->total_metric);
-      ```
-  * The initial distance assigned when a route is imported through [`eigrp_topology_redistributed_route_update()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_topology.c#L722) **must exactly match** the distance computed by subsequent sweeps of [`eigrp_topology_metric_update()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_topology.c#L1245).
+### 6.2 Flawed Behavior & Event Sequence
+1. **Component Route Copied Verbatim into Summary Route (`eigrp_summary_route_build`)**:
+   - At lines 261–275, `eigrp_summary_route_build()` finds `best_route` among covered components and executes `*summary_route = *best_route` and `summary_prefix->reported_metric = summary_route->metric`.
+   - If `best_route` was learned from an EIGRP neighbor, `best_route->metric` is the neighbor's *reported* metric (without the local router's ingress link cost), whereas `best_route->total_metric` is the local composite metric vector.
+   - If `best_route` was redistributed (`type == classic_external_tlv_type`), `summary_route` inherits the external TLV type instead of `classic_internal_tlv_type`, and retains the component's `ei` and `adv_router` instead of `adv_router = eigrp->neighbor_self` and `ei = NULL`.
+   - When selecting candidate components for summary advertisement on interface `ei`, lines 251–269 do not skip component routes learned from a neighbor on that same outgoing interface `ei` (`candidate_route->ei == ei && candidate_route->adv_router != eigrp->neighbor_self`), nor do they skip components with `candidate->distance == EIGRP_MAX_METRIC`.
+2. **Queries for Suppressed Component Prefixes (`eigrp_summary_query_route_build`)**:
+   - In `eigrp_summary_query_route_build()` (lines 311–315), the function only matches when `destination` equals the configured summary aggregate prefix itself (`eigrp_summary_prefix_match(&configured->prefix, destination)`).
+   - When a component prefix covered by an active summary on `ei` (and not permitted by a `leak-map`) is queried or transitions state, `eigrp_summary_query_route_build()` returns `false` instead of building an unreachable (`EIGRP_MAX_METRIC`) response for the suppressed component on `ei`.
 
-### 6.3 Flawed Behavior & Event Sequence
-In upstream [`eigrp_topology.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_topology.c) at line 156:
-
-```c
-/* Upstream eigrp_topology.c lines 147-161 */
-static eigrp_metric_t eigrp_topology_redistributed_distance(
-	eigrp_instance_t *eigrp, const eigrp_metrics_t *metric)
-{
-	eigrp_metrics_t calculation;
-	eigrp_metric_t distance;
-
-	if (!eigrp || !metric)
-		return EIGRP_MAX_METRIC;
-	if (metric->delay == EIGRP_MAX_METRIC)
-		return EIGRP_MAX_METRIC;
-
-	calculation = *metric;
-	/* DEFECT: Redundant scaling applied here at Line 156 */
-	calculation.delay = eigrp_delay_to_scaled(calculation.delay);
-	distance = eigrp_metric_calculate(eigrp, calculation);
-	return distance > EIGRP_MAX_METRIC ? EIGRP_MAX_METRIC : distance;
-}
-```
-
-#### Failure Cascade:
-1. A static, BGP, or OSPF route is redistributed into EIGRP with a seed metric (e.g. bandwidth = 100000 kbps, delay = 100 in 10-microsecond units).
-2. During initial import via `eigrp_topology_redistributed_route_update()`, line 751 calls `eigrp_topology_redistributed_distance()`.
-3. `calculation.delay = eigrp_delay_to_scaled(calculation.delay)` multiplies delay by 256 ($100 \times 256 = 25{,}600$).
-4. `eigrp_metric_calculate()` computes the distance using this $25{,}600$ value, giving an initial distance $D_1 \approx 6{,}579{,}200$.
-5. However, `route->total_metric` is saved as `*metric` (with unscaled delay = 100).
-6. Moments later, the periodic timer or topology sweep invokes `eigrp_topology_metric_update()`.
-7. For this redistributed route (`!route->ei`), line 1265 executes:
-   ```c
-   route->distance = eigrp_metric_calculate(eigrp, route->total_metric);
-   ```
-8. Because `route->total_metric.delay` is 100 (not scaled by 256), the newly calculated distance $D_2 \approx 51{,}200$ is dramatically lower than $D_1$:
-   $$D_2 \ll D_1$$
-9. **Outcome:** Redistributed routes experience instantaneous metric collapse upon the first topology sweep. This unexpected metric shift causes spurious route updates to neighbors, flap damping penalties in downstream BGP/RIB, and inconsistent path selection.
-
-### 6.4 Reproduction Instructions & Minimal Topology
-
-#### Steps to Reproduce
-1. Configure OpenEIGRP with redistribution of static routes.
-2. Ingest static prefix `10.200.0.0/24` with default-metric `bandwidth 100000 delay 100 reliability 255 load 1 mtu 1500`.
-3. Record initial metric in topology table: $D_1$.
-4. Call `eigrp_topology_metric_update(&eigrp)` or wait for topology refresh.
-5. Record updated metric: $D_2$.
-6. **Observed upstream behavior:** $D_1 \neq D_2$. The metric shifts discontinuously between initial import and the first periodic sweep.
-7. **Expected RFC 7868 behavior:** $D_1 == D_2$. Metric calculation must remain invariant across periodic refreshes.
-
-#### Minimal Programmatic Reproduction Test Case (C)
-```c
-void test_reproduce_redistribution_metric_collapse(eigrp_instance_t *eigrp)
-{
-    eigrp_metrics_t seed = {
-        .bandwidth = 100000,
-        .delay = 100,
-        .reliability = 255,
-        .load = 1,
-        .mtu = 1500
-    };
-
-    /* 1. Initial redistribution ingestion */
-    eigrp_prefix_descriptor_t *prefix = ...;
-    eigrp_route_descriptor_t *route = eigrp_topology_redistributed_route_update(
-        eigrp, prefix, &seed);
-    eigrp_metric_t d1 = route->distance;
-
-    /* 2. Periodic topology sweep */
-    eigrp_topology_metric_update(eigrp);
-    eigrp_metric_t d2 = route->distance;
-
-    /* In unpatched upstream:
-     * d1 was calculated with calculation.delay = 100 * 256 = 25600.
-     * d2 was calculated with route->total_metric.delay = 100.
-     * d1 != d2.
-     */
-    assert(d1 == d2); /* FAILS in unpatched: d1 ~ 6579200 != d2 ~ 51200 */
-}
-```
-
-### 6.5 Code Patch
-Remove the redundant `calculation.delay = eigrp_delay_to_scaled(calculation.delay);` invocation:
-
-```diff
---- a/eigrp/code/eigrp_topology.c
-+++ b/eigrp/code/eigrp_topology.c
-@@ -156,11 +156,6 @@ static eigrp_metric_t eigrp_topology_redistributed_distance(
- 		return EIGRP_MAX_METRIC;
- 
- 	calculation = *metric;
--	/* Locally selected redistribution seed delay is retained in the native
--	 * route object in CLI/TLV 10-microsecond units.  The DUAL calculation
--	 * consumes scaled delay, matching eigrp_topology_update_distance().
--	 */
--	calculation.delay = eigrp_delay_to_scaled(calculation.delay);
- 	distance = eigrp_metric_calculate(eigrp, calculation);
- 	return distance > EIGRP_MAX_METRIC ? EIGRP_MAX_METRIC : distance;
- }
-```
+### 6.3 Proposed Upstream Patch
+Normalize `summary_route` fields in `eigrp_summary_route_build()` (excluding same-interface neighbor components and using `best_route->total_metric`, `adv_router = eigrp->neighbor_self`, `type = eigrp->af_vectors.classic_internal_tlv_type`), and in `eigrp_summary_query_route_build()` return a poisoned (`EIGRP_MAX_METRIC`) route when `eigrp_summary_covers(eigrp, ei, destination) && !eigrp_summary_specific_leak(eigrp, ei, destination)` (as implemented in [`src/cshim/srl_cshim_overrides.c:145-256`](file:///home/awhitaker/dev/srl-eigrp/src/cshim/srl_cshim_overrides.c#L145-L256)).
 
 ---
 
-## 7. Consolidated Unified Patch
+## 7. Defect 6: Query Origin Added to Reply-Status Table (`prefix->rij`) When `split-horizon` Is Disabled or on Shared Segments
 
-The complete diff against upstream commit [`81bcb88fc04f84e6d6ed3d7c25f6295ebf437331`](https://github.com/diivious/eigrp/commit/81bcb88fc04f84e6d6ed3d7c25f6295ebf437331) is shown below:
+### 7.1 Affected Source Location
+* **File:** [`src/upstream/eigrp/eigrp/code/eigrp_packetizer.c`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_packetizer.c#L332-L346)
+* **Function:** [`eigrp_packetizer_query_rij_add()`](file:///home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code/eigrp_packetizer.c#L332) (Lines 332–346)
 
+### 7.2 RFC Standard Requirement
+* **RFC 7868 §3.5 & §5.3.1 (Diffusing Computations)**:
+  * When router $i$ enters Active state in response to a `QUERY` from neighbor $k$ (`prefix->query_origin = k`), neighbor $k$ is waiting for a `REPLY` from router $i$ and must never be added to router $i$'s expected reply set (`prefix->rij`).
+
+### 7.3 Flawed Behavior & Event Sequence
+While `eigrp_packetizer_query_split_horizon()` (lines 325–330) suppresses sending a `QUERY` on `prefix->query_origin->ei` when `ei->split_horizon == true`, if `split-horizon` is disabled on the interface (`ei->split_horizon == false`) or if multiple EIGRP neighbors share a multi-access broadcast segment and a query is emitted on `ei`, `eigrp_packetizer_query_rij_add()` iterates all `UP` neighbors on `ei` without skipping `prefix->query_origin`:
+
+```c
+/* Upstream eigrp_packetizer.c lines 332-346 */
+static void eigrp_packetizer_query_rij_add(eigrp_prefix_descriptor_t *prefix,
+					    eigrp_intf_t *ei)
+{
+	eigrp_nbr_t *nbr;
+	eigrp_list_item_t *node;
+
+	if (!prefix || !prefix->rij || !ei)
+		return;
+
+	for (EIGRP_LIST_ITERATE_RO(ei->nbrs, node, nbr)) {
+		if (nbr->state != EIGRP_NEIGHBOR_UP)
+			continue;
+		eigrp_fsm_reply_status_add(prefix, nbr);
+	}
+}
+```
+
+### 7.4 Proposed Upstream Patch
 ```diff
-diff --git a/eigrp/code/eigrp_fsm.c b/eigrp/code/eigrp_fsm.c
-index 973ede8..4fc9ec2 100644
---- a/eigrp/code/eigrp_fsm.c
-+++ b/eigrp/code/eigrp_fsm.c
-@@ -522,11 +522,7 @@ eigrp_fsm_event_select(eigrp_fsm_action_message_t *msg)
- 				&prefix->destination, prefix->rij ? prefix->rij->count : 0,
- 				route->ei ? route->ei->ifindex : 0, 0, 0);
- 
--			if (change == METRIC_INCREASE
--			    && (route->flags
--				& EIGRP_ROUTE_DESCRIPTOR_SUCCESSOR_FLAG)) {
--				return EIGRP_FSM_EVENT_DINC;
--			} else if (prefix->rij->count) {
-+			if (prefix->rij->count) {
- 				return EIGRP_FSM_KEEP_STATE;
- 			} else {
- 				eigrp_log(EIGRP_LOG_INFO, "All reply received");
-@@ -590,11 +586,7 @@ eigrp_fsm_event_select(eigrp_fsm_action_message_t *msg)
- 				&prefix->destination, prefix->rij ? prefix->rij->count : 0,
- 				route->ei ? route->ei->ifindex : 0, 0, 0);
- 
--			if (change == METRIC_INCREASE
--			    && (route->flags
--				& EIGRP_ROUTE_DESCRIPTOR_SUCCESSOR_FLAG)) {
--				return EIGRP_FSM_EVENT_DINC;
--			} else if (prefix->rij->count) {
-+			if (prefix->rij->count) {
- 				return EIGRP_FSM_KEEP_STATE;
- 			} else {
- 				eigrp_log(EIGRP_LOG_INFO, "All reply received");
-diff --git a/eigrp/code/eigrp_metric.c b/eigrp/code/eigrp_metric.c
-index 9158959..8c01acb 100644
---- a/eigrp/code/eigrp_metric.c
-+++ b/eigrp/code/eigrp_metric.c
-@@ -166,7 +166,7 @@ eigrp_metric_t eigrp_metric_total_calculate(eigrp_instance_t *eigrp,
- 		entry->total_metric.delay = EIGRP_METRIC_MAX;
- 
- 	bw = eigrp_bandwidth_to_scaled(ei->params.bandwidth);
--	entry->total_metric.bandwidth = entry->total_metric.bandwidth > bw
-+	entry->total_metric.bandwidth = (bw > entry->total_metric.bandwidth)
- 						? bw
- 						: entry->total_metric.bandwidth;
- 
-diff --git a/eigrp/code/eigrp_packetizer.c b/eigrp/code/eigrp_packetizer.c
-index c266f94..6d90266 100644
 --- a/eigrp/code/eigrp_packetizer.c
 +++ b/eigrp/code/eigrp_packetizer.c
-@@ -338,6 +338,8 @@ static void eigrp_packetizer_query_rij_add(eigrp_prefix_descriptor_t *prefix,
+@@ -341,6 +341,8 @@ static void eigrp_packetizer_query_rij_add(eigrp_prefix_descriptor_t *prefix,
  	for (EIGRP_LIST_ITERATE_RO(ei->nbrs, node, nbr)) {
  		if (nbr->state != EIGRP_NEIGHBOR_UP)
  			continue;
@@ -678,213 +343,4 @@ index c266f94..6d90266 100644
  		eigrp_fsm_reply_status_add(prefix, nbr);
  	}
  }
-diff --git a/eigrp/code/eigrp_topology.c b/eigrp/code/eigrp_topology.c
-index 259600c..3e4d447 100644
---- a/eigrp/code/eigrp_topology.c
-+++ b/eigrp/code/eigrp_topology.c
-@@ -156,11 +156,6 @@ static eigrp_metric_t eigrp_topology_redistributed_distance(
- 		return EIGRP_MAX_METRIC;
- 
- 	calculation = *metric;
--	/* Locally selected redistribution seed delay is retained in the native
--	 * route object in CLI/TLV 10-microsecond units.  The DUAL calculation
--	 * consumes scaled delay, matching eigrp_topology_update_distance().
--	 */
--	calculation.delay = eigrp_delay_to_scaled(calculation.delay);
- 	distance = eigrp_metric_calculate(eigrp, calculation);
- 	return distance > EIGRP_MAX_METRIC ? EIGRP_MAX_METRIC : distance;
- }
-@@ -347,7 +342,8 @@ eigrp_topology_route_select(eigrp_prefix_descriptor_t *prefix)
- 		for (EIGRP_LIST_ITERATE_RO(routes, node, route)) {
- 			if (route->distance == EIGRP_MAX_METRIC)
- 				continue;
--			if (route->reported_distance >= prefix->fdistance)
-+			if (route->reported_distance >= prefix->fdistance
-+			    && route->reported_distance != 0)
- 				continue;
- 			return route;
- 		}
-@@ -1148,7 +1144,8 @@ void eigrp_topology_update_node_flags(eigrp_instance_t *eigrp,
- 
- 	for (EIGRP_LIST_ITERATE_RO(eligible, node, route)) {
- 		uint32_t old_flags = route->flags;
--		bool feasible = route->reported_distance < dest->fdistance;
-+		bool is_self = (eigrp->neighbor_self != NULL && route->adv_router == eigrp->neighbor_self);
-+		bool feasible = (route->reported_distance < dest->fdistance) || is_self;
- 		bool within_variance =
- 			route->distance != EIGRP_MAX_METRIC
- 			&& (uint64_t)route->distance
-@@ -1258,7 +1255,10 @@ void eigrp_topology_metric_update(eigrp_instance_t *eigrp)
- 			continue;
- 		for (route = eigrp_topology_route_iterator_first(prefix, &iterator); route;
- 		     route = eigrp_topology_route_iterator_next(&iterator)) {
--			route->reported_distance = eigrp_metric_calculate(eigrp, route->reported_metric);
-+			if (route->adv_router == eigrp->neighbor_self)
-+				route->reported_distance = 0;
-+			else
-+				route->reported_distance = eigrp_metric_calculate(eigrp, route->reported_metric);
- 			if (route->ei)
- 				route->distance = eigrp_metric_total_calculate(eigrp, route);
- 			else
-diff --git a/eigrp/test/uut/summary-topology/scenario-summary-static-metric.yaml b/eigrp/test/uut/summary-topology/scenario-summary-static-metric.yaml
-index c3e313e..4280c5d 100644
---- a/eigrp/test/uut/summary-topology/scenario-summary-static-metric.yaml
-+++ b/eigrp/test/uut/summary-topology/scenario-summary-static-metric.yaml
-@@ -8,14 +8,14 @@ steps:
-   - validate-convergence:
-       timeout: 7
-       expect:
--        - route: {uut: r1, prefix: 10.30.0.0/16, table: rib, metric: 2094080}
-+        - route: {uut: r1, prefix: 10.30.0.0/16, table: rib, metric: 7336960}
-   - validate-event: {uut: r2, contains: "Summary metric: 10.30.0.0/16 1438720"}
-   - packet-mark: best-down-static
-   - link-down: {uut: r3, interface: n1}
-   - validate-convergence:
-       timeout: 10
-       expect:
--        - route: {uut: r1, prefix: 10.30.0.0/16, table: rib, metric: 2094080}
-+        - route: {uut: r1, prefix: 10.30.0.0/16, table: rib, metric: 7336960}
-         - route: {uut: r2, prefix: 10.30.2.0/24, table: topology, active: false, successors: 1}
-   - wait: 0.5
-   - validate-event: {uut: r2, contains: "Summary component: 10.30.2.0/24 metric 13762560"}
-@@ -31,7 +31,7 @@ steps:
-   - validate-convergence:
-       timeout: 10
-       expect:
--        - route: {uut: r1, prefix: 10.30.0.0/16, table: rib, metric: 2094080}
-+        - route: {uut: r1, prefix: 10.30.0.0/16, table: rib, metric: 7336960}
-         - route: {uut: r2, prefix: 10.30.2.0/24, table: topology, active: false, successors: 1}
-   - validate-event: {uut: r2, contains: "Summary metric: 10.30.0.0/16 1438720"}
-   - stop: all
 ```
-
----
-
-## 8. Verification Evidence & Test Suite Validation
-
-### 8.1 Upstream Python Unit Test Suite (`pytest src/upstream/eigrp/eigrp/test`)
-The complete upstream Python unit test harness was executed against the patched library. All **185** test cases passed cleanly with zero regressions:
-
-```
-$ pytest src/upstream/eigrp/eigrp/test
-============================= test session starts ==============================
-platform linux -- Python 3.14.2, pytest-9.1.1, pluggy-1.6.0
-rootdir: /home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/test
-configfile: pytest.ini
-collected 185 items
-
-src/upstream/eigrp/eigrp/test/boundary/host.py .....                     [  2%]
-src/upstream/eigrp/eigrp/test/boundary/not_implemented_audit.py ........ [  7%]
-src/upstream/eigrp/eigrp/test/instance/data_path_config.py ..            [  8%]
-src/upstream/eigrp/eigrp/test/instance/event_queue.py .........          [ 12%]
-src/upstream/eigrp/eigrp/test/ipv4/packet/codec_vectors.py ........      [ 17%]
-src/upstream/eigrp/eigrp/test/ipv4/packet/tlv1_classic.py ..........     [ 22%]
-src/upstream/eigrp/eigrp/test/ipv4/packet/tlv2_wide.py ...........       [ 28%]
-src/upstream/eigrp/eigrp/test/ipv4/redistribution/route_map_boundary.py . [ 29%]
-..                                                                       [ 30%]
-src/upstream/eigrp/eigrp/test/ipv4/redistribution/seed_metric.py .       [ 30%]
-src/upstream/eigrp/eigrp/test/ipv4/redistribution/topology.py .          [ 31%]
-src/upstream/eigrp/eigrp/test/ipv6/configuration/runtime.py .....        [ 34%]
-src/upstream/eigrp/eigrp/test/ipv6/packet/af_vectors.py .                [ 34%]
-src/upstream/eigrp/eigrp/test/ipv6/packet/tlv1_classic.py ..             [ 35%]
-src/upstream/eigrp/eigrp/test/ipv6/packet/tlv2_wide.py ..                [ 36%]
-src/upstream/eigrp/eigrp/test/ipv6/summary/metric.py ......              [ 40%]
-src/upstream/eigrp/eigrp/test/ipv6/topology/dual_selection.py ..         [ 41%]
-src/upstream/eigrp/eigrp/test/ipv6/topology/query_reply_sia.py ......    [ 44%]
-src/upstream/eigrp/eigrp/test/neighbor/log_warnings.py ..                [ 45%]
-src/upstream/eigrp/eigrp/test/neighbor/transport_srtt.py ......          [ 48%]
-src/upstream/eigrp/eigrp/test/packet/event_log_p0.py ....                [ 50%]
-src/upstream/eigrp/eigrp/test/packet/event_log_p1.py ......              [ 54%]
-src/upstream/eigrp/eigrp/test/packet/event_log_p2.py ......              [ 57%]
-src/upstream/eigrp/eigrp/test/packet/header.py ....                      [ 59%]
-src/upstream/eigrp/eigrp/test/packet/p1_hardening.py .....               [ 62%]
-src/upstream/eigrp/eigrp/test/packet/p2_hardening.py .                   [ 62%]
-src/upstream/eigrp/eigrp/test/packet/rtp/packetizer.py ......            [ 65%]
-src/upstream/eigrp/eigrp/test/packet/wire_order.py .....                 [ 68%]
-src/upstream/eigrp/eigrp/test/packet/wire_path.py .....                  [ 71%]
-src/upstream/eigrp/eigrp/test/prefix_limit/runtime.py ..                 [ 72%]
-src/upstream/eigrp/eigrp/test/redistribution/packetizer.py ......        [ 75%]
-src/upstream/eigrp/eigrp/test/rib/route_boundary.py ..                   [ 76%]
-src/upstream/eigrp/eigrp/test/rib/traffic_share.py ..                    [ 77%]
-src/upstream/eigrp/eigrp/test/topology/default_information.py ...        [ 79%]
-src/upstream/eigrp/eigrp/test/topology/fsm/active_state.py .......       [ 83%]
-src/upstream/eigrp/eigrp/test/topology/fsm/event_log.py ....             [ 85%]
-src/upstream/eigrp/eigrp/test/topology/fsm/event_log_diagnostics.py .... [ 87%]
-src/upstream/eigrp/eigrp/test/topology/fsm/passive_state.py .            [ 88%]
-src/upstream/eigrp/eigrp/test/topology/naming.py ...                     [ 89%]
-src/upstream/eigrp/eigrp/test/topology/prefix_representation.py .....    [ 92%]
-src/upstream/eigrp/eigrp/test/topology/route_class_queues.py ....        [ 94%]
-src/upstream/eigrp/eigrp/test/uut/tests/runner.py .                      [ 95%]
-src/upstream/eigrp/eigrp/test/uut/tests/schema.py .........              [100%]
-
-============================= 185 passed in 6.92s ==============================
-```
-
-### 8.2 Upstream UUT YAML Integration Test Suite (`make -C src/upstream/eigrp/eigrp/test/uut all-scenarios`)
-The multi-node UUT emulator harness executes full multi-router topologies across live sockets, validating DUAL FSM state machines, RTP transport, retransmissions, SIA handling, and summary query boundaries. All **31** YAML scenarios passed cleanly:
-
-```
-$ make -C src/upstream/eigrp/eigrp/test/uut all-scenarios
-YAML UUT scenarios discovered: 31
-[1/31]  eigrp/test/rtp/lost-ack.yaml                                  PASS
-[2/31]  eigrp/test/rtp/lost-reliable-packet.yaml                      PASS
-[3/31]  eigrp/test/rtp/reliable-multicast-peer-retry.yaml             PASS
-[4/31]  eigrp/test/rtp/srtt-rto.yaml                                  PASS
-[5/31]  eigrp/test/uut/active-topology/scenario-sia-failure.yaml       PASS
-[6/31]  eigrp/test/uut/active-topology/scenario-sia-positive.yaml      PASS
-[7/31]  eigrp/test/uut/core-topology/scenario-cross-core.yaml         PASS
-[8/31]  eigrp/test/uut/core-topology/scenario-cross-destination-loss.yaml PASS
-[9/31]  eigrp/test/uut/core-topology/scenario-cross-local-successor-loss.yaml PASS
-[10/31] eigrp/test/uut/core-topology/scenario-cross-r1-isolation.yaml PASS
-[11/31] eigrp/test/uut/core-topology/scenario-cross-retained-alternate-loss.yaml PASS
-[12/31] eigrp/test/uut/core-topology/scenario-square-core.yaml        PASS
-[13/31] eigrp/test/uut/core-topology/scenario-square-destination-loss.yaml PASS
-[14/31] eigrp/test/uut/core-topology/scenario-square-r1-isolation.yaml PASS
-[15/31] eigrp/test/uut/dual-diamond/scenario-a-feasible-successor.yaml PASS
-[16/31] eigrp/test/uut/dual-kite/scenario-a-destination-disappears.yaml PASS
-[17/31] eigrp/test/uut/dual-kite/scenario-b-r1-r3-failure.yaml        PASS
-[18/31] eigrp/test/uut/dual-kite/scenario-c-r2-r3-failure.yaml        PASS
-[19/31] eigrp/test/uut/dual-kite/scenario-d-sequential-recovery.yaml PASS
-[20/31] eigrp/test/uut/examples/ipv4-basic-core-gate.yaml             PASS
-[21/31] eigrp/test/uut/examples/ipv6-basic-core-gate.yaml             PASS
-[22/31] eigrp/test/uut/examples/two-router-neighbor-route.yaml        PASS
-[23/31] eigrp/test/uut/mesh-topology/scenario-dense-mesh-heterogeneous.yaml PASS
-[24/31] eigrp/test/uut/mesh-topology/scenario-k6-a-single-link-heterogeneous.yaml PASS
-[25/31] eigrp/test/uut/mesh-topology/scenario-k6-b-concurrent-multiprefix.yaml PASS
-[26/31] eigrp/test/uut/mesh-topology/scenario-k6-c-simultaneous-double-link.yaml PASS
-[27/31] eigrp/test/uut/mesh-topology/scenario-k6-d-failure-during-active.yaml PASS
-[28/31] eigrp/test/uut/mesh-topology/scenario-k6-e-query-storm-watch.yaml PASS
-[29/31] eigrp/test/uut/summary-topology/scenario-summary-metric-selection.yaml PASS
-[30/31] eigrp/test/uut/summary-topology/scenario-summary-query-boundary.yaml PASS
-[31/31] eigrp/test/uut/summary-topology/scenario-summary-static-metric.yaml PASS
-================================================================================
-YAML UUT scenarios passed: 31/31 (100% clean)
-```
-
-*(Note: In `scenario-summary-static-metric.yaml`, correcting the bottleneck bandwidth calculation in Defect 3 adjusted the expected summary route metric on R1 from `2094080` to the mathematically correct value of `7336960`.)*
-
-### 8.3 Downstream Go / C Shim Integration Build & Test
-```
-$ make test-unit
-make -C src/upstream/eigrp/eigrp/code libeigrp-core.a
-make[1]: Entering directory '/home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code'
-make[1]: 'libeigrp-core.a' is up to date.
-make[1]: Leaving directory '/home/awhitaker/dev/srl-eigrp/src/upstream/eigrp/eigrp/code'
-make -C src/cshim libsrl-cshim.a
-make[1]: Entering directory '/home/awhitaker/dev/srl-eigrp/src/cshim'
-make[1]: 'libsrl-cshim.a' is up to date.
-make[1]: Leaving directory '/home/awhitaker/dev/srl-eigrp/src/cshim'
-cd src/cmd/srl-eigrpd && go test -race ./...
-ok      github.com/srl-labs/srl-eigrp
-```
-
----
-
-## 9. Recommendations for Upstream Merge
-
-1. **Commit Splitting vs. Atomic Patch:**  
-   The changes can be merged either as a single atomic fix commit (as in commit `acbc0ad992d9f62a0b62ffe603a0b54f4731f74f`) or split into 5 individual commits corresponding to Defects 1 through 5.
-2. **Regression Assertion in CI:**  
-   Recommend adding `pytest eigrp/test` and `make -C eigrp/test/uut all-scenarios` directly to the upstream GitHub Actions workflow to ensure these critical DUAL convergence invariants are permanently enforced.
-3. **Address Family Conformance:**  
-   All tests and code modifications maintain strict AFI/SAFI conformance across both `ipv4-unicast` and `ipv6-unicast`.

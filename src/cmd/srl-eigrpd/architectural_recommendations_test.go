@@ -9,8 +9,8 @@ import (
 	"syscall"
 	"testing"
 
-	gnmi "github.com/openconfig/gnmi/proto/gnmi"
 	ndk "github.com/nokia/srlinux-ndk-go/ndk"
+	gnmi "github.com/openconfig/gnmi/proto/gnmi"
 )
 
 // TestSocketOptions_ConstantsAndDSCPCS6 verifies that native socket options and DSCP CS6
@@ -560,10 +560,10 @@ func TestTelemetry_SerializationAndConcurrency(t *testing.T) {
 // existing redistributed routes if an export policy lookup or candidate route query fails.
 func TestSyncRedistribution_AbortOnError(t *testing.T) {
 	d := &EigrpDaemon{
-		instances:           make(map[string]*EigrpInstance),
-		candidateRoutes:     make(map[string]map[string]CandidateRoute),
-		policyDefs:          make(map[string]*PolicyDef),
-		netinstNameToId:     make(map[string]string),
+		instances:       make(map[string]*EigrpInstance),
+		candidateRoutes: make(map[string]map[string]CandidateRoute),
+		policyDefs:      make(map[string]*PolicyDef),
+		netinstNameToId: make(map[string]string),
 	}
 	daemonApp = d
 	defer func() { daemonApp = nil }()
@@ -826,4 +826,3 @@ func TestHandleBfdNotification_DuringCollection(t *testing.T) {
 	}
 	d.mu.RUnlock()
 }
-

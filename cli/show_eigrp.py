@@ -140,6 +140,11 @@ def load_state(state=None, netinst="default"):
                 traffics = raw.get("traffic", [])
                 if isinstance(traffics, dict):
                     traffics = [traffics]
+                ev_logs = local_data.get("event-log")
+                if not ev_logs:
+                    ev_logs = raw.get("event-log", [])
+                    if isinstance(ev_logs, dict):
+                        ev_logs = [ev_logs]
                 return {
                     "autonomous-system": raw.get("autonomous-system") or local_data.get("autonomous-system", 0),
                     "router-id": raw.get("router-id") or local_data.get("router-id", "unspecified"),
@@ -157,8 +162,16 @@ def load_state(state=None, netinst="default"):
                     "route": routes,
                     "topology": topos,
                     "traffic": traffics,
+                    "event-log": ev_logs,
                     "rib-scale": raw.get("rib-scale", local_data.get("rib-scale", 128)),
+                    "preference": raw.get("preference", local_data.get("preference", 90)),
+                    "external-preference": raw.get("external-preference", local_data.get("external-preference", 170)),
                     "wide-metrics": raw.get("wide-metrics", local_data.get("wide-metrics", True)),
+                    "traffic-share-balanced": raw.get("traffic-share-balanced", local_data.get("traffic-share-balanced", False)),
+                    "auto-summary": raw.get("auto-summary", local_data.get("auto-summary", False)),
+                    "event-log-size": raw.get("event-log-size", local_data.get("event-log-size", 500)),
+                    "default-metric": raw.get("default-metric", local_data.get("default-metric", {})),
+                    "maximum-prefix": raw.get("maximum-prefix", local_data.get("maximum-prefix", {})),
                     "graceful-restart": raw.get("graceful-restart", local_data.get("graceful-restart", {})),
                     "default-interface": raw.get("default-interface", local_data.get("default-interface", {})),
                     "variance": raw.get("variance", local_data.get("variance", 1)),
@@ -419,6 +432,13 @@ class Plugin(CliPlugin):
                 callback=self.show_traffic
             )
 
+        if not eigrp.has_command("event-log"):
+            eigrp.add_command(
+                Syntax("event-log", help="Show EIGRP protocol event log"),
+                update_location=False,
+                callback=self.show_event_log
+            )
+
         # Register eigrp show commands under ipv4 route and ipv6 route
         ipv4 = network.get_command_or_none("ipv4")
         if ipv4:
@@ -495,6 +515,12 @@ class Plugin(CliPlugin):
             output.print_line(f"{'Maximum Paths':<24}: {data.get('maximum-paths', 4)}")
             output.print_line(f"{'Maximum Hops':<24}: {data.get('maximum-hops', 100)}")
             output.print_line(f"{'Wide Metrics (64-bit)':<24}: {'enabled' if data.get('wide-metrics', True) else 'disabled'}")
+            output.print_line(f"{'Traffic Share Balanced':<24}: {'enabled' if data.get('traffic-share-balanced', False) else 'disabled'}")
+            output.print_line(f"{'Auto Summary':<24}: {'enabled' if data.get('auto-summary', False) else 'disabled'}")
+            output.print_line(f"{'Event Log Size':<24}: {data.get('event-log-size', 500)}")
+            mp = data.get('maximum-prefix')
+            if isinstance(mp, dict) and mp.get('limit', 0):
+                output.print_line(f"{'Maximum Prefix Limit':<24}: {mp.get('limit')} (threshold: {mp.get('threshold', 75)}%, warning-only: {bool(mp.get('warning-only', False))})")
             gr = data.get('graceful-restart', {})
             if isinstance(gr, dict):
                 gr_oper = gr.get('oper-state', 'down' if gr.get('admin-state') == 'disable' else ('up' if gr else 'disabled'))
@@ -837,6 +863,7 @@ class Plugin(CliPlugin):
                         output.print_line(f"    {'Passive':<22}: {af_pass}")
                         output.print_line(f"    {'Hello Interval':<22}: {af_hello}s")
                         output.print_line(f"    {'Hold Time':<22}: {af_hold}s")
+                        output.print_line(f"    {'Bandwidth Percent':<22}: {af.get('bandwidth-percent', 50)}%")
                         output.print_line(f"    {'Split Horizon':<22}: {af_sh}")
                         output.print_line(f"    {'Next-Hop-Self':<22}: {af_nhs}")
                         af_auth = af.get("authentication")
@@ -1007,6 +1034,37 @@ class Plugin(CliPlugin):
 
             output.print_line("-" * 80)
             output.print_line(f"Total Interfaces Monitored: {len(traffic)}")
+            output.print_line("=" * 80)
+
+    def show_event_log(self, state, arguments, output, **kwargs):
+        netinst_arg = arguments.get_value_or("network-instance", "name", "default")
+        instances = get_target_instances(state=state, netinst_arg=netinst_arg)
+
+        for netinst in instances:
+            data = load_state(state=state, netinst=netinst)
+            asn = data.get("autonomous-system", 0) if data else 0
+            output.print_line("=" * 80)
+            output.print_line(f"EIGRP Event Log for Network-Instance: {netinst} (AS: {asn})")
+            output.print_line("-" * 80)
+            output.print_line(f"{'ID':<6} {'Timestamp':<22} {'Event Message'}")
+            output.print_line("-" * 80)
+
+            events = data.get("event-log", []) if data else []
+            if isinstance(events, dict):
+                events = list(events.values())
+            if not events:
+                output.print_line("No EIGRP event log entries recorded.")
+            else:
+                for ev in events:
+                    if not isinstance(ev, dict):
+                        continue
+                    ev_id = str(ev.get("id", ""))
+                    ev_ts = str(ev.get("timestamp", ""))
+                    ev_msg = str(ev.get("message", ""))
+                    output.print_line(f"{ev_id:<6} {ev_ts:<22} {ev_msg}")
+
+            output.print_line("-" * 80)
+            output.print_line(f"Total Events: {len(events)}")
             output.print_line("=" * 80)
 
 
