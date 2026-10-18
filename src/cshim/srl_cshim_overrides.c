@@ -21,26 +21,6 @@
 #include "eigrp_log.h"
 #include "eigrp.h"
 
-void __wrap_eigrp_sys_intf_update(eigrp_vrf_id_t vrf_id, const eigrp_intf_runtime_state_t *state)
-{
-    if (!state || !eigrp_process.virt_router)
-        return;
-
-    pthread_mutex_lock(&eigrp_process.hierarchy_lock);
-    eigrp_list_item_t *vr_node, *af_node;
-    eigrp_virt_router_t *virt_router;
-    eigrp_instance_t *eigrp;
-    for (EIGRP_LIST_ITERATE_RO(eigrp_process.virt_router, vr_node, virt_router)) {
-        for (EIGRP_LIST_ITERATE_RO(virt_router->af_instance, af_node, eigrp)) {
-            if (eigrp->vrf_id != vrf_id || eigrp->shutdown
-                || eigrp->af_vectors.afi != state->address.address.afi)
-                continue;
-            (void)eigrp_instance_intf_update_event_enqueue(eigrp, state);
-        }
-    }
-    pthread_mutex_unlock(&eigrp_process.hierarchy_lock);
-}
-
 static void srl_topology_route_queue_resort(eigrp_list_t *routes)
 {
     eigrp_list_item_t *a, *b;
@@ -142,6 +122,35 @@ extern bool __real_eigrp_summary_query_route_build(eigrp_instance_t *eigrp, eigr
                                                    eigrp_prefix_descriptor_t *summary_prefix,
                                                    eigrp_route_descriptor_t *summary_route);
 
+struct eigrp_summary_metric_entry {
+    eigrp_prefix_t prefix;
+    eigrp_summary_metric_config_t config;
+    struct eigrp_summary_metric_entry *next;
+};
+
+struct eigrp_summary_state {
+    bool auto_summary;
+    struct eigrp_summary_metric_entry *metrics;
+};
+
+static const eigrp_summary_metric_config_t *srl_summary_metric_lookup(
+    eigrp_instance_t *eigrp, const eigrp_prefix_t *prefix)
+{
+    eigrp_af_config_t *af = eigrp_af_config_runtime_read(eigrp);
+    struct eigrp_summary_metric_entry *entry;
+
+    if (!af || !af->summary_state || !prefix)
+        return NULL;
+    for (entry = af->summary_state->metrics; entry; entry = entry->next) {
+        if (entry->prefix.address.afi == prefix->address.afi
+            && entry->prefix.prefix_length == prefix->prefix_length
+            && memcmp(entry->prefix.address.bytes, prefix->address.bytes,
+                      sizeof(entry->prefix.address.bytes)) == 0)
+            return &entry->config;
+    }
+    return NULL;
+}
+
 static void srl_fixup_summary_route(eigrp_instance_t *eigrp, eigrp_intf_t *ei,
                                     eigrp_prefix_descriptor_t *summary_prefix,
                                     eigrp_route_descriptor_t *summary_route)
@@ -189,11 +198,18 @@ static void srl_fixup_summary_route(eigrp_instance_t *eigrp, eigrp_intf_t *ei,
     summary_route->dest = summary_prefix->destination;
 
     if (best_route && selected_distance != EIGRP_MAX_METRIC) {
+        const eigrp_summary_metric_config_t *metric_config =
+            srl_summary_metric_lookup(eigrp, &summary_prefix->destination);
         summary_route->metric = best_route->total_metric;
         summary_route->reported_metric = summary_route->metric;
         summary_route->total_metric = summary_route->metric;
         summary_route->distance = selected_distance;
         summary_route->reported_distance = 0;
+        if (metric_config && metric_config->metric_configured) {
+            eigrp_metric_values_convert(&metric_config->metric, &summary_route->metric);
+            summary_route->reported_metric = summary_route->metric;
+            summary_route->total_metric = summary_route->metric;
+        }
         summary_prefix->reported_metric = summary_route->metric;
         summary_prefix->distance = selected_distance;
         summary_prefix->fdistance = selected_distance;
@@ -315,7 +331,9 @@ bool __wrap_eigrp_nbr_prefix_admit(eigrp_instance_t *runtime, eigrp_nbr_t *neigh
 {
     if (!__real_eigrp_nbr_prefix_admit(runtime, neighbor, prefix))
         return false;
-    return __wrap_eigrp_topology_prefix_admit(runtime, prefix);
+    if (runtime && prefix && eigrp_topology_table_lookup(runtime->topology_table, prefix))
+        return __wrap_eigrp_topology_prefix_admit(runtime, prefix);
+    return true;
 }
 
 extern void __real_eigrp_update_receive(eigrp_instance_t *eigrp, eigrp_nbr_t *nbr,

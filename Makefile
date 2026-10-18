@@ -4,6 +4,10 @@ SHELL := /bin/bash
 all: core cshim build package
 
 core:
+	@if [ ! -f src/upstream/eigrp/eigrp/code/Makefile ]; then \
+		echo "Initializing upstream EIGRP submodule..."; \
+		git submodule update --init --recursive; \
+	fi
 	$(MAKE) -C src/upstream/eigrp/eigrp/code CFLAGS="-O2 -g -fPIC" libeigrp-core.a
 
 cshim: core

@@ -644,7 +644,18 @@ make test-frr
 
 ## 📦 Building from Source
 
-To build the static core library, host shim, Go binary, and Debian package from scratch:
+The upstream EIGRP engine (`src/upstream/eigrp`) is linked as a Git submodule (`https://github.com/diivious/eigrp.git`). When cloning the repository to build from source, include `--recurse-submodules`:
+
+```bash
+git clone --recurse-submodules https://github.com/andywhitaker/srl-eigrp.git
+cd srl-eigrp
+```
+
+If you have already cloned the repository without `--recurse-submodules`, initialize and fetch the submodule before building (note: `make all` will also initialize the submodule automatically if needed):
+
+```bash
+git submodule update --init --recursive
+```
 
 ### Prerequisites
 - Docker (for `goreleaser/nfpm`)
@@ -661,3 +672,4 @@ make all
 make clean
 ```
 The output `.deb` package will be created in `dist/srl-eigrpd_0.1.2_amd64.deb`.
+
