@@ -437,6 +437,17 @@ This loop has four bugs:
      }
      return false;
  }
+```
+
+#### Corresponding Upstream UUT Test Expectation Update
+> [!NOTE]
+> **Why `scenario-summary-metric-selection.yaml` has updated metric expectations (`+655,360`):**
+> In the 3-router UUT topology (`R1 <--eth12--> R2 <--eth23--> R3`), R3 originates `10.30.1.0/24` (local metric `7,208,960`) and `10.30.2.0/24` (local metric `13,107,200`), and each transit link (`eth23` and `eth12`) has `delay: 10` (`+655,360` composite metric).
+> - On **R2** (1 hop from R3 via `eth23`), the total metrics (`FD`) are `7,864,320` and `13,762,560`.
+> - Previously, because `eigrp_summary_route_build()` copied `best_route->metric` (R3's reported metric `7,208,960` / `13,107,200`) instead of `best_route->total_metric` (R2's metric `7,864,320` / `13,762,560`), R2 advertised R3's metric to R1 (omitting the `R2 <-> R3` link delay), and the test YAML recorded those 1-hop values (`7,864,320` / `13,762,560` on R1, and `Summary metric: 10.30.0.0/16 13107200` right below `Summary component: 10.30.2.0/24 metric 13762560` on R2).
+> - With `eigrp_summary_route_build()` fixed to advertise R2's `best_route->total_metric` (`7,864,320` / `13,762,560`), R2's `Summary metric` event matches its selected `Summary component` (`13,762,560`), and R1 (2 hops from R3 via `eth12 + eth23`) installs the summary with the true 2-hop metric (`8,519,680` initially, and `14,417,920` after `n1` goes down).
+
+```diff
 --- a/eigrp/test/uut/summary-topology/scenario-summary-metric-selection.yaml
 +++ b/eigrp/test/uut/summary-topology/scenario-summary-metric-selection.yaml
 @@ -8,7 +8,7 @@ steps:
