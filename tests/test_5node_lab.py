@@ -283,6 +283,15 @@ def test_5node_feasible_successor_and_variance(srl_exec):
                 break
         assert fs_ok, f"Feasible Successor not properly selected for 5.5.5.5/32: top={out_top}, state={out_state}"
 
+        # Verify self-originated connected routes on SRL2 did not lose their Successor flag (RD must remain 0)
+        # or double-add interface delay during eigrp_topology_metric_update()
+        assert "P 2.2.2.2/32, 1 successors, FD is 1310720" in out_top and "via 0.0.0.0 (1310720/0), system0.0 Successor" in out_top, (
+            f"Connected route 2.2.2.2/32 corrupted after metric update on SRL2: {out_top}"
+        )
+        assert "P 10.2.4.0/24, 1 successors, FD is 1966080" in out_top and "via 0.0.0.0 (1966080/0), ethernet-1/3.0 Successor" in out_top, (
+            f"Connected route 10.2.4.0/24 double-added delay or lost Successor after metric update on SRL2: {out_top}"
+        )
+
         # Verify 3.3.3.3/32 via 10.2.4.4 (RD 1966080 == FD 1966080) is NOT marked as Feasible Successor
         out_state_3 = srl_exec("clab-eigrp-test-srl2", ["sr_cli", "info from state network-instance default protocols eigrp topology 3.3.3.3/32"])
         assert "feasible-successor true" not in out_state_3, f"3.3.3.3/32 via 10.2.4.4 (RD == FD) must not be Feasible Successor: {out_state_3}"
@@ -404,10 +413,28 @@ def test_5node_fs_instant_failover_vs_active_query(srl_exec):
 
 
 def test_5node_peer_restart_recovery(srl_exec):
-    """Verify restarting srl_eigrpd on SRL5 while SRL3 and SRL4 hold timers are active
-    properly detects peer restart (even when INIT reuses sequence 1) and resyncs both paths."""
+    """Verify restarting srl_eigrpd while neighbor hold timers are active properly detects peer restart
+    (even when consecutive restarts reuse INIT sequence 1), re-arms t_holddown, and resyncs full topology."""
+    # 1. Restart SRL5 and verify dual-path recovery across SRL3 and SRL4
     srl_exec("clab-eigrp-test-srl5", ["sr_cli", "tools system app-management application srl_eigrpd restart"])
     assert wait_for_5node_convergence(srl_exec, timeout=25), "SRL5 failed to recover full 2-path topology after daemon restart"
+
+    # 2. Restart SRL1 twice in succession so SRL1 sends INIT with sequence=1 after SRL2 has already seen sequence=1
+    srl_exec("clab-eigrp-test-srl2", ["sr_cli", "tools network-instance default protocols eigrp event-log clear"])
+    srl_exec("clab-eigrp-test-srl1", ["sr_cli", "tools system app-management application srl_eigrpd restart"])
+    assert wait_for_5node_convergence(srl_exec, timeout=25), "SRL1 failed to recover topology after first daemon restart"
+
+    srl_exec("clab-eigrp-test-srl1", ["sr_cli", "tools system app-management application srl_eigrpd restart"])
+    assert wait_for_5node_convergence(srl_exec, timeout=25), "SRL1 failed to recover topology after second consecutive daemon restart (INIT seq 1 reuse)"
+
+    out_srl2_ev = srl_exec("clab-eigrp-test-srl2", ["sr_cli", "show network-instance default protocols eigrp event-log"])
+    assert "reason=peer-restart" in out_srl2_ev or "NSF peer restarted" in out_srl2_ev, (
+        f"SRL2 did not log peer-restart on SRL1 restart: {out_srl2_ev}"
+    )
+    out_srl2_nbr = srl_exec("clab-eigrp-test-srl2", ["sr_cli", "info from state network-instance default protocols eigrp neighbor 10.1.2.1"])
+    assert "hold-time" in out_srl2_nbr and "hold-time 0" not in out_srl2_nbr, (
+        f"SRL2 neighbor 10.1.2.1 hold timer left disarmed after peer restart: {out_srl2_nbr}"
+    )
 
 
 IPV6_CFGS = {
@@ -660,9 +687,13 @@ def test_5node_bfd_and_graceful_restart(srl_exec):
 
 
 def test_5node_summary_address_and_auto_summary(srl_exec):
-    """Verify summary-address component suppression across the diamond and classful auto-summary propagation to SRL5."""
+    """Verify summary-address component suppression across the diamond, summary metric accumulation
+    (advertising local total_metric rather than predecessor RD), no split-horizon self-poisoning,
+    Internal TLV type when summarizing external redistributed routes, no component leak on QUERY,
+    and classful auto-summary propagation to SRL5."""
     try:
         # 1. Configure summary-address 10.0.0.0/8 on SRL2 ethernet-1/1.0 towards SRL1
+        #    (Covers 10.1.2.0/24 on ethernet-1/1.0 itself -> verifies no split-horizon self-poisoning)
         apply_cfg(
             srl_exec,
             "clab-eigrp-test-srl2",
@@ -679,7 +710,73 @@ def test_5node_summary_address_and_auto_summary(srl_exec):
                 break
         assert sum_ok, f"SRL1 did not receive summary 10.0.0.0/8 with component suppression: {out_srl1_routes}"
 
-        # 2. Configure auto-summary true on SRL1 -> 1.1.1.1/32 across 10.1.2.0/24 summarizes to 1.0.0.0/8 all the way to SRL5!
+        # 2. Replace 10.0.0.0/8 with summary-address 10.3.0.0/16 on SRL2 ethernet-1/1.0
+        #    (Covers remote components 10.3.4.0/24 and 10.3.5.0/24 learned from SRL3/SRL4 with RD=1310720, SRL2 FD=1966080)
+        #    -> Verify SRL2 advertises its accumulated distance 1966080 so SRL1 installs 10.3.0.0/16 with 2-hop FD=2621440 (RD=1966080)
+        apply_cfg(
+            srl_exec,
+            "clab-eigrp-test-srl2",
+            """
+            delete / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast summary-address 10.0.0.0/8
+            set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast summary-address 10.3.0.0/16 distance 15
+            """,
+        )
+        sum16_ok = False
+        out_srl1_top = ""
+        for _ in range(20):
+            time.sleep(1)
+            out_srl1_top = srl_exec("clab-eigrp-test-srl1", ["sr_cli", "show network-instance default protocols eigrp topology"])
+            if (
+                "P 10.3.0.0/16, 1 successors, FD is 2621440" in out_srl1_top
+                and "(2621440/1966080)" in out_srl1_top
+                and "10.3.4.0/24" not in out_srl1_top
+                and "10.3.5.0/24" not in out_srl1_top
+            ):
+                sum16_ok = True
+                break
+        assert sum16_ok, f"SRL1 did not learn summary 10.3.0.0/16 with accumulated 2-hop FD 2621440 (RD 1966080): {out_srl1_top}"
+
+        # 3. Summarize an external redistributed route (172.16.99.0/24 -> 172.16.0.0/16) on SRL2 ethernet-1/1.0
+        #    -> Verify SRL1 learns 172.16.0.0/16 as an Internal EIGRP route (Pref 90), not External (170), and suppresses 172.16.99.0/24
+        apply_cfg(
+            srl_exec,
+            "clab-eigrp-test-srl2",
+            """
+            set / network-instance default next-hop-groups group nhg-sum-ext admin-state enable nexthop 1 ip-address 10.2.3.3 admin-state enable
+            set / network-instance default static-routes route 172.16.99.0/24 admin-state enable next-hop-group nhg-sum-ext
+            set / routing-policy policy sum-ext-pol statement 10 match protocol static
+            set / routing-policy policy sum-ext-pol statement 10 action policy-result accept
+            set / network-instance default protocols eigrp default-metric bandwidth 100000 delay 100 reliability 255 load 1 mtu 1500
+            set / network-instance default protocols eigrp address-family ipv4-unicast export-policy sum-ext-pol
+            set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast summary-address 172.16.0.0/16 distance 15
+            """,
+        )
+        sum_ext_ok = False
+        out_srl1_routes = ""
+        for _ in range(20):
+            time.sleep(1)
+            out_srl1_routes = srl_exec("clab-eigrp-test-srl1", ["sr_cli", "show network-instance default protocols eigrp routes"])
+            if "172.16.0.0/16" in out_srl1_routes and "172.16.99.0/24" not in out_srl1_routes:
+                for line in out_srl1_routes.splitlines():
+                    if "172.16.0.0/16" in line and "Internal" in line and "90" in line:
+                        sum_ext_ok = True
+                        break
+            if sum_ext_ok:
+                break
+        assert sum_ext_ok, f"Summary 172.16.0.0/16 over redistributed external route was not advertised as Internal (Pref 90): {out_srl1_routes}"
+
+        # 4. Trigger component QUERY across the diamond (disable/enable SRL3 ethernet-1/2.0) while summary 10.3.0.0/16 is active
+        #    -> Verify suppressed components 10.3.4.0/24 and 10.3.5.0/24 do not leak onto SRL1
+        apply_cfg(srl_exec, "clab-eigrp-test-srl3", "set / network-instance default protocols eigrp interface ethernet-1/2.0 admin-state disable")
+        time.sleep(2)
+        apply_cfg(srl_exec, "clab-eigrp-test-srl3", "set / network-instance default protocols eigrp interface ethernet-1/2.0 admin-state enable")
+        time.sleep(3)
+        out_srl1_after_q = srl_exec("clab-eigrp-test-srl1", ["sr_cli", "show network-instance default protocols eigrp routes"])
+        assert "10.3.0.0/16" in out_srl1_after_q and "10.3.4.0/24" not in out_srl1_after_q and "10.3.5.0/24" not in out_srl1_after_q, (
+            f"Suppressed components leaked to SRL1 after QUERY activity: {out_srl1_after_q}"
+        )
+
+        # 5. Configure auto-summary true on SRL1 -> 1.1.1.1/32 across 10.1.2.0/24 summarizes to 1.0.0.0/8 all the way to SRL5!
         apply_cfg(srl_exec, "clab-eigrp-test-srl1", "set / network-instance default protocols eigrp auto-summary true")
         autosum_ok = False
         out_srl5_routes = ""
@@ -691,12 +788,7 @@ def test_5node_summary_address_and_auto_summary(srl_exec):
                 break
         assert autosum_ok, f"Classful auto-summary 1.0.0.0/8 did not propagate from SRL1 to SRL5: {out_srl5_routes}"
     finally:
-        apply_cfg(
-            srl_exec,
-            "clab-eigrp-test-srl2",
-            "delete / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast summary-address 10.0.0.0/8",
-        )
-        apply_cfg(srl_exec, "clab-eigrp-test-srl1", "delete / network-instance default protocols eigrp auto-summary")
+        restore_5node_baseline(srl_exec)
         assert wait_for_5node_convergence(srl_exec, timeout=25)
 
 
@@ -818,6 +910,16 @@ def test_5node_redistribution_ospf_bgp_isis_static(srl_exec):
             f"reached SRL5 with 2 ECMP successors: routes={out_srl5_routes}\ntop={out_srl5_top}"
         )
         assert "External" in out_srl5_routes and "170" in out_srl5_routes
+
+        # Verify that triggering eigrp_topology_metric_update() on SRL2 (via interface delay update) preserves
+        # self-originated redistributed route successor status (RD=0) and scaled delay (FD=13107200 for bw=100000, delay=100)
+        apply_cfg(srl_exec, "clab-eigrp-test-srl2", "set / network-instance default protocols eigrp interface ethernet-1/3.0 delay 20")
+        time.sleep(2)
+        out_srl2_top = srl_exec("clab-eigrp-test-srl2", ["sr_cli", "show network-instance default protocols eigrp topology"])
+        assert "P 172.16.30.0/24, 1 successors, FD is 13107200" in out_srl2_top and "(13107200/0)" in out_srl2_top, (
+            f"Self-originated redistributed route 172.16.30.0/24 lost Successor or scaled delay after metric update on SRL2: {out_srl2_top}"
+        )
+        apply_cfg(srl_exec, "clab-eigrp-test-srl2", "delete / network-instance default protocols eigrp interface ethernet-1/3.0 delay")
 
         # 3. Verify withdrawal when export-policy is removed on SRL2
         apply_cfg(
@@ -1032,6 +1134,79 @@ def test_5node_timers_maxprefix_bwpercent_ribscale_and_tools(srl_exec):
         apply_cfg(srl_exec, "clab-eigrp-test-srl1", "delete / network-instance default protocols eigrp maximum-prefix")
         out_tclr = srl_exec("clab-eigrp-test-srl1", ["sr_cli", "tools network-instance default protocols eigrp topology clear"])
         assert "Success" in out_tclr or "Cleared" in out_tclr
+        assert wait_for_5node_convergence(srl_exec, timeout=20)
+
+        # 4b. Verify maximum-prefix route replacement and re-advertisement admission (Defect 3):
+        #     SRL2 has 11 baseline prefixes. Set limit 12 on SRL2, advertise 192.0.2.101/32 from SRL1 (12/12 admitted),
+        #     replace 192.0.2.101/32 with 192.0.2.102/32 in a single commit (must NOT count poisoned 192.0.2.101/32 as a 13th prefix),
+        #     then re-add 192.0.2.101/32 while 192.0.2.102/32 is still present (must reject 192.0.2.101/32 at 12/12).
+        apply_cfg(
+            srl_exec,
+            "clab-eigrp-test-srl2",
+            "set / network-instance default protocols eigrp maximum-prefix limit 12 threshold 75 warning-only false",
+        )
+        apply_cfg(
+            srl_exec,
+            "clab-eigrp-test-srl1",
+            """
+            set / network-instance default next-hop-groups group nhg-mp admin-state enable nexthop 1 ip-address 10.1.2.2 admin-state enable
+            set / routing-policy policy mp-pol statement 10 match protocol static
+            set / routing-policy policy mp-pol statement 10 action policy-result accept
+            set / network-instance default protocols eigrp default-metric bandwidth 100000 delay 100 reliability 255 load 1 mtu 1500
+            set / network-instance default protocols eigrp address-family ipv4-unicast export-policy mp-pol
+            set / network-instance default static-routes route 192.0.2.101/32 admin-state enable next-hop-group nhg-mp
+            """,
+        )
+        mp_first_ok = False
+        out_srl2_top = ""
+        for _ in range(15):
+            time.sleep(1)
+            out_srl2_top = srl_exec("clab-eigrp-test-srl2", ["sr_cli", "show network-instance default protocols eigrp topology"])
+            if "P 192.0.2.101/32, 1 successors" in out_srl2_top:
+                mp_first_ok = True
+                break
+        assert mp_first_ok, f"SRL2 did not admit 12th prefix 192.0.2.101/32 under limit 12: {out_srl2_top}"
+
+        apply_cfg(
+            srl_exec,
+            "clab-eigrp-test-srl1",
+            """
+            delete / network-instance default static-routes route 192.0.2.101/32
+            set / network-instance default static-routes route 192.0.2.102/32 admin-state enable next-hop-group nhg-mp
+            """,
+        )
+        mp_replace_ok = False
+        for _ in range(15):
+            time.sleep(1)
+            out_srl2_top = srl_exec("clab-eigrp-test-srl2", ["sr_cli", "show network-instance default protocols eigrp topology"])
+            if "P 192.0.2.102/32, 1 successors" in out_srl2_top and "192.0.2.101/32" not in out_srl2_top:
+                mp_replace_ok = True
+                break
+        assert mp_replace_ok, f"SRL2 rejected replacement prefix 192.0.2.102/32 due to poisoned 192.0.2.101/32 counting toward limit 12: {out_srl2_top}"
+
+        apply_cfg(
+            srl_exec,
+            "clab-eigrp-test-srl1",
+            "set / network-instance default static-routes route 192.0.2.101/32 admin-state enable next-hop-group nhg-mp",
+        )
+        time.sleep(3)
+        out_srl2_top = srl_exec("clab-eigrp-test-srl2", ["sr_cli", "show network-instance default protocols eigrp topology"])
+        assert "P 192.0.2.102/32, 1 successors" in out_srl2_top and "192.0.2.101/32" not in out_srl2_top, (
+            f"Re-advertised 13th prefix 192.0.2.101/32 bypassed maximum-prefix limit 12 on SRL2: {out_srl2_top}"
+        )
+
+        apply_cfg(
+            srl_exec,
+            "clab-eigrp-test-srl1",
+            """
+            delete / network-instance default protocols eigrp address-family ipv4-unicast export-policy
+            delete / network-instance default protocols eigrp default-metric
+            delete / routing-policy policy mp-pol
+            delete / network-instance default static-routes
+            delete / network-instance default next-hop-groups
+            """,
+        )
+        apply_cfg(srl_exec, "clab-eigrp-test-srl2", "delete / network-instance default protocols eigrp maximum-prefix")
 
         # 5. Enable IPv6 across all 5 nodes, then verify passive-interface suppression/recovery and rapid IPv6 AF toggle
         for node, cfg in IPV6_CFGS.items():

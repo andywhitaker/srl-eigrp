@@ -2697,7 +2697,7 @@ eigrp_result_t eigrp_sys_interface_walk(eigrp_instance_t *e, eigrp_sys_interface
                 sts[i].address = c->address;
                 sts[i].type = 1; // multi-access
                 sts[i].secondary = false;
-                sts[i].operative = true;
+                sts[i].operative = c->active;
                 sts[i].bandwidth = c->bandwidth;
                 sts[i].mtu = c->mtu;
                 i++;
@@ -2708,7 +2708,7 @@ eigrp_result_t eigrp_sys_interface_walk(eigrp_instance_t *e, eigrp_sys_interface
                 sts[i].address = c->address_v6;
                 sts[i].type = 1; // multi-access
                 sts[i].secondary = false;
-                sts[i].operative = true;
+                sts[i].operative = c->active_v6;
                 sts[i].bandwidth = c->bandwidth;
                 sts[i].mtu = c->mtu;
                 i++;
@@ -3955,14 +3955,17 @@ typedef struct {
     srl_rep_topo_t *entries;
     int count;
     int capacity;
+    bool skip_routes;
 } srl_topo_report_ctx_t;
 
 static eigrp_result_t srl_topo_prefix_cb(const eigrp_topology_prefix_state_t *st, void *arg) {
     srl_topo_report_ctx_t *ctx = (srl_topo_report_ctx_t *)arg;
     if (!ctx || !st || ctx->count >= ctx->capacity) return EIGRP_RESULT_SUCCESS;
     if (st->successor_count == 0 && !st->active && (st->feasible_distance >= 4294967295ULL || st->feasible_distance == 0)) {
+        ctx->skip_routes = true;
         return EIGRP_RESULT_SUCCESS;
     }
+    ctx->skip_routes = false;
     srl_rep_topo_t *e = &ctx->entries[ctx->count++];
     e->type = SRL_TOPO_ENTRY_PREFIX;
 
@@ -3983,7 +3986,7 @@ static eigrp_result_t srl_topo_prefix_cb(const eigrp_topology_prefix_state_t *st
 
 static eigrp_result_t srl_topo_route_cb(const eigrp_topology_route_state_t *st, void *arg) {
     srl_topo_report_ctx_t *ctx = (srl_topo_report_ctx_t *)arg;
-    if (!ctx || !st || ctx->count >= ctx->capacity) return EIGRP_RESULT_SUCCESS;
+    if (!ctx || !st || ctx->skip_routes || ctx->count >= ctx->capacity) return EIGRP_RESULT_SUCCESS;
 
     srl_rep_topo_t *e = &ctx->entries[ctx->count++];
     e->type = SRL_TOPO_ENTRY_ROUTE;
@@ -4568,8 +4571,6 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
 
     if (admin_up) {
         eigrp_network_create(&ctx, &pfx);
-    } else {
-        eigrp_network_delete(&ctx, &pfx);
     }
 
     srl_intf_enable_args_t ea = {
@@ -4915,10 +4916,10 @@ static eigrp_result_t srl_originate_v6_msg_cb(eigrp_instance_t *runtime, void *a
     eigrp_prefix_descriptor_t *prefix = eigrp_topology_table_lookup(runtime->topology_table, &oa->pfx);
     if (prefix) {
         int self_count = 0;
-        if (prefix->rij) {
+        if (prefix->internal_routes) {
             eigrp_list_item_t *node;
             eigrp_route_descriptor_t *cand;
-            for (EIGRP_LIST_ITERATE_RO(prefix->rij, node, cand)) {
+            for (EIGRP_LIST_ITERATE_RO(prefix->internal_routes, node, cand)) {
                 if (cand && cand->adv_router == runtime->neighbor_self &&
                     cand->type == runtime->af_vectors.classic_internal_tlv_type) {
                     self_count++;
@@ -5074,10 +5075,10 @@ static eigrp_result_t srl_withdraw_v6_msg_cb(eigrp_instance_t *runtime, void *ar
         eigrp_route_descriptor_t *route = eigrp_prefix_descriptor_lookup(prefix, runtime->neighbor_self);
         while (route && route->type == runtime->af_vectors.classic_internal_tlv_type) {
             eigrp_route_descriptor_t *next_self = NULL;
-            if (prefix->rij) {
+            if (prefix->internal_routes) {
                 eigrp_list_item_t *node;
                 eigrp_route_descriptor_t *cand;
-                for (EIGRP_LIST_ITERATE_RO(prefix->rij, node, cand)) {
+                for (EIGRP_LIST_ITERATE_RO(prefix->internal_routes, node, cand)) {
                     if (cand && cand != route && cand->adv_router == runtime->neighbor_self &&
                         cand->type == runtime->af_vectors.classic_internal_tlv_type) {
                         next_self = cand;
@@ -6717,7 +6718,9 @@ static uint32_t srl_active_topology_prefix_count(eigrp_instance_t *runtime) {
     for (rn = eigrp_table_first(runtime->topology_table); rn; rn = eigrp_table_next(rn)) {
         eigrp_prefix_descriptor_t *pe = rn->info;
         if (!pe || !eigrp_prefix_valid(&pe->destination)) continue;
-        if (eigrp_topology_route_read(pe) != NULL || pe->state != EIGRP_FSM_STATE_PASSIVE) {
+        eigrp_route_descriptor_t *best = eigrp_topology_route_read(pe);
+        if (pe->distance != EIGRP_MAX_METRIC && best &&
+            best->distance != EIGRP_MAX_METRIC && best->metric.delay != EIGRP_MAX_METRIC) {
             count++;
         }
     }
@@ -6756,7 +6759,9 @@ static eigrp_result_t srl_max_prefix_msg_cb(eigrp_instance_t *runtime, void *arg
             for (rn = eigrp_table_first(runtime->topology_table); rn; rn = eigrp_table_next(rn)) {
                 eigrp_prefix_descriptor_t *pe = rn->info;
                 if (!pe || !eigrp_prefix_valid(&pe->destination)) continue;
-                if (eigrp_topology_route_read(pe) == NULL && pe->state == EIGRP_FSM_STATE_PASSIVE) continue;
+                eigrp_route_descriptor_t *best = eigrp_topology_route_read(pe);
+                if (pe->distance == EIGRP_MAX_METRIC || !best ||
+                    best->distance == EIGRP_MAX_METRIC || best->metric.delay == EIGRP_MAX_METRIC) continue;
                 if (pe->nt != EIGRP_TOPOLOGY_TYPE_REMOTE && pe->nt != EIGRP_TOPOLOGY_TYPE_REMOTE_EXTERNAL) continue;
                 if (runtime->neighbor_self && eigrp_prefix_descriptor_lookup(pe, runtime->neighbor_self) != NULL) continue;
                 victim = pe;

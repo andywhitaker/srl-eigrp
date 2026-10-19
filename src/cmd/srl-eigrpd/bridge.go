@@ -2,7 +2,7 @@ package main
 
 /*
 #cgo CFLAGS: -I../../upstream/eigrp/eigrp/code -I../../cshim
-#cgo LDFLAGS: -rdynamic -L../../cshim -L../../upstream/eigrp/eigrp/code -Wl,--wrap=eigrp_topology_metric_update -Wl,--wrap=eigrp_summary_route_build -Wl,--wrap=eigrp_summary_query_route_build -Wl,--wrap=eigrp_topology_prefix_admit -Wl,--wrap=eigrp_nbr_prefix_admit -Wl,--wrap=eigrp_update_receive -Wl,--start-group -leigrp-core -lsrl-cshim -Wl,--end-group -lpthread -ldl -lstdc++
+#cgo LDFLAGS: -rdynamic -L../../cshim -L../../upstream/eigrp/eigrp/code -Wl,--wrap=eigrp_topology_metric_update -Wl,--wrap=eigrp_summary_route_build -Wl,--wrap=eigrp_summary_query_route_build -Wl,--wrap=eigrp_topology_prefix_admit -Wl,--wrap=eigrp_nbr_prefix_admit -Wl,--wrap=eigrp_update_receive -Wl,--wrap=eigrp_topology_neighbor_down -Wl,--start-group -leigrp-core -lsrl-cshim -Wl,--end-group -lpthread -ldl -lstdc++
 #include <stdlib.h>
 #include "srl_cshim.h"
 */
@@ -547,3 +547,9 @@ func ShimEventLogReport(netinst string) {
 	defer C.free(unsafe.Pointer(cNetinst))
 	C.srlShimEventLogReport(cNetinst)
 }
+
+// ShimTestRel030OverridesCheck runs unit checks on rel-0.3.0 CShim overrides.
+func ShimTestRel030OverridesCheck() int {
+	return int(C.srlTestRel030OverridesCheck())
+}
+

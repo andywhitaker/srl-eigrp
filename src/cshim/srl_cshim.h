@@ -109,6 +109,7 @@ int srlShimEventLogSizeUpdate(const char *netinst, uint32_t size);
 int srlShimEventLogClear(const char *netinst);
 void srlShimEventLogReport(const char *netinst);
 int srlShimStatisticsClear(const char *netinst);
+int srlTestRel030OverridesCheck(void);
 
 
 #ifdef __cplusplus

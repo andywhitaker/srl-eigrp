@@ -271,3 +271,10 @@ func TestRouteWorker_RapidFlapStress(t *testing.T) {
 
 	d.StopRouteWorker(netinst)
 }
+
+func TestRel030OverridesCheck(t *testing.T) {
+	if rc := ShimTestRel030OverridesCheck(); rc != 0 {
+		t.Fatalf("ShimTestRel030OverridesCheck failed with rc=%d", rc)
+	}
+}
+
