@@ -160,11 +160,10 @@ def test_state_db(srl_exec):
     assert "passive false" in out_state, f"passive false missing from state DB: {out_state}"
     assert "passive true" in out_state, f"passive true missing from state DB: {out_state}"
     assert "neighbor 10.0.0.2" in out_state, f"neighbor list missing from state DB: {out_state}"
-    assert "route 192.0.2.2/32" in out_state, f"route list missing from state DB: {out_state}"
-    assert "topology 192.0.2.2/32" in out_state, f"topology list missing from state DB: {out_state}"
+    assert "topology {" in out_state and "prefix 192.0.2.2/32" in out_state, f"topology prefix list missing from state DB: {out_state}"
     assert "route 10.0.0.2" in out_state, f"topology route next-hop missing from state DB: {out_state}"
     assert "successor true" in out_state, f"topology successor status missing from state DB: {out_state}"
-    assert "traffic ethernet-1/1.0" in out_state, f"traffic list missing from state DB: {out_state}"
+    assert "statistics {" in out_state and "unreliable-multicast" in out_state, f"interface statistics missing from state DB: {out_state}"
 
     out_cfg = srl_exec("clab-srl-srl-eigrp-srl1", [
         "sr_cli", "info network-instance default protocols eigrp"
@@ -513,11 +512,10 @@ def test_vrf1_state_db(srl_exec):
     assert "passive false" in out_state, f"passive false missing from VRF-1 state DB: {out_state}"
     assert "passive true" in out_state, f"passive true missing from VRF-1 state DB: {out_state}"
     assert "neighbor 10.1.0.2" in out_state, f"neighbor 10.1.0.2 missing from VRF-1 state DB: {out_state}"
-    assert "route 192.0.2.22/32" in out_state, f"route 192.0.2.22/32 missing from VRF-1 state DB: {out_state}"
-    assert "topology 192.0.2.22/32" in out_state, f"topology missing from VRF-1 state DB: {out_state}"
+    assert "topology {" in out_state and "prefix 192.0.2.22/32" in out_state, f"topology prefix missing from VRF-1 state DB: {out_state}"
     assert "route 10.1.0.2" in out_state, f"VRF-1 topology route next-hop missing from state DB: {out_state}"
     assert "successor true" in out_state, f"VRF-1 successor status missing from state DB: {out_state}"
-    assert "traffic ethernet-1/1.1" in out_state, f"traffic missing from VRF-1 state DB: {out_state}"
+    assert "statistics {" in out_state and "unreliable-multicast" in out_state, f"interface statistics missing from VRF-1 state DB: {out_state}"
 
 
 def test_vrf1_tools_clear_neighbor(srl_exec):
@@ -722,7 +720,7 @@ def test_srl_ipv6_state_db(srl_exec):
             break
     assert "total-neighbors 2" in out_state, f"total-neighbors 2 missing from state DB: {out_state}"
     assert re.search(r"total-routes [23]", out_state), f"total-routes 2 missing from state DB: {out_state}"
-    assert "route 2001:db8::2/128" in out_state, f"IPv6 route missing from state DB: {out_state}"
+    assert "prefix 2001:db8::2/128" in out_state, f"IPv6 topology prefix missing from state DB: {out_state}"
     assert "neighbor fe80::" in out_state, f"IPv6 neighbor missing from state DB: {out_state}"
 
 
@@ -871,7 +869,7 @@ EOF"""
         out_fib = srl_exec("clab-srl-srl-eigrp-srl1", [
             "sr_cli", "show network-instance default ipv4 route 192.0.2.2/32"
         ])
-        m = re.search(r'wide-metric\s+(\d+)', out_state)
+        m = re.search(r'wide-(?:feasible-distance|distance|metric)\s+(\d+)', out_state)
         if m and "rib-scale 64" in out_state:
             wm = int(m.group(1))
             expected_scaled = str(wm // 64)
@@ -898,7 +896,7 @@ EOF"""
         out_fib = srl_exec("clab-srl-srl-eigrp-srl1", [
             "sr_cli", "show network-instance default ipv4 route 192.0.2.2/32"
         ])
-        m = re.search(r'wide-metric\s+(\d+)', out_state)
+        m = re.search(r'wide-(?:feasible-distance|distance|metric)\s+(\d+)', out_state)
         if m:
             wm = int(m.group(1))
             expected_restored = str(wm // 128)
@@ -1846,13 +1844,13 @@ def test_per_afi_interface_state_ip(srl_exec):
 
 
 def test_traffic_share_balanced_and_auto_summary(srl_exec):
-    """Verify traffic-share-balanced and auto-summary configuration, inheritance to AF, classful summarization, and CLI summary."""
+    """Verify traffic-share-balanced and auto-summary configuration under address-family, classful summarization, and CLI summary."""
     try:
         cfg = """sr_cli << 'EOF'
 enter candidate
 discard stay
-set / network-instance default protocols eigrp traffic-share-balanced true
-set / network-instance default protocols eigrp auto-summary true
+set / network-instance default protocols eigrp address-family ipv4-unicast traffic-share-balanced true
+set / network-instance default protocols eigrp address-family ipv4-unicast auto-summary true
 commit now
 EOF"""
         out_commit = srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg])
@@ -1892,8 +1890,8 @@ EOF"""
         clean = """sr_cli << 'EOF'
 enter candidate
 discard stay
-delete / network-instance default protocols eigrp traffic-share-balanced
-delete / network-instance default protocols eigrp auto-summary
+delete / network-instance default protocols eigrp address-family ipv4-unicast traffic-share-balanced
+delete / network-instance default protocols eigrp address-family ipv4-unicast auto-summary
 commit now
 EOF"""
         srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", clean])
@@ -1919,13 +1917,13 @@ EOF"""
 
 
 def test_default_metric_and_maximum_prefix(srl_exec):
-    """Verify default-metric and maximum-prefix configuration, inheritance to AF, active prefix limit enforcement, and CLI summary."""
+    """Verify default-metric and maximum-prefix configuration under address-family, active prefix limit enforcement, and CLI summary."""
     try:
         cfg = """sr_cli << 'EOF'
 enter candidate
 discard stay
-set / network-instance default protocols eigrp default-metric bandwidth 250000 delay 250 reliability 250 load 2 mtu 1400
-set / network-instance default protocols eigrp maximum-prefix limit 500 threshold 80 warning-only true
+set / network-instance default protocols eigrp address-family ipv4-unicast default-metric bandwidth 250000 delay 250 reliability 250 load 2 mtu 1400
+set / network-instance default protocols eigrp address-family ipv4-unicast maximum-prefix limit 500 threshold 80 warning-only true
 commit now
 EOF"""
         out_commit = srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg])
@@ -1961,7 +1959,7 @@ EOF"""
         cfg_strict = """sr_cli << 'EOF'
 enter candidate
 discard stay
-set / network-instance default protocols eigrp maximum-prefix limit 2 threshold 50 warning-only false
+set / network-instance default protocols eigrp address-family ipv4-unicast maximum-prefix limit 2 threshold 50 warning-only false
 commit now
 EOF"""
         srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_strict])
@@ -1981,8 +1979,8 @@ EOF"""
         clean = """sr_cli << 'EOF'
 enter candidate
 discard stay
-delete / network-instance default protocols eigrp default-metric
-delete / network-instance default protocols eigrp maximum-prefix
+delete / network-instance default protocols eigrp address-family ipv4-unicast default-metric
+delete / network-instance default protocols eigrp address-family ipv4-unicast maximum-prefix
 commit now
 EOF"""
         srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", clean])
@@ -2011,13 +2009,13 @@ EOF"""
 
 
 def test_bandwidth_percent_hierarchy(srl_exec):
-    """Verify bandwidth-percent inheritance across default-interface, interface, and interface address-family (including values > 100)."""
+    """Verify bandwidth-percent inheritance across default-interface address-family and interface address-family (including values > 100)."""
     try:
-        # 1. Configure only default-interface bandwidth-percent 65 and verify interface inherits 65%
+        # 1. Configure default-interface address-family ipv4-unicast bandwidth-percent 65 and verify interface inherits 65%
         cfg_def = """sr_cli << 'EOF'
 enter candidate
 discard stay
-set / network-instance default protocols eigrp default-interface bandwidth-percent 65
+set / network-instance default protocols eigrp default-interface address-family ipv4-unicast bandwidth-percent 65
 commit now
 EOF"""
         out_commit = srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg_def])
@@ -2035,11 +2033,10 @@ EOF"""
                 break
         assert inherited_def, f"Interface did not inherit default-interface bandwidth-percent 65%: {out_if}"
 
-        # 2. Override at interface level (75%) and interface address-family ipv4-unicast level (300%)
+        # 2. Override at interface address-family ipv4-unicast level (300%)
         cfg = """sr_cli << 'EOF'
 enter candidate
 discard stay
-set / network-instance default protocols eigrp interface ethernet-1/1.0 bandwidth-percent 75
 set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast bandwidth-percent 300
 commit now
 EOF"""
@@ -2055,7 +2052,6 @@ EOF"""
             ])
             if (
                 "bandwidth-percent 65" in out_state
-                and "bandwidth-percent 75" in out_state
                 and "bandwidth-percent 300" in out_state
             ):
                 ok = True
@@ -2070,8 +2066,7 @@ EOF"""
         clean = """sr_cli << 'EOF'
 enter candidate
 discard stay
-delete / network-instance default protocols eigrp default-interface bandwidth-percent
-delete / network-instance default protocols eigrp interface ethernet-1/1.0 bandwidth-percent
+delete / network-instance default protocols eigrp default-interface address-family ipv4-unicast bandwidth-percent
 delete / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast bandwidth-percent
 commit now
 EOF"""
@@ -2090,7 +2085,7 @@ EOF"""
 
 
 def test_event_log_and_tools_clear(srl_exec):
-    """Verify event-log-size configuration, show event-log CLI, State DB event-log list, and tools event-log clear."""
+    """Verify event-log-size configuration, show event-log CLI, State DB event-log/entry list, and tools event-log clear."""
     try:
         cfg = """sr_cli << 'EOF'
 enter candidate
@@ -2108,7 +2103,7 @@ EOF"""
             out_state = srl_exec("clab-srl-srl-eigrp-srl1", [
                 "sr_cli", "info from state network-instance default protocols eigrp"
             ])
-            if "event-log-size 250" in out_state and "event-log " in out_state:
+            if "event-log-size 250" in out_state and "event-log {" in out_state and "entry " in out_state:
                 size_ok = True
                 break
         assert size_ok, f"State DB missing event-log-size 250 or event-log entries: {out_state}"

@@ -702,27 +702,28 @@ func TestInterfacePropertyDeletionsNoDeadlock(t *testing.T) {
 		AdminState:    "disable",
 		Bandwidth:     &bw,
 		Delay:         &del,
-		Passive:       &pass,
-		HelloInterval: &hello,
-		HoldTime:      &hold,
-		SplitHorizon:  &sh,
-		NextHopSelf:   &nhs,
 		VlanID:        nil, // Specifically nil to exercise the d.learnedVlans lock-path inside applyInterface
+		AddressFamily: []InterfaceAddressFamilyConfig{
+			{
+				Name:          "ipv4-unicast",
+				AdminState:    "disable",
+				Passive:       &pass,
+				HelloInterval: &hello,
+				HoldTime:      &hold,
+				SplitHorizon:  &sh,
+				NextHopSelf:   &nhs,
+			},
+		},
 	}
 	inst.configuredInterfaces[intfName] = ifcfg
 
-	leafs := []string{
+	intfLeafs := []string{
 		"admin-state",
 		"delay",
 		"bandwidth",
-		"passive",
-		"hello-interval",
-		"hold-time",
-		"split-horizon",
-		"next-hop-self",
 	}
 
-	for _, leaf := range leafs {
+	for _, leaf := range intfLeafs {
 		notif := &ndk.ConfigNotification{
 			Op: ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE,
 			Key: &ndk.ConfigKey{
@@ -742,6 +743,35 @@ func TestInterfacePropertyDeletionsNoDeadlock(t *testing.T) {
 		}
 	}
 
+	afLeafs := []string{
+		"admin-state",
+		"passive",
+		"hello-interval",
+		"hold-time",
+		"split-horizon",
+		"next-hop-self",
+	}
+
+	for _, leaf := range afLeafs {
+		notif := &ndk.ConfigNotification{
+			Op: ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE,
+			Key: &ndk.ConfigKey{
+				JsPath: fmt.Sprintf(`.network_instance{.name=="default"}.protocols.eigrp.interface{.interface-name=="%s"}.address-family{.name=="ipv4-unicast"}.%s`, intfName, leaf),
+			},
+		}
+		done := make(chan struct{})
+		go func() {
+			d.HandleConfigNotification(notif)
+			close(done)
+		}()
+
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("deadlock detected while deleting interface AF leaf: %s", leaf)
+		}
+	}
+
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	if ifcfg.AdminState != "enable" {
@@ -753,20 +783,65 @@ func TestInterfacePropertyDeletionsNoDeadlock(t *testing.T) {
 	if ifcfg.Bandwidth != nil {
 		t.Fatalf("expected bandwidth reset to nil, got %v", ifcfg.Bandwidth)
 	}
-	if ifcfg.Passive != nil {
-		t.Fatalf("expected passive reset to nil, got %v", ifcfg.Passive)
+	af := ifcfg.GetAfiConfig("ipv4-unicast")
+	if af == nil {
+		t.Fatal("expected ipv4-unicast AF config to exist")
 	}
-	if ifcfg.HelloInterval != nil {
-		t.Fatalf("expected hello-interval reset to nil, got %v", ifcfg.HelloInterval)
+	if af.Passive != nil {
+		t.Fatalf("expected passive reset to nil, got %v", af.Passive)
 	}
-	if ifcfg.HoldTime != nil {
-		t.Fatalf("expected hold-time reset to nil, got %v", ifcfg.HoldTime)
+	if af.HelloInterval != nil {
+		t.Fatalf("expected hello-interval reset to nil, got %v", af.HelloInterval)
 	}
-	if ifcfg.SplitHorizon != nil {
-		t.Fatalf("expected split-horizon reset to nil, got %v", ifcfg.SplitHorizon)
+	if af.HoldTime != nil {
+		t.Fatalf("expected hold-time reset to nil, got %v", af.HoldTime)
 	}
-	if ifcfg.NextHopSelf != nil {
-		t.Fatalf("expected next-hop-self reset to nil, got %v", ifcfg.NextHopSelf)
+	if af.SplitHorizon != nil {
+		t.Fatalf("expected split-horizon reset to nil, got %v", af.SplitHorizon)
+	}
+	if af.NextHopSelf != nil {
+		t.Fatalf("expected next-hop-self reset to nil, got %v", af.NextHopSelf)
+	}
+}
+
+func TestTelemetryReorganizedPathsAndSchemaRank(t *testing.T) {
+	tf := &TrafficInfo{
+		Interface:       "ethernet-1/1.0",
+		ReliableMcast:   10,
+		UnreliableMcast: 20,
+		ReliableUcast:   30,
+		UnreliableUcast: 40,
+		Retransmissions: 2,
+		CRPackets:       1,
+	}
+	ic := &InterfaceConfig{
+		InterfaceName: "ethernet-1/1.0",
+		AdminState:    "enable",
+	}
+	defIntf := &DefaultInterfaceConfig{
+		AdminState: "enable",
+	}
+	data := buildInterfaceData("ethernet-1/1.0", "10.0.0.1", 30, "up", ic, defIntf, "up", tf)
+	stats, ok := data["statistics"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected statistics map in buildInterfaceData, got %+v", data["statistics"])
+	}
+	if stats["reliable-multicast"] != uint64(10) || stats["unreliable-multicast"] != uint64(20) || stats["retransmissions"] != uint64(2) {
+		t.Fatalf("unexpected statistics counters: %+v", stats)
+	}
+
+	// Verify schemaRank orders topology.prefix, topology.prefix.route, and event-log.entry strictly
+	rRoot := schemaRank(`.network_instance{.name=="default"}.protocols.eigrp`)
+	rDefAf := schemaRank(`.network_instance{.name=="default"}.protocols.eigrp.default-interface.address-family{.name=="ipv4-unicast"}`)
+	rIntf := schemaRank(`.network_instance{.name=="default"}.protocols.eigrp.interface{.interface-name=="ethernet-1/1.0"}`)
+	rAf := schemaRank(`.network_instance{.name=="default"}.protocols.eigrp.address-family{.name=="ipv4-unicast"}`)
+	rTopoPfx := schemaRank(`.network_instance{.name=="default"}.protocols.eigrp.topology.prefix{.prefix=="10.0.0.0/24"}`)
+	rTopoRt := schemaRank(`.network_instance{.name=="default"}.protocols.eigrp.topology.prefix{.prefix=="10.0.0.0/24"}.route{.next-hop=="10.0.0.2"}`)
+	rEvLog := schemaRank(`.network_instance{.name=="default"}.protocols.eigrp.event-log.entry{.id==1}`)
+
+	if !(rRoot < rAf && rAf < rDefAf && rDefAf < rEvLog && rEvLog < rIntf && rIntf < rTopoPfx && rTopoPfx < rTopoRt) {
+		t.Fatalf("invalid schemaRank ordering: root=%d af=%d defAf=%d evLog=%d intf=%d topoPfx=%d topoRt=%d",
+			rRoot, rAf, rDefAf, rEvLog, rIntf, rTopoPfx, rTopoRt)
 	}
 }
 

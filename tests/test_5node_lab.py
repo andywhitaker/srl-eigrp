@@ -233,7 +233,7 @@ def test_5node_ecmp_fib_and_maximum_paths(srl_exec):
     try:
         # Restrict maximum-paths to 1 on SRL2 -> only 1 successor should remain in topology and FIB,
         # while the second equal-cost path becomes a Feasible Successor!
-        apply_cfg(srl_exec, "clab-eigrp-test-srl2", "set / network-instance default protocols eigrp maximum-paths 1")
+        apply_cfg(srl_exec, "clab-eigrp-test-srl2", "set / network-instance default protocols eigrp address-family ipv4-unicast maximum-paths 1")
         ok = False
         out_top = ""
         for _ in range(15):
@@ -248,7 +248,7 @@ def test_5node_ecmp_fib_and_maximum_paths(srl_exec):
         nh_count = sum(1 for nh in ["10.2.3.3", "10.2.4.4"] if nh in out_fib_single)
         assert nh_count == 1, f"Expected 1 next-hop in FIB with maximum-paths 1, got: {out_fib_single}"
     finally:
-        apply_cfg(srl_exec, "clab-eigrp-test-srl2", "delete / network-instance default protocols eigrp maximum-paths")
+        apply_cfg(srl_exec, "clab-eigrp-test-srl2", "delete / network-instance default protocols eigrp address-family ipv4-unicast maximum-paths")
 
     restored = False
     for _ in range(15):
@@ -273,7 +273,7 @@ def test_5node_feasible_successor_and_variance(srl_exec):
         for _ in range(15):
             time.sleep(1)
             out_top = srl_exec("clab-eigrp-test-srl2", ["sr_cli", "show network-instance default protocols eigrp topology"])
-            out_state = srl_exec("clab-eigrp-test-srl2", ["sr_cli", "info from state network-instance default protocols eigrp topology 5.5.5.5/32"])
+            out_state = srl_exec("clab-eigrp-test-srl2", ["sr_cli", "info from state network-instance default protocols eigrp topology prefix 5.5.5.5/32"])
             if (
                 "P 5.5.5.5/32, 1 successors, FD is 2621440" in out_top
                 and "via 10.2.4.4 (3276800/1966080), ethernet-1/3.0 Feasible Successor" in out_top
@@ -293,7 +293,7 @@ def test_5node_feasible_successor_and_variance(srl_exec):
         )
 
         # Verify 3.3.3.3/32 via 10.2.4.4 (RD 1966080 == FD 1966080) is NOT marked as Feasible Successor
-        out_state_3 = srl_exec("clab-eigrp-test-srl2", ["sr_cli", "info from state network-instance default protocols eigrp topology 3.3.3.3/32"])
+        out_state_3 = srl_exec("clab-eigrp-test-srl2", ["sr_cli", "info from state network-instance default protocols eigrp topology prefix 3.3.3.3/32"])
         assert "feasible-successor true" not in out_state_3, f"3.3.3.3/32 via 10.2.4.4 (RD == FD) must not be Feasible Successor: {out_state_3}"
         block_3 = out_top.split("P 3.3.3.3/32")[1].split("P ")[0] if "P 3.3.3.3/32" in out_top else ""
         assert "Feasible Successor" not in block_3, f"3.3.3.3/32 CLI topology block must not show Feasible Successor: {block_3}"
@@ -307,8 +307,8 @@ def test_5node_feasible_successor_and_variance(srl_exec):
             srl_exec,
             "clab-eigrp-test-srl2",
             """
-            set / network-instance default protocols eigrp variance 2
-            set / network-instance default protocols eigrp traffic-share-balanced true
+            set / network-instance default protocols eigrp address-family ipv4-unicast variance 2
+            set / network-instance default protocols eigrp address-family ipv4-unicast traffic-share-balanced true
             """,
         )
 
@@ -335,8 +335,8 @@ def test_5node_feasible_successor_and_variance(srl_exec):
             srl_exec,
             "clab-eigrp-test-srl2",
             """
-            delete / network-instance default protocols eigrp variance
-            delete / network-instance default protocols eigrp traffic-share-balanced
+            delete / network-instance default protocols eigrp address-family ipv4-unicast variance
+            delete / network-instance default protocols eigrp address-family ipv4-unicast traffic-share-balanced
             delete / network-instance default protocols eigrp interface ethernet-1/3.0 delay
             """,
         )
@@ -513,7 +513,7 @@ def test_5node_ipv6_eigrp_diamond(srl_exec):
             time.sleep(1)
             out_srl2_state = srl_exec(
                 "clab-eigrp-test-srl2",
-                ["sr_cli", "info from state network-instance default protocols eigrp topology 2001:db8::5/128"],
+                ["sr_cli", "info from state network-instance default protocols eigrp topology prefix 2001:db8::5/128"],
             )
             if "successor-count 1" in out_srl2_state and "feasible-successor true" in out_srl2_state:
                 v6_fs_ok = True
@@ -746,7 +746,7 @@ def test_5node_summary_address_and_auto_summary(srl_exec):
             set / network-instance default static-routes route 172.16.99.0/24 admin-state enable next-hop-group nhg-sum-ext
             set / routing-policy policy sum-ext-pol statement 10 match protocol static
             set / routing-policy policy sum-ext-pol statement 10 action policy-result accept
-            set / network-instance default protocols eigrp default-metric bandwidth 100000 delay 100 reliability 255 load 1 mtu 1500
+            set / network-instance default protocols eigrp address-family ipv4-unicast default-metric bandwidth 100000 delay 100 reliability 255 load 1 mtu 1500
             set / network-instance default protocols eigrp address-family ipv4-unicast export-policy sum-ext-pol
             set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast summary-address 172.16.0.0/16 distance 15
             """,
@@ -777,7 +777,7 @@ def test_5node_summary_address_and_auto_summary(srl_exec):
         )
 
         # 5. Configure auto-summary true on SRL1 -> 1.1.1.1/32 across 10.1.2.0/24 summarizes to 1.0.0.0/8 all the way to SRL5!
-        apply_cfg(srl_exec, "clab-eigrp-test-srl1", "set / network-instance default protocols eigrp auto-summary true")
+        apply_cfg(srl_exec, "clab-eigrp-test-srl1", "set / network-instance default protocols eigrp address-family ipv4-unicast auto-summary true")
         autosum_ok = False
         out_srl5_routes = ""
         for _ in range(20):
@@ -876,7 +876,8 @@ def test_5node_redistribution_ospf_bgp_isis_static(srl_exec):
             set / routing-policy policy redist-pol statement 40 action policy-result accept
             set / routing-policy policy redist-pol statement 50 match protocol bgp
             set / routing-policy policy redist-pol statement 50 action policy-result accept eigrp metric bandwidth 50000 delay 200 reliability 255 load 1 mtu 1500
-            set / network-instance default protocols eigrp default-metric bandwidth 100000 delay 100 reliability 255 load 1 mtu 1500
+            set / network-instance default protocols eigrp address-family ipv4-unicast default-metric bandwidth 100000 delay 100 reliability 255 load 1 mtu 1500
+            set / network-instance default protocols eigrp address-family ipv6-unicast default-metric bandwidth 100000 delay 100 reliability 255 load 1 mtu 1500
             set / network-instance default protocols eigrp address-family ipv4-unicast export-policy redist-pol
             set / network-instance default protocols eigrp address-family ipv6-unicast export-policy redist-pol
             """,
@@ -1109,7 +1110,7 @@ def test_5node_timers_maxprefix_bwpercent_ribscale_and_tools(srl_exec):
         apply_cfg(
             srl_exec,
             "clab-eigrp-test-srl1",
-            "set / network-instance default protocols eigrp maximum-prefix limit 3 threshold 50 warning-only true",
+            "set / network-instance default protocols eigrp address-family ipv4-unicast maximum-prefix limit 3 threshold 50 warning-only true",
         )
         time.sleep(2)
         out_warn_top = srl_exec("clab-eigrp-test-srl1", ["sr_cli", "show network-instance default protocols eigrp topology"])
@@ -1119,7 +1120,7 @@ def test_5node_timers_maxprefix_bwpercent_ribscale_and_tools(srl_exec):
         apply_cfg(
             srl_exec,
             "clab-eigrp-test-srl1",
-            "set / network-instance default protocols eigrp maximum-prefix limit 3 threshold 50 warning-only false",
+            "set / network-instance default protocols eigrp address-family ipv4-unicast maximum-prefix limit 3 threshold 50 warning-only false",
         )
         limit_ok = False
         for _ in range(15):
@@ -1131,7 +1132,7 @@ def test_5node_timers_maxprefix_bwpercent_ribscale_and_tools(srl_exec):
                 break
         assert limit_ok, f"Strict maximum-prefix limit 3 did not cap topology entries on SRL1: {out_top}"
 
-        apply_cfg(srl_exec, "clab-eigrp-test-srl1", "delete / network-instance default protocols eigrp maximum-prefix")
+        apply_cfg(srl_exec, "clab-eigrp-test-srl1", "delete / network-instance default protocols eigrp address-family ipv4-unicast maximum-prefix")
         out_tclr = srl_exec("clab-eigrp-test-srl1", ["sr_cli", "tools network-instance default protocols eigrp topology clear"])
         assert "Success" in out_tclr or "Cleared" in out_tclr
         assert wait_for_5node_convergence(srl_exec, timeout=20)
@@ -1143,7 +1144,7 @@ def test_5node_timers_maxprefix_bwpercent_ribscale_and_tools(srl_exec):
         apply_cfg(
             srl_exec,
             "clab-eigrp-test-srl2",
-            "set / network-instance default protocols eigrp maximum-prefix limit 12 threshold 75 warning-only false",
+            "set / network-instance default protocols eigrp address-family ipv4-unicast maximum-prefix limit 12 threshold 75 warning-only false",
         )
         apply_cfg(
             srl_exec,
@@ -1152,7 +1153,7 @@ def test_5node_timers_maxprefix_bwpercent_ribscale_and_tools(srl_exec):
             set / network-instance default next-hop-groups group nhg-mp admin-state enable nexthop 1 ip-address 10.1.2.2 admin-state enable
             set / routing-policy policy mp-pol statement 10 match protocol static
             set / routing-policy policy mp-pol statement 10 action policy-result accept
-            set / network-instance default protocols eigrp default-metric bandwidth 100000 delay 100 reliability 255 load 1 mtu 1500
+            set / network-instance default protocols eigrp address-family ipv4-unicast default-metric bandwidth 100000 delay 100 reliability 255 load 1 mtu 1500
             set / network-instance default protocols eigrp address-family ipv4-unicast export-policy mp-pol
             set / network-instance default static-routes route 192.0.2.101/32 admin-state enable next-hop-group nhg-mp
             """,
@@ -1200,13 +1201,13 @@ def test_5node_timers_maxprefix_bwpercent_ribscale_and_tools(srl_exec):
             "clab-eigrp-test-srl1",
             """
             delete / network-instance default protocols eigrp address-family ipv4-unicast export-policy
-            delete / network-instance default protocols eigrp default-metric
+            delete / network-instance default protocols eigrp address-family ipv4-unicast default-metric
             delete / routing-policy policy mp-pol
             delete / network-instance default static-routes
             delete / network-instance default next-hop-groups
             """,
         )
-        apply_cfg(srl_exec, "clab-eigrp-test-srl2", "delete / network-instance default protocols eigrp maximum-prefix")
+        apply_cfg(srl_exec, "clab-eigrp-test-srl2", "delete / network-instance default protocols eigrp address-family ipv4-unicast maximum-prefix")
 
         # 5. Enable IPv6 across all 5 nodes, then verify passive-interface suppression/recovery and rapid IPv6 AF toggle
         for node, cfg in IPV6_CFGS.items():

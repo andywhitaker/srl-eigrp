@@ -487,32 +487,52 @@ func ShimInterfaceBandwidthPercentUpdate(netinst, ifname, afiName string, percen
 	return int(C.srlShimInterfaceBandwidthPercentUpdate(cNetinst, cIfname, cAfi, C.uint32_t(percent)))
 }
 
-// ShimTrafficShareBalancedUpdate updates traffic-share balanced mode for a network instance.
-func ShimTrafficShareBalancedUpdate(netinst string, balanced bool) int {
+// ShimTrafficShareBalancedUpdate updates traffic-share balanced mode for a network instance and AFI.
+func ShimTrafficShareBalancedUpdate(netinst, afiName string, balanced bool) int {
 	cNetinst := C.CString(netinst)
 	defer C.free(unsafe.Pointer(cNetinst))
-	return int(C.srlShimTrafficShareBalancedUpdate(cNetinst, nil, C.bool(balanced)))
+	var cAfi *C.char
+	if afiName != "" {
+		cAfi = C.CString(afiName)
+		defer C.free(unsafe.Pointer(cAfi))
+	}
+	return int(C.srlShimTrafficShareBalancedUpdate(cNetinst, cAfi, C.bool(balanced)))
 }
 
-// ShimAutoSummaryUpdate updates auto-summary configuration for a network instance.
-func ShimAutoSummaryUpdate(netinst string, enabled bool) int {
+// ShimAutoSummaryUpdate updates auto-summary configuration for a network instance and AFI.
+func ShimAutoSummaryUpdate(netinst, afiName string, enabled bool) int {
 	cNetinst := C.CString(netinst)
 	defer C.free(unsafe.Pointer(cNetinst))
-	return int(C.srlShimAutoSummaryUpdate(cNetinst, nil, C.bool(enabled)))
+	var cAfi *C.char
+	if afiName != "" {
+		cAfi = C.CString(afiName)
+		defer C.free(unsafe.Pointer(cAfi))
+	}
+	return int(C.srlShimAutoSummaryUpdate(cNetinst, cAfi, C.bool(enabled)))
 }
 
-// ShimDefaultMetricUpdate updates the default redistribution metric for a network instance.
-func ShimDefaultMetricUpdate(netinst string, bw, delay uint32, reliability, load uint8, mtu uint32) int {
+// ShimDefaultMetricUpdate updates the default redistribution metric for a network instance and AFI.
+func ShimDefaultMetricUpdate(netinst, afiName string, bw, delay uint32, reliability, load uint8, mtu uint32) int {
 	cNetinst := C.CString(netinst)
 	defer C.free(unsafe.Pointer(cNetinst))
-	return int(C.srlShimDefaultMetricUpdate(cNetinst, nil, C.uint32_t(bw), C.uint32_t(delay), C.uint8_t(reliability), C.uint8_t(load), C.uint32_t(mtu)))
+	var cAfi *C.char
+	if afiName != "" {
+		cAfi = C.CString(afiName)
+		defer C.free(unsafe.Pointer(cAfi))
+	}
+	return int(C.srlShimDefaultMetricUpdate(cNetinst, cAfi, C.uint32_t(bw), C.uint32_t(delay), C.uint8_t(reliability), C.uint8_t(load), C.uint32_t(mtu)))
 }
 
-// ShimMaxPrefixUpdate updates the topology maximum-prefix limit for a network instance.
-func ShimMaxPrefixUpdate(netinst string, maxPrefixes uint32, threshold uint8, warningOnly bool) int {
+// ShimMaxPrefixUpdate updates the topology maximum-prefix limit for a network instance and AFI.
+func ShimMaxPrefixUpdate(netinst, afiName string, maxPrefixes uint32, threshold uint8, warningOnly bool) int {
 	cNetinst := C.CString(netinst)
 	defer C.free(unsafe.Pointer(cNetinst))
-	return int(C.srlShimMaxPrefixUpdate(cNetinst, nil, C.uint32_t(maxPrefixes), C.uint8_t(threshold), C.bool(warningOnly)))
+	var cAfi *C.char
+	if afiName != "" {
+		cAfi = C.CString(afiName)
+		defer C.free(unsafe.Pointer(cAfi))
+	}
+	return int(C.srlShimMaxPrefixUpdate(cNetinst, cAfi, C.uint32_t(maxPrefixes), C.uint8_t(threshold), C.bool(warningOnly)))
 }
 
 // ShimTopologyClear clears topology entries for a network instance.

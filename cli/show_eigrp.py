@@ -131,20 +131,94 @@ def load_state(state=None, netinst="default"):
                 nbrs = raw.get("neighbor", [])
                 if isinstance(nbrs, dict):
                     nbrs = [nbrs]
+
+                topo_raw = raw.get("topology", [])
+                total_prefixes = 0
+                active_prefixes = 0
+                if isinstance(topo_raw, dict):
+                    total_prefixes = topo_raw.get("total-prefixes", 0)
+                    active_prefixes = topo_raw.get("active-prefixes", 0)
+                    topos = topo_raw.get("prefix", [])
+                    if isinstance(topos, dict):
+                        topos = [topos]
+                elif isinstance(topo_raw, list):
+                    topos = topo_raw
+                    total_prefixes = len(topos)
+                    active_prefixes = sum(1 for t in topos if isinstance(t, dict) and t.get("active"))
+                else:
+                    topos = []
+
+                for t in topos:
+                    if isinstance(t, dict):
+                        if "destination" not in t and "prefix" in t:
+                            t["destination"] = t["prefix"]
+                        elif "prefix" not in t and "destination" in t:
+                            t["prefix"] = t["destination"]
+
                 routes = raw.get("route", [])
                 if isinstance(routes, dict):
                     routes = [routes]
-                topos = raw.get("topology", [])
-                if isinstance(topos, dict):
-                    topos = [topos]
+                if not routes and topos:
+                    for t in topos:
+                        if not isinstance(t, dict):
+                            continue
+                        t_routes = t.get("route") or t.get("routes", [])
+                        if isinstance(t_routes, dict):
+                            t_routes = [t_routes]
+                        for r in t_routes:
+                            if isinstance(r, dict) and r.get("successor", False):
+                                nh = r.get("next-hop", "")
+                                if nh and nh not in ("0.0.0.0", "::", "connected", "Connected"):
+                                    routes.append({
+                                        "prefix": t.get("prefix") or t.get("destination", ""),
+                                        "next-hop": nh,
+                                        "interface": r.get("interface", ""),
+                                        "metric": r.get("distance", t.get("feasible-distance", 0)),
+                                        "wide-metric": r.get("wide-distance", t.get("wide-feasible-distance", 0)),
+                                        "external": t.get("external", False),
+                                        "preference": t.get("preference", 170 if t.get("external", False) else 90),
+                                        "rib-scale": t.get("rib-scale", raw.get("rib-scale", 128)),
+                                    })
+                if not routes:
+                    routes = local_data.get("routes") or local_data.get("route", [])
+
                 traffics = raw.get("traffic", [])
                 if isinstance(traffics, dict):
                     traffics = [traffics]
+                if not traffics and intfs:
+                    for itf in intfs:
+                        if isinstance(itf, dict) and isinstance(itf.get("statistics"), dict):
+                            st = dict(itf["statistics"])
+                            st["interface"] = itf.get("interface-name", itf.get("name", ""))
+                            traffics.append(st)
+                if not traffics:
+                    traffics = local_data.get("traffic", [])
+
                 ev_logs = local_data.get("event-log")
+                if isinstance(ev_logs, dict):
+                    ev_logs = ev_logs.get("entry", list(ev_logs.values()))
                 if not ev_logs:
-                    ev_logs = raw.get("event-log", [])
-                    if isinstance(ev_logs, dict):
-                        ev_logs = [ev_logs]
+                    raw_ev = raw.get("event-log", [])
+                    if isinstance(raw_ev, dict):
+                        ev_logs = raw_ev.get("entry", [])
+                        if isinstance(ev_logs, dict):
+                            ev_logs = [ev_logs]
+                    elif isinstance(raw_ev, list):
+                        ev_logs = raw_ev
+                    else:
+                        ev_logs = []
+
+                afs = raw.get("address-family", local_data.get("address-family", []))
+                if isinstance(afs, dict):
+                    afs = [afs]
+                primary_af = {}
+                for af in afs:
+                    if isinstance(af, dict) and af.get("name") == "ipv4-unicast":
+                        primary_af = af
+                        break
+                if not primary_af and afs and isinstance(afs[0], dict):
+                    primary_af = afs[0]
+
                 return {
                     "autonomous-system": raw.get("autonomous-system") or local_data.get("autonomous-system", 0),
                     "router-id": raw.get("router-id") or local_data.get("router-id", "unspecified"),
@@ -154,6 +228,7 @@ def load_state(state=None, netinst="default"):
                     "networks": raw.get("network", local_data.get("networks", [])),
                     "static-neighbors": raw.get("static-neighbor", local_data.get("static-neighbors", [])),
                     "static-neighbor": raw.get("static-neighbor", local_data.get("static-neighbor", [])),
+                    "address-family": afs,
                     "interfaces": intfs,
                     "interface": intfs,
                     "neighbors": nbrs,
@@ -161,26 +236,28 @@ def load_state(state=None, netinst="default"):
                     "routes": routes,
                     "route": routes,
                     "topology": topos,
+                    "total-prefixes": total_prefixes,
+                    "active-prefixes": active_prefixes,
                     "traffic": traffics,
                     "event-log": ev_logs,
                     "rib-scale": raw.get("rib-scale", local_data.get("rib-scale", 128)),
-                    "preference": raw.get("preference", local_data.get("preference", 90)),
-                    "external-preference": raw.get("external-preference", local_data.get("external-preference", 170)),
+                    "preference": raw.get("preference", primary_af.get("preference", local_data.get("preference", 90))),
+                    "external-preference": raw.get("external-preference", primary_af.get("external-preference", local_data.get("external-preference", 170))),
                     "wide-metrics": raw.get("wide-metrics", local_data.get("wide-metrics", True)),
-                    "traffic-share-balanced": raw.get("traffic-share-balanced", local_data.get("traffic-share-balanced", False)),
-                    "auto-summary": raw.get("auto-summary", local_data.get("auto-summary", False)),
+                    "traffic-share-balanced": raw.get("traffic-share-balanced", primary_af.get("traffic-share-balanced", local_data.get("traffic-share-balanced", False))),
+                    "auto-summary": raw.get("auto-summary", primary_af.get("auto-summary", local_data.get("auto-summary", False))),
                     "event-log-size": raw.get("event-log-size", local_data.get("event-log-size", 500)),
-                    "default-metric": raw.get("default-metric", local_data.get("default-metric", {})),
-                    "maximum-prefix": raw.get("maximum-prefix", local_data.get("maximum-prefix", {})),
+                    "default-metric": raw.get("default-metric", primary_af.get("default-metric", local_data.get("default-metric", {}))),
+                    "maximum-prefix": raw.get("maximum-prefix", primary_af.get("maximum-prefix", local_data.get("maximum-prefix", {}))),
                     "graceful-restart": raw.get("graceful-restart", local_data.get("graceful-restart", {})),
                     "default-interface": raw.get("default-interface", local_data.get("default-interface", {})),
-                    "variance": raw.get("variance", local_data.get("variance", 1)),
-                    "maximum-paths": raw.get("maximum-paths", local_data.get("maximum-paths", 4)),
-                    "maximum-hops": raw.get("maximum-hops", local_data.get("maximum-hops", 100)),
+                    "variance": raw.get("variance", primary_af.get("variance", local_data.get("variance", 1))),
+                    "maximum-paths": raw.get("maximum-paths", primary_af.get("maximum-paths", local_data.get("maximum-paths", 4))),
+                    "maximum-hops": raw.get("maximum-hops", primary_af.get("maximum-hops", local_data.get("maximum-hops", 100))),
                     "timers": raw.get("timers", local_data.get("timers", {})),
                     "metrics": raw.get("metrics", local_data.get("metrics", {})),
-                    "export-policy": raw.get("export-policy", local_data.get("export-policy", "")),
-                    "import-policy": raw.get("import-policy", local_data.get("import-policy", "")),
+                    "export-policy": raw.get("export-policy", primary_af.get("export-policy", local_data.get("export-policy", ""))),
+                    "import-policy": raw.get("import-policy", primary_af.get("import-policy", local_data.get("import-policy", ""))),
                 }
         except Exception:
             pass
@@ -508,6 +585,12 @@ class Plugin(CliPlugin):
             output.print_line(f"{'Participating Interfaces':<24}: {len(interfaces)}")
             output.print_line(f"{'Established Neighbors':<24}: {len(nbrs)}")
             output.print_line(f"{'Learned Routes':<24}: {len(routes)}")
+            topo_list = data.get("topology", [])
+            if isinstance(topo_list, dict):
+                topo_list = topo_list.get("prefix", [])
+            total_pfxs = data.get("total-prefixes", len(topo_list) if isinstance(topo_list, list) else 0)
+            active_pfxs = data.get("active-prefixes", sum(1 for t in topo_list if isinstance(t, dict) and t.get("active")) if isinstance(topo_list, list) else 0)
+            output.print_line(f"{'Total Prefixes':<24}: {total_pfxs} (Active: {active_pfxs})")
             output.print_line(f"{'RIB Scale':<24}: {data.get('rib-scale', 128)}")
             output.print_line(f"{'Preference (Internal)':<24}: {data.get('preference', 90)}")
             output.print_line(f"{'Preference (External)':<24}: {data.get('external-preference', 170)}")
@@ -527,9 +610,33 @@ class Plugin(CliPlugin):
             else:
                 gr_oper = 'disabled'
             output.print_line(f"{'Graceful Restart':<24}: {gr_oper}")
+            afs = data.get("address-family", [])
+            if isinstance(afs, dict):
+                afs = [afs]
+            if afs:
+                output.print_line("-" * 80)
+                output.print_line("Address Families:")
+                for af in afs:
+                    if not isinstance(af, dict):
+                        continue
+                    af_name = af.get("name", "")
+                    af_admin = af.get("admin-state", "enable")
+                    af_oper = af.get("oper-state", "up" if af_admin != "disable" and oper.lower() == "up" else "down")
+                    af_pref = af.get("preference", 90)
+                    af_ext_pref = af.get("external-preference", 170)
+                    af_var = af.get("variance", 1)
+                    af_mp = af.get("maximum-paths", 4)
+                    af_mh = af.get("maximum-hops", 100)
+                    af_tsb = "enabled" if af.get("traffic-share-balanced", False) else "disabled"
+                    af_as = "enabled" if af.get("auto-summary", False) else "disabled"
+                    output.print_line(f"  {af_name} (Admin: {af_admin}, Oper: {af_oper}):")
+                    output.print_line(f"    Pref: {af_pref}/{af_ext_pref}, Variance: {af_var}, Max-Paths: {af_mp}, Max-Hops: {af_mh}")
+                    output.print_line(f"    Traffic-Share-Balanced: {af_tsb}, Auto-Summary: {af_as}")
+                    if af.get("export-policy") or af.get("import-policy"):
+                        output.print_line(f"    Export-Policy: {af.get('export-policy') or 'none'}, Import-Policy: {af.get('import-policy') or 'none'}")
             output.print_line(f"{'Last Telemetry Update':<24}: {updated}")
             output.print_line("=" * 80)
- 
+
     show_status = show_summary
 
     def show_neighbor(self, state, arguments, output, **kwargs):
@@ -776,6 +883,12 @@ class Plugin(CliPlugin):
                 norm_name = normalize_interface_name(raw_name)
                 ip = itf.get("ip-address", "")
                 plen = itf.get("prefix-length", 32)
+                if not ip:
+                    for af in itf.get("address-family", []):
+                        if af.get("ip-address"):
+                            ip = af.get("ip-address", "")
+                            plen = af.get("prefix-length", 32)
+                            break
                 oper = itf.get("oper-state", "Up")
                 rid = data.get("router-id", "unspecified") if data else "unspecified"
 
@@ -788,13 +901,15 @@ class Plugin(CliPlugin):
                 ]
 
                 # Find traffic statistics for this interface
-                traffic_list = data.get("traffic", []) if data else []
-                tf_match = [
-                    t for t in traffic_list
-                    if t.get("interface") == raw_name
-                    or normalize_interface_name(t.get("interface")) == norm_name
-                ]
-                tf = tf_match[0] if tf_match else {}
+                tf = itf.get("statistics") if isinstance(itf.get("statistics"), dict) else {}
+                if not tf:
+                    traffic_list = data.get("traffic", []) if data else []
+                    tf_match = [
+                        t for t in traffic_list
+                        if t.get("interface") == raw_name
+                        or normalize_interface_name(t.get("interface")) == norm_name
+                    ]
+                    tf = tf_match[0] if tf_match else {}
 
                 output.print_line("=" * 80)
                 output.print_line(f"EIGRP Interface Details: {norm_name} (Network-Instance: {netinst})")
@@ -813,7 +928,13 @@ class Plugin(CliPlugin):
                         else:
                             down_reason = "link down or inactive"
                     output.print_line(f"{'Down Reason':<26}: {down_reason}")
-                output.print_line(f"{'Passive Interface':<26}: {'true' if itf.get('passive', False) else 'false'}")
+                passive_val = bool(itf.get("passive", False))
+                if not passive_val:
+                    for af in itf.get("address-family", []):
+                        if af.get("passive", False):
+                            passive_val = True
+                            break
+                output.print_line(f"{'Passive Interface':<26}: {'true' if passive_val else 'false'}")
                 output.print_line(f"{'IP Address / Prefix':<26}: {ip}/{plen}")
                 bfd_raw = itf.get('bfd-state', 'disabled')
                 if isinstance(bfd_raw, dict):
@@ -822,12 +943,26 @@ class Plugin(CliPlugin):
                         bfd_str += f" (peer: {bfd_raw['remote-address']})"
                 else:
                     bfd_str = str(bfd_raw)
+                if bfd_str == "disabled":
+                    for af in itf.get("address-family", []):
+                        af_bfd_st = af.get("bfd-state", {})
+                        if isinstance(af_bfd_st, dict) and af_bfd_st.get("session-state") and af_bfd_st.get("session-state") != "disabled":
+                            bfd_str = str(af_bfd_st.get("session-state"))
+                            if "remote-address" in af_bfd_st:
+                                bfd_str += f" (peer: {af_bfd_st['remote-address']})"
+                            break
                 output.print_line(f"{'BFD State':<26}: {bfd_str}")
                 auth_val = itf.get('auth-mode', 'none')
                 if not auth_val or auth_val == 'none':
                     auth_c = itf.get('authentication', {})
                     if isinstance(auth_c, dict) and auth_c.get('mode'):
                         auth_val = auth_c.get('mode')
+                if not auth_val or auth_val == 'none':
+                    for af in itf.get("address-family", []):
+                        af_auth = af.get("authentication", {})
+                        if isinstance(af_auth, dict) and af_auth.get("mode") and af_auth.get("mode") != "none":
+                            auth_val = str(af_auth.get("mode"))
+                            break
                 output.print_line(f"{'Authentication Mode':<26}: {auth_val}")
                 output.print_line(f"{'Autonomous System':<26}: {asn}")
                 output.print_line(f"{'Router ID':<26}: {rid}")
@@ -912,6 +1047,12 @@ class Plugin(CliPlugin):
                     name = normalize_interface_name(itf.get("interface-name", itf.get("name", "")))
                     ip = itf.get("ip-address", "")
                     plen = str(itf.get("prefix-length", 32))
+                    if not ip:
+                        for af in itf.get("address-family", []):
+                            if af.get("ip-address"):
+                                ip = af.get("ip-address", "")
+                                plen = str(af.get("prefix-length", 32))
+                                break
                     oper = itf.get("oper-state", "Up")
                     passive_str = "true" if itf.get("passive", False) else "false"
                     if passive_str == "false":
@@ -984,12 +1125,17 @@ class Plugin(CliPlugin):
 
             topology = data.get("topology", []) if data else []
             if isinstance(topology, dict):
-                topology = list(topology.values())
+                if "prefix" in topology:
+                    topology = topology.get("prefix", [])
+                    if isinstance(topology, dict):
+                        topology = [topology]
+                else:
+                    topology = list(topology.values())
             if not topology:
                 output.print_line("No EIGRP topology entries found.")
             else:
                 for p in topology:
-                    dest = p.get("destination", "")
+                    dest = p.get("destination") or p.get("prefix", "")
                     code = "A" if p.get("active", False) else "P"
                     succ = p.get("successor-count", 0)
                     fd = p.get("feasible-distance", 0)
@@ -1021,6 +1167,12 @@ class Plugin(CliPlugin):
             output.print_line("-" * 80)
 
             traffic = data.get("traffic", []) if data else []
+            if not traffic and data:
+                for itf in (data.get("interfaces") or data.get("interface", [])):
+                    if isinstance(itf, dict) and isinstance(itf.get("statistics"), dict):
+                        st = dict(itf["statistics"])
+                        st["interface"] = itf.get("interface-name", itf.get("name", ""))
+                        traffic.append(st)
             if not traffic:
                 output.print_line("No EIGRP traffic statistics available.")
             else:
@@ -1051,7 +1203,12 @@ class Plugin(CliPlugin):
 
             events = data.get("event-log", []) if data else []
             if isinstance(events, dict):
-                events = list(events.values())
+                if "entry" in events:
+                    events = events.get("entry", [])
+                    if isinstance(events, dict):
+                        events = [events]
+                else:
+                    events = list(events.values())
             if not events:
                 output.print_line("No EIGRP event log entries recorded.")
             else:

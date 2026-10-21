@@ -4144,13 +4144,20 @@ void srlShimTrafficReport(const char *netinst) {
     }
 }
 
-int srlShimVarianceUpdate(const char *netinst, uint8_t variance) {
+static int srl_parse_afi_filter(const char *afi_name);
+
+int srlShimVarianceUpdateAfi(const char *netinst, const char *afi_name, uint8_t variance) {
     const char *ni = (netinst && netinst[0]) ? netinst : "default";
+    int target_afi = srl_parse_afi_filter(afi_name);
+    uint8_t var = variance ? variance : 1;
     eigrp_instance_t *instances[32];
     int count = 0;
     pthread_mutex_lock(&g_data_lock);
     for (srl_binding_t *b = g_bindings; b && count < 32; b = b->next) {
         if (strcmp(b->netinst, ni) == 0 && b->eigrp) {
+            if (target_afi != -1 && (int)eigrp_instance_afi(b->eigrp) != target_afi) {
+                continue;
+            }
             instances[count++] = b->eigrp;
         }
     }
@@ -4161,18 +4168,58 @@ int srlShimVarianceUpdate(const char *netinst, uint8_t variance) {
         memset(&ctx, 0, sizeof(ctx));
         ctx.runtime = instances[i];
         ctx.config = eigrp_af_config_runtime_read(instances[i]);
-        (void)eigrp_metric_variance_update(EIGRP_SET, &ctx, variance);
+        (void)eigrp_metric_variance_update(EIGRP_SET, &ctx, var);
+    }
+    return 0;
+}
+
+int srlShimVarianceUpdate(const char *netinst, uint8_t variance) {
+    return srlShimVarianceUpdateAfi(netinst, NULL, variance);
+}
+
+int srlShimMaxPathsUpdateAfi(const char *netinst, const char *afi_name, uint8_t max_paths) {
+    const char *ni = (netinst && netinst[0]) ? netinst : "default";
+    int target_afi = srl_parse_afi_filter(afi_name);
+    uint8_t mp = max_paths ? max_paths : 4;
+    eigrp_instance_t *instances[32];
+    int count = 0;
+    pthread_mutex_lock(&g_data_lock);
+    for (srl_binding_t *b = g_bindings; b && count < 32; b = b->next) {
+        if (strcmp(b->netinst, ni) == 0 && b->eigrp) {
+            if (target_afi != -1 && (int)eigrp_instance_afi(b->eigrp) != target_afi) {
+                continue;
+            }
+            instances[count++] = b->eigrp;
+        }
+    }
+    pthread_mutex_unlock(&g_data_lock);
+
+    for (int i = 0; i < count; i++) {
+        eigrp_instance_context_t ctx;
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.runtime = instances[i];
+        ctx.config = eigrp_af_config_runtime_read(instances[i]);
+        (void)eigrp_topology_maximum_paths_update(EIGRP_SET, &ctx, mp);
     }
     return 0;
 }
 
 int srlShimMaxPathsUpdate(const char *netinst, uint8_t max_paths) {
+    return srlShimMaxPathsUpdateAfi(netinst, NULL, max_paths);
+}
+
+int srlShimMaxHopsUpdateAfi(const char *netinst, const char *afi_name, uint8_t max_hops) {
     const char *ni = (netinst && netinst[0]) ? netinst : "default";
+    int target_afi = srl_parse_afi_filter(afi_name);
+    uint8_t mh = max_hops ? max_hops : 100;
     eigrp_instance_t *instances[32];
     int count = 0;
     pthread_mutex_lock(&g_data_lock);
     for (srl_binding_t *b = g_bindings; b && count < 32; b = b->next) {
         if (strcmp(b->netinst, ni) == 0 && b->eigrp) {
+            if (target_afi != -1 && (int)eigrp_instance_afi(b->eigrp) != target_afi) {
+                continue;
+            }
             instances[count++] = b->eigrp;
         }
     }
@@ -4183,31 +4230,13 @@ int srlShimMaxPathsUpdate(const char *netinst, uint8_t max_paths) {
         memset(&ctx, 0, sizeof(ctx));
         ctx.runtime = instances[i];
         ctx.config = eigrp_af_config_runtime_read(instances[i]);
-        (void)eigrp_topology_maximum_paths_update(EIGRP_SET, &ctx, max_paths);
+        (void)eigrp_metric_maximum_hops_update(EIGRP_SET, &ctx, mh);
     }
     return 0;
 }
 
 int srlShimMaxHopsUpdate(const char *netinst, uint8_t max_hops) {
-    const char *ni = (netinst && netinst[0]) ? netinst : "default";
-    eigrp_instance_t *instances[32];
-    int count = 0;
-    pthread_mutex_lock(&g_data_lock);
-    for (srl_binding_t *b = g_bindings; b && count < 32; b = b->next) {
-        if (strcmp(b->netinst, ni) == 0 && b->eigrp) {
-            instances[count++] = b->eigrp;
-        }
-    }
-    pthread_mutex_unlock(&g_data_lock);
-
-    for (int i = 0; i < count; i++) {
-        eigrp_instance_context_t ctx;
-        memset(&ctx, 0, sizeof(ctx));
-        ctx.runtime = instances[i];
-        ctx.config = eigrp_af_config_runtime_read(instances[i]);
-        (void)eigrp_metric_maximum_hops_update(EIGRP_SET, &ctx, max_hops);
-    }
-    return 0;
+    return srlShimMaxHopsUpdateAfi(netinst, NULL, max_hops);
 }
 
 int srlShimActiveTimeUpdate(const char *netinst, uint16_t minutes) {

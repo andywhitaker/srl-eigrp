@@ -44,6 +44,8 @@ type RouteInfo struct {
 	External              bool   `json:"external"`
 	Preference            uint8  `json:"preference,omitempty"`
 	Interface             string `json:"interface,omitempty"`
+	RawNextHop            string `json:"-"`
+	RawInterface          string `json:"-"`
 	RefreshedAfterRestart bool   `json:"-"`
 }
 
@@ -62,18 +64,19 @@ type NeighborInfo struct {
 }
 
 type InterfaceInfo struct {
-	Name           string `json:"name"`
-	InterfaceName  string `json:"interface-name,omitempty"`
-	AdminState     string `json:"admin-state,omitempty"`
-	IPAddress      string `json:"ip-address"`
-	PrefixLen      uint32 `json:"prefix-length"`
-	IP6Address     string `json:"ip6-address,omitempty"`
-	PrefixLen6     uint32 `json:"prefix-length6,omitempty"`
-	OperState      string `json:"oper-state"`
-	OperDownReason string `json:"oper-down-reason,omitempty"`
-	BfdState       string `json:"bfd-state,omitempty"`
-	AuthMode       string `json:"auth-mode,omitempty"`
-	Passive        bool   `json:"passive"`
+	Name           string       `json:"name"`
+	InterfaceName  string       `json:"interface-name,omitempty"`
+	AdminState     string       `json:"admin-state,omitempty"`
+	IPAddress      string       `json:"ip-address"`
+	PrefixLen      uint32       `json:"prefix-length"`
+	IP6Address     string       `json:"ip6-address,omitempty"`
+	PrefixLen6     uint32       `json:"prefix-length6,omitempty"`
+	OperState      string       `json:"oper-state"`
+	OperDownReason string       `json:"oper-down-reason,omitempty"`
+	BfdState       string       `json:"bfd-state,omitempty"`
+	AuthMode       string       `json:"auth-mode,omitempty"`
+	Passive        bool         `json:"passive"`
+	Statistics     *TrafficInfo `json:"statistics,omitempty"`
 }
 
 type TopologyRouteInfo struct {
@@ -88,16 +91,19 @@ type TopologyRouteInfo struct {
 }
 
 type TopologyPrefixInfo struct {
-	Destination    string               `json:"destination"`
+	Prefix         string               `json:"prefix"`
+	Destination    string               `json:"destination,omitempty"`
 	Active         bool                 `json:"active"`
 	FD             uint32               `json:"feasible-distance"`
 	WideFD         uint64               `json:"wide-feasible-distance"`
 	SuccessorCount uint32               `json:"successor-count"`
+	External       bool                 `json:"external"`
+	Preference     uint8                `json:"preference,omitempty"`
 	Routes         []*TopologyRouteInfo `json:"routes"`
 }
 
 type TrafficInfo struct {
-	Interface       string `json:"interface"`
+	Interface       string `json:"interface,omitempty"`
 	ReliableMcast   uint64 `json:"reliable-multicast"`
 	UnreliableMcast uint64 `json:"unreliable-multicast"`
 	ReliableUcast   uint64 `json:"reliable-unicast"`
@@ -130,29 +136,15 @@ type EigrpInstance struct {
 	routerId             string
 	adminState           string
 	operState            string
-	networks             []string
 	configuredInterfaces map[string]*InterfaceConfig
 	defaultIntf          *DefaultInterfaceConfig
-	exportPolicy         string
-	importPolicy         string
-	variance             uint8
-	maximumPaths         uint8
-	maximumHops          uint8
 	ribScale             uint8
-	preference           uint8
-	externalPreference   uint8
 	wideMetrics          bool
-	trafficShareBalanced bool
-	autoSummary          bool
 	eventLogSize         uint32
-	defaultMetric        *PolicyMetricConfig
-	maximumPrefix        *MaxPrefixConfig
 	hasV6                bool
 	gracefulRestart      *GracefulRestartConfig
 	metrics              *MetricsConfig
-	metricWeights        *MetricsConfig
 	timers               *TimersConfig
-	authentication       *AuthConfig
 	addressFamily        []AddressFamilyConfig
 	restarting           bool
 	bfdSessions          map[string]string
@@ -160,13 +152,14 @@ type EigrpInstance struct {
 	redistributedRoutes  map[string]string
 	redistributedHashes  map[string]string
 
-	routes     map[string]*RouteInfo
-	neighbors  map[string]*NeighborInfo
-	interfaces map[string]*InterfaceInfo
-	topology   map[string]*TopologyPrefixInfo
-	traffic    map[string]*TrafficInfo
-	eventLog   []*EventLogInfo
-	currentPfx *TopologyPrefixInfo
+	routes        map[string]*RouteInfo
+	learnedRoutes map[string]*RouteInfo
+	neighbors     map[string]*NeighborInfo
+	interfaces    map[string]*InterfaceInfo
+	topology      map[string]*TopologyPrefixInfo
+	traffic       map[string]*TrafficInfo
+	eventLog      []*EventLogInfo
+	currentPfx    *TopologyPrefixInfo
 
 	tempNeighbors  map[string]*NeighborInfo
 	tempInterfaces map[string]*InterfaceInfo
@@ -204,11 +197,11 @@ func (inst *EigrpInstance) SetAfiAdminState(afi string, state string) {
 
 func (inst *EigrpInstance) GetAfiExportPolicy(afi string) string {
 	for _, af := range inst.addressFamily {
-		if af.Name == afi && af.ExportPolicy != "" {
+		if af.Name == afi {
 			return af.ExportPolicy
 		}
 	}
-	return inst.exportPolicy
+	return ""
 }
 
 func (inst *EigrpInstance) SetAfiExportPolicy(afi string, policy string) {
@@ -226,11 +219,11 @@ func (inst *EigrpInstance) SetAfiExportPolicy(afi string, policy string) {
 
 func (inst *EigrpInstance) GetAfiImportPolicy(afi string) string {
 	for _, af := range inst.addressFamily {
-		if af.Name == afi && af.ImportPolicy != "" {
+		if af.Name == afi {
 			return af.ImportPolicy
 		}
 	}
-	return inst.importPolicy
+	return ""
 }
 
 func (inst *EigrpInstance) SetAfiImportPolicy(afi string, policy string) {
@@ -243,6 +236,72 @@ func (inst *EigrpInstance) SetAfiImportPolicy(afi string, policy string) {
 	inst.addressFamily = append(inst.addressFamily, AddressFamilyConfig{
 		Name:         afi,
 		ImportPolicy: policy,
+	})
+}
+
+func (inst *EigrpInstance) GetAfiVariance(afi string) uint8 {
+	for _, af := range inst.addressFamily {
+		if af.Name == afi && af.Variance > 0 {
+			return af.Variance
+		}
+	}
+	return 1
+}
+
+func (inst *EigrpInstance) SetAfiVariance(afi string, val uint8) {
+	for i, af := range inst.addressFamily {
+		if af.Name == afi {
+			inst.addressFamily[i].Variance = val
+			return
+		}
+	}
+	inst.addressFamily = append(inst.addressFamily, AddressFamilyConfig{
+		Name:     afi,
+		Variance: val,
+	})
+}
+
+func (inst *EigrpInstance) GetAfiMaximumPaths(afi string) uint8 {
+	for _, af := range inst.addressFamily {
+		if af.Name == afi && af.MaximumPaths > 0 {
+			return af.MaximumPaths
+		}
+	}
+	return 4
+}
+
+func (inst *EigrpInstance) SetAfiMaximumPaths(afi string, val uint8) {
+	for i, af := range inst.addressFamily {
+		if af.Name == afi {
+			inst.addressFamily[i].MaximumPaths = val
+			return
+		}
+	}
+	inst.addressFamily = append(inst.addressFamily, AddressFamilyConfig{
+		Name:         afi,
+		MaximumPaths: val,
+	})
+}
+
+func (inst *EigrpInstance) GetAfiMaximumHops(afi string) uint8 {
+	for _, af := range inst.addressFamily {
+		if af.Name == afi && af.MaximumHops > 0 {
+			return af.MaximumHops
+		}
+	}
+	return 100
+}
+
+func (inst *EigrpInstance) SetAfiMaximumHops(afi string, val uint8) {
+	for i, af := range inst.addressFamily {
+		if af.Name == afi {
+			inst.addressFamily[i].MaximumHops = val
+			return
+		}
+	}
+	inst.addressFamily = append(inst.addressFamily, AddressFamilyConfig{
+		Name:        afi,
+		MaximumHops: val,
 	})
 }
 
@@ -260,13 +319,8 @@ func isDefaultPolicyMetric(dm *PolicyMetricConfig) bool {
 func (inst *EigrpInstance) GetAfiPreference(afi string) uint8 {
 	for _, af := range inst.addressFamily {
 		if af.Name == afi && af.Preference > 0 {
-			if af.Preference != 90 || inst.preference == 0 {
-				return af.Preference
-			}
+			return af.Preference
 		}
-	}
-	if inst.preference > 0 {
-		return inst.preference
 	}
 	return 90
 }
@@ -287,13 +341,8 @@ func (inst *EigrpInstance) SetAfiPreference(afi string, pref uint8) {
 func (inst *EigrpInstance) GetAfiExternalPreference(afi string) uint8 {
 	for _, af := range inst.addressFamily {
 		if af.Name == afi && af.ExternalPreference > 0 {
-			if af.ExternalPreference != 170 || inst.externalPreference == 0 {
-				return af.ExternalPreference
-			}
+			return af.ExternalPreference
 		}
-	}
-	if inst.externalPreference > 0 {
-		return inst.externalPreference
 	}
 	return 170
 }
@@ -336,7 +385,7 @@ func (inst *EigrpInstance) GetAfiTrafficShareBalanced(afi string) bool {
 			return *af.TrafficShareBalanced
 		}
 	}
-	return inst.trafficShareBalanced
+	return false
 }
 
 func (inst *EigrpInstance) SetAfiTrafficShareBalanced(afi string, val *bool) {
@@ -358,7 +407,7 @@ func (inst *EigrpInstance) GetAfiAutoSummary(afi string) bool {
 			return *af.AutoSummary
 		}
 	}
-	return inst.autoSummary
+	return false
 }
 
 func (inst *EigrpInstance) SetAfiAutoSummary(afi string, val *bool) {
@@ -377,12 +426,10 @@ func (inst *EigrpInstance) SetAfiAutoSummary(afi string, val *bool) {
 func (inst *EigrpInstance) GetAfiDefaultMetric(afi string) *PolicyMetricConfig {
 	for _, af := range inst.addressFamily {
 		if af.Name == afi && af.DefaultMetric != nil {
-			if !isDefaultPolicyMetric(af.DefaultMetric) || isDefaultPolicyMetric(inst.defaultMetric) {
-				return af.DefaultMetric
-			}
+			return af.DefaultMetric
 		}
 	}
-	return inst.defaultMetric
+	return nil
 }
 
 func (inst *EigrpInstance) SetAfiDefaultMetric(afi string, dm *PolicyMetricConfig) {
@@ -400,19 +447,11 @@ func (inst *EigrpInstance) SetAfiDefaultMetric(afi string, dm *PolicyMetricConfi
 
 func (inst *EigrpInstance) GetAfiMaximumPrefix(afi string) *MaxPrefixConfig {
 	for _, af := range inst.addressFamily {
-		if af.Name == afi && af.MaximumPrefix != nil && af.MaximumPrefix.Limit > 0 {
-			return af.MaximumPrefix
-		}
-	}
-	if inst.maximumPrefix != nil && inst.maximumPrefix.Limit > 0 {
-		return inst.maximumPrefix
-	}
-	for _, af := range inst.addressFamily {
 		if af.Name == afi && af.MaximumPrefix != nil {
 			return af.MaximumPrefix
 		}
 	}
-	return inst.maximumPrefix
+	return nil
 }
 
 func (inst *EigrpInstance) SetAfiMaximumPrefix(afi string, mp *MaxPrefixConfig) {
@@ -433,17 +472,13 @@ func newEigrpInstance(netinst string) *EigrpInstance {
 		netinst:              netinst,
 		adminState:           "enable",
 		operState:            "up",
-		variance:             1,
-		maximumPaths:         4,
-		maximumHops:          100,
 		ribScale:             128,
-		preference:           90,
-		externalPreference:   170,
 		wideMetrics:          true,
 		eventLogSize:         500,
 		configuredInterfaces: make(map[string]*InterfaceConfig),
 		staticNeighbors:      make(map[string]*StaticNeighborConfig),
 		routes:               make(map[string]*RouteInfo),
+		learnedRoutes:        make(map[string]*RouteInfo),
 		neighbors:            make(map[string]*NeighborInfo),
 		interfaces:           make(map[string]*InterfaceInfo),
 		topology:             make(map[string]*TopologyPrefixInfo),
@@ -722,6 +757,7 @@ func (d *EigrpDaemon) CollectAndPublish(ctx context.Context) {
 		} else {
 			d.mu.Lock()
 			inst.routes = make(map[string]*RouteInfo)
+			inst.learnedRoutes = make(map[string]*RouteInfo)
 			inst.eventLog = make([]*EventLogInfo, 0)
 			d.mu.Unlock()
 		}
@@ -832,18 +868,14 @@ func (d *EigrpDaemon) OnNeighborReport(netinst, ip, ifname, state string, hold u
 
 	// Check interface config for auth mode fallback
 	if authMode == "" || authMode == "none" {
-		auth := ic.GetAfiAuthentication(afiName, inst.defaultIntf, inst.authentication)
+		auth := ic.GetAfiAuthentication(afiName, inst.defaultIntf)
 		if auth != nil && auth.Mode != "" {
 			authMode = auth.Mode
 		} else if inst.defaultIntf != nil {
 			authDef := inst.defaultIntf.GetAfiAuthentication(afiName)
 			if authDef != nil && authDef.Mode != "" {
 				authMode = authDef.Mode
-			} else if inst.authentication != nil && inst.authentication.Mode != "" {
-				authMode = inst.authentication.Mode
 			}
-		} else if inst.authentication != nil && inst.authentication.Mode != "" {
-			authMode = inst.authentication.Mode
 		}
 	}
 
@@ -916,7 +948,7 @@ func (d *EigrpDaemon) OnInterfaceReport(netinst, name, ipAddr string, prefixlen 
 	}
 
 	authMode := "none"
-	auth := ic.GetAfiAuthentication(afi, inst.defaultIntf, inst.authentication)
+	auth := ic.GetAfiAuthentication(afi, inst.defaultIntf)
 	if auth != nil && auth.Mode != "" {
 		authMode = auth.Mode
 	}
@@ -927,14 +959,7 @@ func (d *EigrpDaemon) OnInterfaceReport(netinst, name, ipAddr string, prefixlen 
 	}
 	isPassive := ic.IsAfiPassive(afi, defPassive)
 
-	defAdmin := "enable"
-	if inst.defaultIntf != nil && inst.defaultIntf.AdminState != "" {
-		defAdmin = inst.defaultIntf.AdminState
-	}
-	adminState := "enable"
-	if !ic.IsAfiEnabled(afi, defAdmin) {
-		adminState = "disable"
-	}
+	adminState := ic.GetAdminState(inst.defaultIntf)
 
 	targetMap := inst.interfaces
 	if inst.collecting {
@@ -995,12 +1020,25 @@ func (d *EigrpDaemon) OnTopologyPrefix(netinst, prefix string, active bool, fd u
 		inst.currentPfx = nil
 		return
 	}
+	isExt := false
+	if r, ok := inst.learnedRoutes[prefix]; ok && r != nil {
+		isExt = r.External
+	} else if r, ok := inst.routes[prefix]; ok && r != nil {
+		isExt = r.External
+	}
+	pref := inst.GetAfiPreference(afiName)
+	if isExt {
+		pref = inst.GetAfiExternalPreference(afiName)
+	}
 	p := &TopologyPrefixInfo{
+		Prefix:         prefix,
 		Destination:    prefix,
 		Active:         active,
 		FD:             fd,
 		WideFD:         wideFd,
 		SuccessorCount: succCount,
+		External:       isExt,
+		Preference:     pref,
 		Routes:         make([]*TopologyRouteInfo, 0),
 	}
 	if inst.collecting {

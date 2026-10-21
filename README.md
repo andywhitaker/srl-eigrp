@@ -212,8 +212,15 @@ A:srl1# info from state /network-instance default protocols eigrp
     total-routes 1
     interface ethernet-1/1.0 {
         oper-state up
-        ip-address 10.0.0.1
-        prefix-length 30
+        statistics {
+            reliable-multicast 2
+            unreliable-multicast 12
+        }
+        address-family ipv4-unicast {
+            oper-state up
+            ip-address 10.0.0.1
+            prefix-length 30
+        }
     }
     neighbor 10.0.0.2 {
         interface ethernet-1/1.0
@@ -223,11 +230,26 @@ A:srl1# info from state /network-instance default protocols eigrp
         srtt-ms 9
         rto-ms 200
     }
-    route 192.0.2.2/32 {
-        next-hop 10.0.0.2
-        metric 7864320
-        external false
-        preference 90
+    topology {
+        total-prefixes 2
+        active-prefixes 0
+        prefix 192.0.2.2/32 {
+            active false
+            feasible-distance 61440
+            wide-feasible-distance 7864320
+            successor-count 1
+            external false
+            preference 90
+            route 10.0.0.2 {
+                interface ethernet-1/1.0
+                successor true
+                feasible-successor false
+                distance 61440
+                wide-distance 7864320
+                reported-distance 56320
+                wide-reported-distance 7208960
+            }
+        }
     }
 ```
 
@@ -248,17 +270,16 @@ set / network-instance default protocols eigrp interface system0.0 address-famil
 ```
 
 ### 2. Unequal-Cost Load Balancing (`variance` & `traffic-share-balanced`)
-Allows EIGRP to install feasible successor routes with metrics up to `variance × FD` into the FIB, and configure proportional traffic sharing across unequal-cost paths:
+Allows EIGRP to install feasible successor routes with metrics up to `variance × FD` into the FIB, and configure proportional traffic sharing across unequal-cost paths per address family:
 ```text
-set / network-instance default protocols eigrp variance 2
-set / network-instance default protocols eigrp traffic-share-balanced true
+set / network-instance default protocols eigrp address-family ipv4-unicast variance 2
 set / network-instance default protocols eigrp address-family ipv4-unicast traffic-share-balanced true
 ```
 
 ### 3. Equal-Cost Multipath (ECMP Maximum Paths)
-Limits the maximum number of parallel paths installed in the FIB (1 to 64):
+Limits the maximum number of parallel paths installed in the FIB (1 to 64) per address family:
 ```text
-set / network-instance default protocols eigrp maximum-paths 4
+set / network-instance default protocols eigrp address-family ipv4-unicast maximum-paths 4
 ```
 
 ### 4. Named Metric Weights (K-Values)
@@ -273,7 +294,7 @@ set / network-instance default protocols eigrp metrics extended-attributes 0    
 ```
 
 ### 5. Address Families, Default Seed Metric & Routing Policy Redistribution (`export-policy` / `import-policy` / `default-metric`)
-Attach standard Nokia SR Linux routing policies under `address-family ipv4-unicast` and `address-family ipv6-unicast` to redistribute routes from OSPF (OSPFv2/OSPFv3), IS-IS, BGP, or local/static interfaces into EIGRP. You can also configure instance-wide or per-address-family `default-metric` seed values for redistributed routes when a policy statement does not specify explicit metrics.
+Attach standard Nokia SR Linux routing policies under `address-family ipv4-unicast` and `address-family ipv6-unicast` to redistribute routes from OSPF (OSPFv2/OSPFv3), IS-IS, BGP, or local/static interfaces into EIGRP. You can also configure per-address-family `default-metric` seed values for redistributed routes when a policy statement does not specify explicit metrics.
 
 #### Route Preferences (Administrative Distance)
 In alignment with industry standards:
@@ -282,7 +303,6 @@ In alignment with industry standards:
 
 ```text
 # 1. Configure default seed metric for redistributed routes (optional)
-set / network-instance default protocols eigrp default-metric bandwidth 100000 delay 100 reliability 255 load 1 mtu 1500
 set / network-instance default protocols eigrp address-family ipv4-unicast default-metric bandwidth 100000 delay 100 reliability 255 load 1 mtu 1500
 
 # 2. Define routing policy with protocol match and EIGRP metric action
@@ -319,7 +339,7 @@ set / network-instance vrf-1 protocols eigrp interface lo0.1 address-family ipv4
 All routes, FIB injection via NDK, and telemetry streaming are completely isolated per network instance and viewable via `show network-instance <name> protocols eigrp ...`.
 
 ### 7. Interface Fine-Tuning, Bandwidth Percent & Per-Address-Family Controls
-Interface settings (including `bandwidth-percent`, timers, `split-horizon`, `next-hop-self`, `passive`, `authentication`, and `bfd`) can be configured per address family (`address-family ipv4-unicast` / `ipv6-unicast`), at the interface level, or inherited from `default-interface`:
+Interface settings (`bandwidth` and `delay` at the link level; `bandwidth-percent`, timers, `split-horizon`, `next-hop-self`, `passive`, `authentication`, and `bfd` per address family `address-family ipv4-unicast` / `ipv6-unicast`) can be configured on individual interfaces or inherited from `default-interface`:
 ```text
 # Per-AFI interface parameters (timers, bandwidth-percent, split-horizon, next-hop-self, passive):
 set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast hello-interval 5
@@ -331,7 +351,6 @@ set / network-instance default protocols eigrp interface ethernet-1/1.0 address-
 
 # Link-level interface properties:
 set / network-instance default protocols eigrp interface ethernet-1/1.0 bandwidth 1000000
-set / network-instance default protocols eigrp interface ethernet-1/1.0 bandwidth-percent 50
 set / network-instance default protocols eigrp interface ethernet-1/1.0 delay 100
 ```
 
@@ -339,16 +358,14 @@ set / network-instance default protocols eigrp interface ethernet-1/1.0 delay 10
 Configure DUAL Stuck-in-Active (SIA) timer, hop count limits, topology prefix limits (`maximum-prefix`), and protocol event log history size (`event-log-size`):
 ```text
 set / network-instance default protocols eigrp timers active-time 3
-set / network-instance default protocols eigrp maximum-hops 100
+set / network-instance default protocols eigrp address-family ipv4-unicast maximum-hops 100
 set / network-instance default protocols eigrp event-log-size 500
-set / network-instance default protocols eigrp maximum-prefix limit 1000 threshold 75 warning-only false
 set / network-instance default protocols eigrp address-family ipv4-unicast maximum-prefix limit 1000 threshold 75 warning-only false
 ```
 
 ### 9. Route Summarization (`summary-address` & `auto-summary`)
 Configure manual summary prefixes with custom administrative distance directly on interfaces under the appropriate address family, or enable classful boundary `auto-summary`:
 ```text
-set / network-instance default protocols eigrp auto-summary false
 set / network-instance default protocols eigrp address-family ipv4-unicast auto-summary false
 set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast summary-address 10.0.0.0/16 distance 5
 ```
@@ -374,9 +391,11 @@ Verify the wide metric and scaled FIB metric via CLI:
 ```text
 A:srl1# info from state network-instance default protocols eigrp
     rib-scale 64
-    route 192.0.2.2/32 {
-        wide-metric 7864320
-        metric 122880
+    topology {
+        prefix 192.0.2.2/32 {
+            feasible-distance 122880
+            wide-feasible-distance 7864320
+        }
     }
 
 A:srl1# show network-instance default ipv4 route 192.0.2.2/32
@@ -395,11 +414,11 @@ Secure EIGRP peering and route exchanges with cryptographic digest authenticatio
 set / system authentication keychain eigrp-md5-key admin-state enable type ospf key 1 algorithm md5 authentication-key authsecret123
 set / system authentication keychain eigrp-sha-key admin-state enable type isis key 1 algorithm hmac-sha-256 authentication-key shasecret456
 
-# 2. Attach keychain to an interface (or default-interface)
-set / network-instance default protocols eigrp interface ethernet-1/1.0 authentication mode md5 keychain eigrp-md5-key
+# 2. Attach keychain to an interface (or default-interface) address-family
+set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast authentication mode md5 keychain eigrp-md5-key
 
 # Or enable HMAC-SHA-256 authentication:
-set / network-instance default protocols eigrp interface ethernet-1/1.0 authentication mode hmac-sha-256 keychain eigrp-sha-key
+set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast authentication mode hmac-sha-256 keychain eigrp-sha-key
 ```
 
 ### 13. Graceful Restart / Non-Stop Forwarding (NSF)
@@ -427,14 +446,14 @@ Integrates EIGRP with the Nokia SR Linux micro-BFD engine for sub-second failure
 - **Fast Adjacency Teardown**: Upon BFD session down transition (`BFD_SESSION_STATUS_DOWN` or `BFD_SESSION_STATUS_ADMIN_DOWN`), immediately clears the neighbor adjacency and triggers DUAL recalculation without waiting for hold timer expiration.
 
 ```text
-# Enable BFD globally for all EIGRP interfaces via default-interface
-set / network-instance default protocols eigrp default-interface bfd admin-state enable
-set / network-instance default protocols eigrp default-interface bfd desired-minimum-tx-interval 100000
-set / network-instance default protocols eigrp default-interface bfd required-minimum-receive 100000
-set / network-instance default protocols eigrp default-interface bfd detection-multiplier 3
+# Enable BFD globally for all EIGRP interfaces via default-interface address-family
+set / network-instance default protocols eigrp default-interface address-family ipv4-unicast bfd admin-state enable
+set / network-instance default protocols eigrp default-interface address-family ipv4-unicast bfd desired-minimum-tx-interval 100000
+set / network-instance default protocols eigrp default-interface address-family ipv4-unicast bfd required-minimum-receive 100000
+set / network-instance default protocols eigrp default-interface address-family ipv4-unicast bfd detection-multiplier 3
 
-# Or enable/override per individual interface
-set / network-instance default protocols eigrp interface ethernet-1/1.0 bfd admin-state enable
+# Or enable/override per individual interface address-family
+set / network-instance default protocols eigrp interface ethernet-1/1.0 address-family ipv4-unicast bfd admin-state enable
 ```
 Simulate or trigger neighbor teardown via BFD down event:
 ```text
