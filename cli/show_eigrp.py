@@ -158,6 +158,10 @@ def load_state(state=None, netinst="default"):
                 routes = raw.get("route", [])
                 if isinstance(routes, dict):
                     routes = [routes]
+                if not routes and "routes" in local_data:
+                    routes = local_data.get("routes") or []
+                elif not routes and "route" in local_data:
+                    routes = local_data.get("route") or []
                 if not routes and topos:
                     for t in topos:
                         if not isinstance(t, dict):
@@ -169,18 +173,21 @@ def load_state(state=None, netinst="default"):
                             if isinstance(r, dict) and r.get("successor", False):
                                 nh = r.get("next-hop", "")
                                 if nh and nh not in ("0.0.0.0", "::", "connected", "Connected"):
+                                    r_dist = int(r.get("distance", t.get("feasible-distance", 0)) or 0)
+                                    r_wide = int(r.get("wide-distance", t.get("wide-feasible-distance", 0)) or 0)
+                                    r_scale = int(t.get("rib-scale", raw.get("rib-scale", 128)) or 128)
+                                    if raw.get("wide-metrics", True) and r_scale > 0 and r_dist == r_wide and r_wide > 0:
+                                        r_dist = max(1, r_wide // r_scale)
                                     routes.append({
                                         "prefix": t.get("prefix") or t.get("destination", ""),
                                         "next-hop": nh,
                                         "interface": r.get("interface", ""),
-                                        "metric": r.get("distance", t.get("feasible-distance", 0)),
-                                        "wide-metric": r.get("wide-distance", t.get("wide-feasible-distance", 0)),
+                                        "metric": r_dist,
+                                        "wide-metric": r_wide,
                                         "external": t.get("external", False),
                                         "preference": t.get("preference", 170 if t.get("external", False) else 90),
-                                        "rib-scale": t.get("rib-scale", raw.get("rib-scale", 128)),
+                                        "rib-scale": r_scale,
                                     })
-                if not routes:
-                    routes = local_data.get("routes") or local_data.get("route", [])
 
                 traffics = raw.get("traffic", [])
                 if isinstance(traffics, dict):

@@ -122,6 +122,7 @@ type IPCRequest struct {
 	Action   string `json:"action"`
 	Netinst  string `json:"netinst"`
 	Neighbor string `json:"neighbor"`
+	Prefix   string `json:"prefix,omitempty"`
 }
 
 type IPCResponse struct {
@@ -1252,11 +1253,22 @@ func (d *EigrpDaemon) handleIPC(conn net.Conn) {
 
 	case "clear-topology":
 		cNetinst := C.CString(netinst)
-		C.srlShimTopologyClear(cNetinst, nil)
+		var cPfx *C.char
+		if req.Prefix != "" && req.Prefix != "*" && req.Prefix != "all" {
+			cPfx = C.CString(req.Prefix)
+		}
+		C.srlShimTopologyClear(cNetinst, cPfx)
+		if cPfx != nil {
+			C.free(unsafe.Pointer(cPfx))
+		}
 		C.free(unsafe.Pointer(cNetinst))
+		msg := fmt.Sprintf("Cleared EIGRP topology table in network-instance %s", netinst)
+		if req.Prefix != "" && req.Prefix != "*" && req.Prefix != "all" {
+			msg = fmt.Sprintf("Cleared EIGRP topology prefix %s in network-instance %s", req.Prefix, netinst)
+		}
 		_ = json.NewEncoder(conn).Encode(IPCResponse{
 			Status:  "ok",
-			Message: fmt.Sprintf("Cleared EIGRP topology table in network-instance %s", netinst),
+			Message: msg,
 		})
 		go d.CollectAndPublish(context.Background())
 

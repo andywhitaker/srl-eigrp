@@ -629,6 +629,22 @@ int srlTestRel030OverridesCheck(void)
     if (r_poison->adv_router != NULL)
         return -9;
 
+    /* 5. Peer codec downgrade on UP neighbor must update interface encoder peer counts. */
+    {
+        extern void __wrap_eigrp_nbr_codec_select(eigrp_nbr_t *nbr, uint8_t tlv_version);
+        eigrp.tlv1_codec.encoder = (void *)1;
+        eigrp.tlv1_codec.decoder = (void *)1;
+        eigrp.tlv2_codec.encoder = (void *)2;
+        eigrp.tlv2_codec.decoder = (void *)2;
+        nbr1.state = EIGRP_NEIGHBOR_UP;
+        nbr1.tlv_version = EIGRP_TLV_64B_VERSION;
+        ei.tlv2_peer_count = 1;
+        ei.tlv1_peer_count = 0;
+        __wrap_eigrp_nbr_codec_select(&nbr1, EIGRP_TLV_32B_VERSION);
+        if (ei.tlv2_peer_count != 0 || ei.tlv1_peer_count != 1)
+            return -10;
+    }
+
     eigrp_route_descriptor_delete(&eigrp, p1, r_poison);
     eigrp_prefix_descriptor_delete(&eigrp, eigrp.topology_table, p1);
     eigrp_list_delete(&ei.nbrs);
@@ -638,3 +654,28 @@ int srlTestRel030OverridesCheck(void)
     srl_saved_update_decoder = NULL;
     return 0;
 }
+
+extern void __real_eigrp_nbr_codec_select(eigrp_nbr_t *nbr, uint8_t tlv_version);
+extern void __real_eigrp_nbr_codec_update(eigrp_instance_t *eigrp);
+
+static __thread bool srl_in_codec_update = false;
+
+void __wrap_eigrp_nbr_codec_select(eigrp_nbr_t *nbr, uint8_t tlv_version)
+{
+    uint8_t old_version = nbr ? nbr->tlv_version : 0;
+    __real_eigrp_nbr_codec_select(nbr, tlv_version);
+    if (!srl_in_codec_update && nbr && nbr->ei && old_version != nbr->tlv_version &&
+        nbr->state == EIGRP_NEIGHBOR_UP) {
+        eigrp_intf_encoder_peer_remove(nbr->ei, old_version);
+        eigrp_intf_encoder_peer_add(nbr->ei, nbr->tlv_version);
+    }
+}
+
+void __wrap_eigrp_nbr_codec_update(eigrp_instance_t *eigrp)
+{
+    srl_in_codec_update = true;
+    __real_eigrp_nbr_codec_update(eigrp);
+    srl_in_codec_update = false;
+}
+
+

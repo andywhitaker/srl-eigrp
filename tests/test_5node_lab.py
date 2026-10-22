@@ -1272,12 +1272,15 @@ def test_5node_timers_maxprefix_bwpercent_ribscale_and_tools(srl_exec):
                 break
         assert v6_rec, f"IPv6 route 2001:db8::5/128 did not recover after rapid AF toggle on SRL1: {out_v6}"
 
-        # 6. Operational tools: statistics clear, event-log clear, neighbor clear, graceful-shutdown
+        # 6. Operational tools: statistics clear, event-log clear, topology clear prefix, neighbor clear, graceful-shutdown
         out_sclr = srl_exec("clab-eigrp-test-srl1", ["sr_cli", "tools network-instance default protocols eigrp statistics clear"])
         assert "Success" in out_sclr or "Cleared" in out_sclr, f"statistics clear failed: {out_sclr}"
 
         out_eclr = srl_exec("clab-eigrp-test-srl1", ["sr_cli", "tools network-instance default protocols eigrp event-log clear"])
         assert "Success" in out_eclr or "Cleared" in out_eclr, f"event-log clear failed: {out_eclr}"
+
+        out_pclr = srl_exec("clab-eigrp-test-srl1", ["sr_cli", "tools network-instance default protocols eigrp topology clear prefix 5.5.5.5/32"])
+        assert "5.5.5.5/32" in out_pclr and ("Success" in out_pclr or "Cleared" in out_pclr), f"topology clear prefix failed: {out_pclr}"
 
         out_nclr = srl_exec("clab-eigrp-test-srl1", ["sr_cli", "tools network-instance default protocols eigrp neighbor clear 10.1.2.2"])
         assert "Success" in out_nclr or "Cleared" in out_nclr, f"neighbor clear failed: {out_nclr}"

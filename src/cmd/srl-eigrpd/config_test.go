@@ -1192,3 +1192,120 @@ func TestTwoLevelAdminStateInheritance(t *testing.T) {
 		t.Fatalf("expected interface AF hello-interval=7 from container merge, got %d", got)
 	}
 }
+
+func TestContainerNotificationResetToDefaults(t *testing.T) {
+	d := &EigrpDaemon{
+		instances:    make(map[string]*EigrpInstance),
+		learnedVlans: make(map[string]uint16),
+	}
+	inst := newEigrpInstance("default")
+	d.instances["default"] = inst
+
+	// 1. Set interface admin-state=disable and delay=20 via container notification
+	d.HandleConfigNotification(&ndk.ConfigNotification{
+		Key:  &ndk.ConfigKey{JsPath: `.network_instance{.name=="default"}.protocols.eigrp.interface`, JsPathWithKeys: `.network_instance{.name=="default"}.protocols.eigrp.interface{.interface-name=="ethernet-1/2.0"}`},
+		Data: &ndk.ConfigData{DataType: &ndk.ConfigData_Json{Json: `{"admin-state": "disable", "delay": 20}`}},
+		Op:   ndk.SdkMgrOperation_SDK_MGR_OPERATION_UPDATE,
+	})
+	d.mu.RLock()
+	ic := inst.configuredInterfaces["ethernet-1/2.0"]
+	d.mu.RUnlock()
+	if ic == nil || ic.GetAdminState(nil) != "disable" || ic.GetDelay(nil) == nil || *ic.GetDelay(nil) != 20 {
+		t.Fatalf("expected interface admin-state=disable and delay=20, got admin=%s delay=%v", ic.GetAdminState(nil), ic.GetDelay(nil))
+	}
+
+	// 2. Re-enable interface admin-state=enable and delete delay (omitted from container JSON) via container notification
+	d.HandleConfigNotification(&ndk.ConfigNotification{
+		Key:  &ndk.ConfigKey{JsPath: `.network_instance{.name=="default"}.protocols.eigrp.interface`, JsPathWithKeys: `.network_instance{.name=="default"}.protocols.eigrp.interface{.interface-name=="ethernet-1/2.0"}`},
+		Data: &ndk.ConfigData{DataType: &ndk.ConfigData_Json{Json: `{"admin-state": "enable"}`}},
+		Op:   ndk.SdkMgrOperation_SDK_MGR_OPERATION_UPDATE,
+	})
+	if ic.GetAdminState(nil) != "enable" {
+		t.Fatalf("expected interface admin-state to reset to enable, got %s", ic.GetAdminState(nil))
+	}
+	if ic.GetDelay(nil) != nil {
+		t.Fatalf("expected interface delay to be cleared when omitted from container update, got %v", *ic.GetDelay(nil))
+	}
+
+	// 3. Set interface AF non-default values via container notification, then reset to YANG defaults via container notification
+	d.HandleConfigNotification(&ndk.ConfigNotification{
+		Key:  &ndk.ConfigKey{JsPath: `.network_instance{.name=="default"}.protocols.eigrp.interface.address-family`, JsPathWithKeys: `.network_instance{.name=="default"}.protocols.eigrp.interface{.interface-name=="ethernet-1/2.0"}.address-family{.name=="ipv4-unicast"}`},
+		Data: &ndk.ConfigData{DataType: &ndk.ConfigData_Json{Json: `{"admin-state":"disable","passive":true,"hello-interval":2,"hold-time":6,"split-horizon":false,"next-hop-self":true,"bandwidth-percent":250}`}},
+		Op:   ndk.SdkMgrOperation_SDK_MGR_OPERATION_UPDATE,
+	})
+	if ic.GetAfiAdminState("ipv4-unicast", nil) != "disable" || !ic.IsAfiPassive("ipv4-unicast", false) || ic.GetAfiHelloInterval("ipv4-unicast", nil) != 2 {
+		t.Fatal("expected interface AF non-default values to be applied")
+	}
+
+	d.HandleConfigNotification(&ndk.ConfigNotification{
+		Key:  &ndk.ConfigKey{JsPath: `.network_instance{.name=="default"}.protocols.eigrp.interface.address-family`, JsPathWithKeys: `.network_instance{.name=="default"}.protocols.eigrp.interface{.interface-name=="ethernet-1/2.0"}.address-family{.name=="ipv4-unicast"}`},
+		Data: &ndk.ConfigData{DataType: &ndk.ConfigData_Json{Json: `{"admin-state":"enable","passive":false,"hello-interval":5,"hold-time":15,"split-horizon":true,"next-hop-self":false,"bandwidth-percent":50,"authentication":{"admin-state":"enable","mode":"none"},"bfd":{"admin-state":"disable","desired-minimum-tx-interval":1000000,"required-minimum-receive":1000000,"detection-multiplier":3}}`}},
+		Op:   ndk.SdkMgrOperation_SDK_MGR_OPERATION_UPDATE,
+	})
+	if ic.GetAfiAdminState("ipv4-unicast", nil) != "enable" || ic.IsAfiPassive("ipv4-unicast", false) || ic.GetAfiHelloInterval("ipv4-unicast", nil) != 5 || ic.GetAfiHoldTime("ipv4-unicast", nil) != 15 || !ic.GetAfiSplitHorizon("ipv4-unicast", nil) || ic.GetAfiNextHopSelf("ipv4-unicast", nil) || ic.GetAfiBandwidthPercent("ipv4-unicast", nil) != 50 {
+		t.Fatal("expected interface AF values to reset to defaults on container update")
+	}
+}
+
+func TestAutoAllDefaultsChildAndDeleteEdgeCases(t *testing.T) {
+	d := &EigrpDaemon{
+		instances:    make(map[string]*EigrpInstance),
+		learnedVlans: make(map[string]uint16),
+	}
+	inst := newEigrpInstance("default")
+	d.instances["default"] = inst
+
+	// 1. Auto-created interface AF container with all YANG defaults followed by child authentication notification
+	d.HandleConfigNotification(&ndk.ConfigNotification{
+		Key:  &ndk.ConfigKey{JsPath: `.network_instance.protocols.eigrp.interface.address_family`, Keys: []string{"default", "ethernet-1/1.0", "ipv4-unicast"}},
+		Data: &ndk.ConfigData{DataType: &ndk.ConfigData_Json{Json: `{"admin-state":"enable","passive":false,"hello-interval":5,"hold-time":15,"split-horizon":true,"next-hop-self":false,"bandwidth-percent":50}`}},
+		Op:   ndk.SdkMgrOperation_SDK_MGR_OPERATION_CREATE,
+	})
+	d.HandleConfigNotification(&ndk.ConfigNotification{
+		Key:  &ndk.ConfigKey{JsPath: `.network_instance.protocols.eigrp.interface.address_family.authentication`, Keys: []string{"default", "ethernet-1/1.0", "ipv4-unicast"}},
+		Data: &ndk.ConfigData{DataType: &ndk.ConfigData_Json{Json: `{"admin-state":"enable","mode":"md5","keychain":"kc1"}`}},
+		Op:   ndk.SdkMgrOperation_SDK_MGR_OPERATION_CREATE,
+	})
+
+	// Configure default-interface hello-interval=9 -> interface AF should inherit hello-interval=9 because AutoAllDefaults was cleared by authentication
+	d.HandleConfigNotification(&ndk.ConfigNotification{
+		Key:  &ndk.ConfigKey{JsPath: `.network_instance.protocols.eigrp.default_interface`, Keys: []string{"default"}},
+		Data: &ndk.ConfigData{DataType: &ndk.ConfigData_Json{Json: `{"admin-state":"enable","address-family":[{"name":"ipv4-unicast","hello-interval":9,"hold-time":27}]}`}},
+		Op:   ndk.SdkMgrOperation_SDK_MGR_OPERATION_CREATE,
+	})
+	d.mu.RLock()
+	ic := inst.configuredInterfaces["ethernet-1/1.0"]
+	defIntf := inst.defaultIntf
+	d.mu.RUnlock()
+	if got := ic.GetAfiHelloInterval("ipv4-unicast", defIntf); got != 9 {
+		t.Fatalf("expected interface AF to inherit hello-interval 9 after authentication cleared AutoAllDefaults, got %d", got)
+	}
+	if auth := ic.GetAfiAuthentication("ipv4-unicast", defIntf); auth == nil || auth.Mode != "md5" {
+		t.Fatalf("expected interface AF authentication mode md5, got %+v", auth)
+	}
+
+	// 2. Static neighbor delete with empty JsPathWithKeys and populated Keys must delete only the target neighbor
+	d.HandleConfigNotification(&ndk.ConfigNotification{
+		Key:  &ndk.ConfigKey{JsPath: `.network_instance.protocols.eigrp.static_neighbor`, Keys: []string{"default", "10.0.0.2"}},
+		Data: &ndk.ConfigData{DataType: &ndk.ConfigData_Json{Json: `{"ip-address":"10.0.0.2","interface":"ethernet-1/1.0"}`}},
+		Op:   ndk.SdkMgrOperation_SDK_MGR_OPERATION_CREATE,
+	})
+	d.HandleConfigNotification(&ndk.ConfigNotification{
+		Key:  &ndk.ConfigKey{JsPath: `.network_instance.protocols.eigrp.static_neighbor`, Keys: []string{"default", "10.0.0.3"}},
+		Data: &ndk.ConfigData{DataType: &ndk.ConfigData_Json{Json: `{"ip-address":"10.0.0.3","interface":"ethernet-1/1.0"}`}},
+		Op:   ndk.SdkMgrOperation_SDK_MGR_OPERATION_CREATE,
+	})
+	d.HandleConfigNotification(&ndk.ConfigNotification{
+		Key: &ndk.ConfigKey{JsPath: `.network_instance.protocols.eigrp.static_neighbor`, Keys: []string{"default", "10.0.0.2"}},
+		Op:  ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE,
+	})
+	d.mu.RLock()
+	_, has2 := inst.staticNeighbors["10.0.0.2"]
+	_, has3 := inst.staticNeighbors["10.0.0.3"]
+	d.mu.RUnlock()
+	if has2 || !has3 {
+		t.Fatalf("expected only 10.0.0.2 deleted and 10.0.0.3 retained, got has2=%v has3=%v", has2, has3)
+	}
+}
+
+

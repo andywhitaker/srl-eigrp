@@ -869,7 +869,7 @@ EOF"""
         out_fib = srl_exec("clab-srl-srl-eigrp-srl1", [
             "sr_cli", "show network-instance default ipv4 route 192.0.2.2/32"
         ])
-        m = re.search(r'wide-(?:feasible-distance|distance|metric)\s+(\d+)', out_state)
+        m = re.search(r'prefix 192\.0\.2\.2/32\s*\{[^}]*wide-(?:feasible-distance|distance|metric)\s+(\d+)', out_state)
         if m and "rib-scale 64" in out_state:
             wm = int(m.group(1))
             expected_scaled = str(wm // 64)
@@ -896,7 +896,7 @@ EOF"""
         out_fib = srl_exec("clab-srl-srl-eigrp-srl1", [
             "sr_cli", "show network-instance default ipv4 route 192.0.2.2/32"
         ])
-        m = re.search(r'wide-(?:feasible-distance|distance|metric)\s+(\d+)', out_state)
+        m = re.search(r'prefix 192\.0\.2\.2/32\s*\{[^}]*wide-(?:feasible-distance|distance|metric)\s+(\d+)', out_state)
         if m:
             wm = int(m.group(1))
             expected_restored = str(wm // 128)
