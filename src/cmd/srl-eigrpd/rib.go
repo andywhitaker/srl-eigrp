@@ -113,6 +113,70 @@ func (d *EigrpDaemon) OnRouteAdd(netinst string, prefix string, nexthop string, 
 		return
 	}
 
+	afiName := "ipv4-unicast"
+	if strings.Contains(prefix, ":") {
+		afiName = "ipv6-unicast"
+	}
+
+	primaryNh := validRawNhs[0]
+	var rawIfStr string
+	if len(ifname) > 0 {
+		rawIfStr = ifname[0]
+	}
+
+	inst := d.GetOrCreateInstance(netinst)
+	d.mu.Lock()
+	pref := preference
+	if pref == 0 || (!isExt && pref == 90) || (isExt && pref == 170) {
+		if isExt {
+			pref = uint32(inst.GetAfiExternalPreference(afiName))
+		} else {
+			pref = uint32(inst.GetAfiPreference(afiName))
+		}
+	}
+	if inst.learnedRoutes == nil {
+		inst.learnedRoutes = make(map[string]*RouteInfo)
+	}
+	inst.learnedRoutes[prefix] = &RouteInfo{
+		Prefix:                prefix,
+		NextHop:               primaryNh,
+		Interface:             primaryIf,
+		RawNextHop:            nexthop,
+		RawInterface:          rawIfStr,
+		Metric:                metric,
+		WideMetric:            wideMetric,
+		External:              isExt,
+		Preference:            uint8(pref),
+		RefreshedAfterRestart: inst.restarting,
+	}
+	impPolicyName := inst.GetAfiImportPolicy(afiName)
+	d.mu.Unlock()
+
+	if impPolicyName != "" {
+		pol, _ := d.getPolicyDef(impPolicyName)
+		if pol != nil {
+			cand := CandidateRoute{
+				Prefix:     prefix,
+				RouteType:  "eigrp",
+				RouteOwner: "srl_eigrpd",
+				NextHop:    primaryNh,
+				AFI:        afiName,
+			}
+			accepted, _ := evaluateRoutePolicyWithDefault(cand, pol, nil)
+			if !accepted {
+				d.mu.Lock()
+				_, wasInstalled := inst.routes[prefix]
+				delete(inst.routes, prefix)
+				d.mu.Unlock()
+				if wasInstalled {
+					d.withdrawRouteInternal(netinst, prefix)
+				}
+				d.triggerDebouncedTelemetry()
+				return
+			}
+		}
+	}
+
 	nhgName := computeNhgName(netinst, validNhStrs)
 	pfxKey := netinst + ":" + prefix
 
@@ -161,14 +225,6 @@ func (d *EigrpDaemon) OnRouteAdd(netinst string, prefix string, nexthop string, 
 		}
 	}
 
-	pref := preference
-	if pref == 0 {
-		pref = 90 // EIGRP Internal
-		if isExt {
-			pref = 170 // EIGRP External
-		}
-	}
-
 	routeReq := &ndk.RouteAddRequest{
 		Routes: []*ndk.RouteInfo{
 			{
@@ -210,13 +266,13 @@ func (d *EigrpDaemon) OnRouteAdd(netinst string, prefix string, nexthop string, 
 		}
 	}
 
-	primaryNh := validRawNhs[0]
-	inst := d.GetOrCreateInstance(netinst)
 	d.mu.Lock()
 	inst.routes[prefix] = &RouteInfo{
 		Prefix:                prefix,
 		NextHop:               primaryNh,
 		Interface:             primaryIf,
+		RawNextHop:            nexthop,
+		RawInterface:          rawIfStr,
 		Metric:                metric,
 		WideMetric:            wideMetric,
 		External:              isExt,
@@ -234,6 +290,51 @@ func (d *EigrpDaemon) OnRouteAdd(netinst string, prefix string, nexthop string, 
 	d.triggerDebouncedTelemetry()
 }
 
+func (d *EigrpDaemon) reconcileImportedRoutes(netinst string) {
+	if netinst == "all" {
+		d.mu.RLock()
+		netinsts := make([]string, 0, len(d.instances))
+		for ni := range d.instances {
+			netinsts = append(netinsts, ni)
+		}
+		d.mu.RUnlock()
+		for _, ni := range netinsts {
+			d.reconcileImportedRoutes(ni)
+		}
+		return
+	}
+	if netinst == "" {
+		netinst = "default"
+	}
+	inst := d.GetInstance(netinst)
+	if inst == nil {
+		return
+	}
+	d.mu.RLock()
+	learned := make([]*RouteInfo, 0, len(inst.learnedRoutes))
+	for _, r := range inst.learnedRoutes {
+		if r != nil {
+			cp := *r
+			learned = append(learned, &cp)
+		}
+	}
+	d.mu.RUnlock()
+
+	for _, r := range learned {
+		nh := r.RawNextHop
+		if nh == "" {
+			nh = r.NextHop
+		}
+		if r.RawInterface != "" {
+			d.OnRouteAdd(netinst, r.Prefix, nh, r.Metric, r.WideMetric, r.External, 0, r.RawInterface)
+		} else if r.Interface != "" {
+			d.OnRouteAdd(netinst, r.Prefix, nh, r.Metric, r.WideMetric, r.External, 0, r.Interface)
+		} else {
+			d.OnRouteAdd(netinst, r.Prefix, nh, r.Metric, r.WideMetric, r.External, 0)
+		}
+	}
+}
+
 func (d *EigrpDaemon) WithdrawAfRoutes(netinst, afName string) {
 	if netinst == "" {
 		netinst = "default"
@@ -249,6 +350,12 @@ func (d *EigrpDaemon) WithdrawAfRoutes(netinst, afName string) {
 		if (afName == "ipv6-unicast" && isV6) || (afName == "ipv4-unicast" && !isV6) {
 			toWithdraw = append(toWithdraw, pfx)
 			delete(inst.routes, pfx)
+		}
+	}
+	for pfx := range inst.learnedRoutes {
+		isV6 := strings.Contains(pfx, ":")
+		if (afName == "ipv6-unicast" && isV6) || (afName == "ipv4-unicast" && !isV6) {
+			delete(inst.learnedRoutes, pfx)
 		}
 	}
 	for pfx := range inst.topology {
@@ -381,6 +488,7 @@ func (d *EigrpDaemon) OnRouteDel(netinst string, prefix string) {
 	if inst != nil {
 		d.mu.Lock()
 		delete(inst.routes, prefix)
+		delete(inst.learnedRoutes, prefix)
 		d.mu.Unlock()
 	}
 

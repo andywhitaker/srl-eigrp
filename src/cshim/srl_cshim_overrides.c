@@ -15,269 +15,35 @@
 #include "eigrp_fsm.h"
 #include "eigrp_packet.h"
 #include "eigrp_prefix.h"
-#include "eigrp_summary.h"
+#include "eigrp_interface.h"
 #include "eigrp_neighbor.h"
 #include "eigrp_eventlog.h"
+#include "eigrp_filter.h"
 #include "eigrp_log.h"
 #include "eigrp.h"
 
-static void srl_topology_route_queue_resort(eigrp_list_t *routes)
-{
-    eigrp_list_item_t *a, *b;
-    bool changed;
-
-    if (!routes)
-        return;
-    do {
-        changed = false;
-        for (a = routes->head; a && a->next; a = a->next) {
-            b = a->next;
-            if (((eigrp_route_descriptor_t *)a->data)->distance
-                <= ((eigrp_route_descriptor_t *)b->data)->distance)
-                continue;
-            void *tmp = a->data;
-            a->data = b->data;
-            b->data = tmp;
-            changed = true;
-        }
-    } while (changed);
-}
-
-void __wrap_eigrp_topology_metric_update(eigrp_instance_t *eigrp)
-{
-    eigrp_table_node_t *rn;
-    eigrp_prefix_descriptor_t *prefix;
-    eigrp_route_descriptor_t *route, *best;
-    eigrp_topology_route_iterator_t iterator;
-
-    if (!eigrp || !eigrp->topology_table)
-        return;
-    for (rn = eigrp_table_first(eigrp->topology_table); rn;
-         rn = eigrp_table_next(rn)) {
-        prefix = rn->info;
-        if (!prefix || prefix->state != EIGRP_FSM_STATE_PASSIVE)
-            continue;
-        bool query_retained_only = (prefix->distance == EIGRP_MAX_METRIC
-                                    && prefix->fdistance == EIGRP_MAX_METRIC
-                                    && prefix->reported_metric.delay == EIGRP_MAX_METRIC);
-        for (route = eigrp_topology_route_iterator_first(prefix, &iterator); route;
-             route = eigrp_topology_route_iterator_next(&iterator)) {
-            if (route->adv_router == eigrp->neighbor_self) {
-                route->reported_distance = 0;
-                if (route->metric.delay == EIGRP_MAX_METRIC) {
-                    route->distance = EIGRP_MAX_METRIC;
-                } else if (route->ei && route->type == eigrp->af_vectors.classic_internal_tlv_type) {
-                    eigrp_metrics_t m;
-                    memset(&m, 0, sizeof(m));
-                    m.bandwidth = eigrp_bandwidth_to_scaled(route->ei->params.bandwidth);
-                    m.delay = eigrp_delay_to_scaled(route->ei->params.delay);
-                    m.load = route->ei->params.load;
-                    m.reliability = route->ei->params.reliability;
-                    m.mtu[0] = 0xDC;
-                    m.mtu[1] = 0x05;
-                    m.mtu[2] = 0x00;
-                    m.hop_count = 0;
-                    route->metric = m;
-                    route->reported_metric = m;
-                    route->total_metric = m;
-                    route->distance = eigrp_metric_calculate(eigrp, m);
-                } else if (!route->ei && route->type == eigrp->af_vectors.classic_external_tlv_type) {
-                    eigrp_metrics_t scaled_m = route->metric;
-                    scaled_m.delay = eigrp_delay_to_scaled(route->metric.delay);
-                    route->distance = eigrp_metric_calculate(eigrp, scaled_m);
-                } else {
-                    route->distance = eigrp_metric_calculate(eigrp, route->total_metric);
-                }
-            } else {
-                route->reported_distance = eigrp_metric_calculate(eigrp, route->reported_metric);
-                if (route->ei)
-                    route->distance = eigrp_metric_total_calculate(eigrp, route);
-                else
-                    route->distance = eigrp_metric_calculate(eigrp, route->total_metric);
-            }
-        }
-        srl_topology_route_queue_resort(prefix->internal_routes);
-        srl_topology_route_queue_resort(prefix->external_routes);
-        if (query_retained_only)
-            continue;
-        best = eigrp_topology_route_read(prefix);
-        if (best) {
-            prefix->distance = best->distance;
-            prefix->fdistance = best->distance;
-            prefix->rdistance = best->distance;
-            prefix->reported_metric = best->total_metric;
-        }
-        eigrp_topology_update_node_flags(eigrp, prefix);
-        eigrp_update_routing_table(eigrp, prefix);
-        prefix->req_action |= EIGRP_FSM_NEED_UPDATE;
-        if (!eigrp_list_lookup(eigrp->topology_changes, prefix))
-            eigrp_list_add(eigrp->topology_changes, prefix);
-    }
-    eigrp_update_send_all(eigrp, NULL);
-}
-
-extern bool __real_eigrp_summary_route_build(eigrp_instance_t *eigrp, eigrp_intf_t *ei,
-                                             const eigrp_prefix_descriptor_t *prefix,
-                                             const eigrp_route_descriptor_t *route,
-                                             eigrp_prefix_descriptor_t *summary_prefix,
-                                             eigrp_route_descriptor_t *summary_route);
-
-extern bool __real_eigrp_summary_query_route_build(eigrp_instance_t *eigrp, eigrp_intf_t *ei,
-                                                   const eigrp_prefix_t *destination,
-                                                   eigrp_prefix_descriptor_t *summary_prefix,
-                                                   eigrp_route_descriptor_t *summary_route);
-
-struct eigrp_summary_metric_entry {
-    eigrp_prefix_t prefix;
-    eigrp_summary_metric_config_t config;
-    struct eigrp_summary_metric_entry *next;
-};
-
-struct eigrp_summary_state {
-    bool auto_summary;
-    struct eigrp_summary_metric_entry *metrics;
-};
-
-static const eigrp_summary_metric_config_t *srl_summary_metric_lookup(
-    eigrp_instance_t *eigrp, const eigrp_prefix_t *prefix)
-{
-    eigrp_af_config_t *af = eigrp_af_config_runtime_read(eigrp);
-    struct eigrp_summary_metric_entry *entry;
-
-    if (!af || !af->summary_state || !prefix)
-        return NULL;
-    for (entry = af->summary_state->metrics; entry; entry = entry->next) {
-        if (entry->prefix.address.afi == prefix->address.afi
-            && entry->prefix.prefix_length == prefix->prefix_length
-            && memcmp(entry->prefix.address.bytes, prefix->address.bytes,
-                      sizeof(entry->prefix.address.bytes)) == 0)
-            return &entry->config;
-    }
-    return NULL;
-}
-
-static void srl_fixup_summary_route(eigrp_instance_t *eigrp, eigrp_intf_t *ei,
-                                    eigrp_prefix_descriptor_t *summary_prefix,
-                                    eigrp_route_descriptor_t *summary_route)
-{
-    if (!eigrp || !summary_prefix || !summary_route)
-        return;
-
-    eigrp_route_descriptor_t *best_route = NULL;
-    uint32_t selected_distance = EIGRP_MAX_METRIC;
-
-    if (eigrp->topology_table) {
-        eigrp_table_node_t *rn;
-        for (rn = eigrp_table_first(eigrp->topology_table); rn;
-             rn = eigrp_table_next(rn)) {
-            eigrp_prefix_descriptor_t *candidate = rn->info;
-            eigrp_route_descriptor_t *candidate_route;
-            if (!candidate
-                || candidate->destination.address.afi != summary_prefix->destination.address.afi
-                || candidate->destination.prefix_length <= summary_prefix->destination.prefix_length
-                || !eigrp_prefix_address_match(&summary_prefix->destination,
-                                               &candidate->destination.address))
-                continue;
-            candidate_route = eigrp_topology_route_read(candidate);
-            if (!candidate_route || candidate->distance == EIGRP_MAX_METRIC
-                || candidate_route->metric.delay == EIGRP_MAX_METRIC)
-                continue;
-            /* Do not summarize a route learned from a neighbor on ei back out ei */
-            if (ei && candidate_route->ei == ei && candidate_route->adv_router != eigrp->neighbor_self)
-                continue;
-            /* Prefer components not on the outgoing interface when distances tie */
-            if (!best_route || candidate->distance < selected_distance
-                || (ei && best_route->ei == ei && candidate_route->ei != ei
-                    && candidate->distance == selected_distance)) {
-                best_route = candidate_route;
-                selected_distance = candidate->distance;
-            }
-        }
-    }
-
-    summary_route->ei = NULL;
-    summary_route->adv_router = eigrp->neighbor_self;
-    summary_route->type = eigrp->af_vectors.classic_internal_tlv_type;
-    memset(&summary_route->nexthop, 0, sizeof(summary_route->nexthop));
-    summary_route->prefix = summary_prefix;
-    summary_route->dest = summary_prefix->destination;
-
-    if (best_route && selected_distance != EIGRP_MAX_METRIC) {
-        const eigrp_summary_metric_config_t *metric_config =
-            srl_summary_metric_lookup(eigrp, &summary_prefix->destination);
-        summary_route->metric = best_route->total_metric;
-        summary_route->reported_metric = summary_route->metric;
-        summary_route->total_metric = summary_route->metric;
-        summary_route->distance = selected_distance;
-        summary_route->reported_distance = 0;
-        if (metric_config && metric_config->metric_configured) {
-            eigrp_metric_values_convert(&metric_config->metric, &summary_route->metric);
-            summary_route->reported_metric = summary_route->metric;
-            summary_route->total_metric = summary_route->metric;
-        }
-        summary_prefix->reported_metric = summary_route->metric;
-        summary_prefix->distance = selected_distance;
-        summary_prefix->fdistance = selected_distance;
-    } else {
-        summary_route->metric.delay = EIGRP_MAX_METRIC;
-        summary_route->reported_metric.delay = EIGRP_MAX_METRIC;
-        summary_route->total_metric.delay = EIGRP_MAX_METRIC;
-        summary_route->distance = EIGRP_MAX_METRIC;
-        summary_prefix->reported_metric.delay = EIGRP_MAX_METRIC;
-    }
-}
-
-bool __wrap_eigrp_summary_route_build(eigrp_instance_t *eigrp, eigrp_intf_t *ei,
-                                      const eigrp_prefix_descriptor_t *prefix,
-                                      const eigrp_route_descriptor_t *route,
-                                      eigrp_prefix_descriptor_t *summary_prefix,
-                                      eigrp_route_descriptor_t *summary_route)
-{
-    if (!__real_eigrp_summary_route_build(eigrp, ei, prefix, route, summary_prefix, summary_route))
-        return false;
-    srl_fixup_summary_route(eigrp, ei, summary_prefix, summary_route);
-    return true;
-}
-
-bool __wrap_eigrp_summary_query_route_build(eigrp_instance_t *eigrp, eigrp_intf_t *ei,
-                                            const eigrp_prefix_t *destination,
-                                            eigrp_prefix_descriptor_t *summary_prefix,
-                                            eigrp_route_descriptor_t *summary_route)
-{
-    if (__real_eigrp_summary_query_route_build(eigrp, ei, destination, summary_prefix, summary_route)) {
-        srl_fixup_summary_route(eigrp, ei, summary_prefix, summary_route);
-        return true;
-    }
-    if (!eigrp || !ei || !destination || !summary_prefix || !summary_route)
-        return false;
-    /* If the queried destination is a specific prefix covered by a summary on ei
-     * and not leaked, answer the QUERY with unreachable so the neighbor does not
-     * re-install the suppressed specific route. */
-    if (eigrp_summary_covers(eigrp, ei, destination)
-        && !eigrp_summary_specific_leak(eigrp, ei, destination)) {
-        if (ei->address.address.afi == destination->address.afi
-            && ei->address.prefix_length == destination->prefix_length
-            && eigrp_prefix_address_match(&ei->address, &destination->address))
-            return false;
-        memset(summary_prefix, 0, sizeof(*summary_prefix));
-        summary_prefix->destination = *destination;
-        summary_prefix->state = EIGRP_FSM_STATE_PASSIVE;
-        summary_prefix->reported_metric.delay = EIGRP_MAX_METRIC;
-        memset(summary_route, 0, sizeof(*summary_route));
-        summary_route->prefix = summary_prefix;
-        summary_route->dest = *destination;
-        summary_route->type = eigrp->af_vectors.classic_internal_tlv_type;
-        summary_route->metric.delay = EIGRP_MAX_METRIC;
-        summary_route->reported_metric.delay = EIGRP_MAX_METRIC;
-        summary_route->total_metric.delay = EIGRP_MAX_METRIC;
-        summary_route->distance = EIGRP_MAX_METRIC;
-        return true;
-    }
-    return false;
-}
-
 extern bool __real_eigrp_nbr_prefix_admit(eigrp_instance_t *runtime, eigrp_nbr_t *neighbor,
                                           const eigrp_prefix_t *prefix);
+
+static bool srl_prefix_is_query_retained_passive(const eigrp_prefix_descriptor_t *prefix)
+{
+    return prefix
+           && prefix->state == EIGRP_FSM_STATE_PASSIVE
+           && prefix->distance == EIGRP_MAX_METRIC
+           && prefix->fdistance == EIGRP_MAX_METRIC
+           && prefix->reported_metric.delay == EIGRP_MAX_METRIC;
+}
+
+static bool srl_prefix_has_active_route(eigrp_prefix_descriptor_t *pfx)
+{
+    if (!pfx || pfx->distance == EIGRP_MAX_METRIC || pfx->fdistance == EIGRP_MAX_METRIC)
+        return false;
+    eigrp_route_descriptor_t *best = eigrp_topology_route_read(pfx);
+    if (!best || best->distance == EIGRP_MAX_METRIC || best->metric.delay == EIGRP_MAX_METRIC)
+        return false;
+    return (best->flags & (EIGRP_ROUTE_DESCRIPTOR_SUCCESSOR_FLAG |
+                           EIGRP_ROUTE_DESCRIPTOR_FSUCCESSOR_FLAG)) != 0;
+}
 
 static uint32_t srl_active_topology_prefix_count(eigrp_instance_t *runtime)
 {
@@ -288,59 +54,10 @@ static uint32_t srl_active_topology_prefix_count(eigrp_instance_t *runtime)
         return 0;
     for (node = eigrp_table_first(runtime->topology_table); node;
          node = eigrp_table_next(node)) {
-        eigrp_prefix_descriptor_t *pfx = node->info;
-        if (!pfx || pfx->distance == EIGRP_MAX_METRIC)
-            continue;
-        eigrp_route_descriptor_t *best = eigrp_topology_route_read(pfx);
-        if (best && best->distance != EIGRP_MAX_METRIC && best->metric.delay != EIGRP_MAX_METRIC)
+        if (srl_prefix_has_active_route(node->info))
             count++;
     }
     return count;
-}
-
-bool __wrap_eigrp_topology_prefix_admit(eigrp_instance_t *runtime,
-                                        const eigrp_prefix_t *prefix)
-{
-    eigrp_af_config_t *af;
-    const eigrp_prefix_limit_t *limit;
-    eigrp_prefix_descriptor_t *existing;
-
-    if (!runtime || !prefix)
-        return false;
-    existing = eigrp_topology_table_lookup(runtime->topology_table, prefix);
-    if (existing && existing->distance != EIGRP_MAX_METRIC) {
-        eigrp_route_descriptor_t *best = eigrp_topology_route_read(existing);
-        if (best && best->distance != EIGRP_MAX_METRIC && best->metric.delay != EIGRP_MAX_METRIC)
-            return true;
-    }
-    af = eigrp_af_config_runtime_read(runtime);
-    if (!af || !af->topology_maximum_prefix_configured)
-        return true;
-    limit = &af->topology_maximum_prefix;
-    uint32_t count = srl_active_topology_prefix_count(runtime);
-    if (eigrp_prefix_limit_threshold_crossed(limit, count))
-        eigrp_log(EIGRP_LOG_WARNING,
-                  "EIGRP topology maximum-prefix threshold reached (%u/%u)",
-                  count + 1U, limit->maximum);
-    if (!eigrp_prefix_limit_allows(limit, count, false)) {
-        (void)eigrp_eventlog_msg_add(runtime, EIGRP_EVENTLOG_OPCODE_PREFIX_LIMIT_REJECT,
-                                     prefix, EIGRP_EVENTLOG_PREFIX_LIMIT_TOPOLOGY,
-                                     count + 1U, limit->maximum, 0);
-        return false;
-    }
-    return true;
-}
-
-static _Thread_local eigrp_packet_decoder_t srl_saved_update_decoder = NULL;
-static _Thread_local bool srl_in_unreachable_update = false;
-
-static bool srl_prefix_is_query_retained_passive(const eigrp_prefix_descriptor_t *prefix)
-{
-    return prefix
-           && prefix->state == EIGRP_FSM_STATE_PASSIVE
-           && prefix->distance == EIGRP_MAX_METRIC
-           && prefix->fdistance == EIGRP_MAX_METRIC
-           && prefix->reported_metric.delay == EIGRP_MAX_METRIC;
 }
 
 static void srl_prune_other_query_retained_routes(eigrp_instance_t *eigrp,
@@ -360,16 +77,52 @@ static void srl_prune_other_query_retained_routes(eigrp_instance_t *eigrp,
     }
 }
 
+bool __wrap_eigrp_topology_prefix_admit(eigrp_instance_t *runtime,
+                                        const eigrp_prefix_t *prefix)
+{
+    eigrp_af_config_t *af;
+    const eigrp_prefix_limit_t *limit;
+    eigrp_prefix_descriptor_t *existing;
+
+    if (!runtime || !prefix)
+        return false;
+    if (runtime->eigrp_pfxlimits_af_state)
+        return false;
+    existing = eigrp_topology_table_lookup(runtime->topology_table, prefix);
+    if (srl_prefix_has_active_route(existing))
+        return true;
+    af = eigrp_af_config_runtime_read(runtime);
+    if (!af || !af->topology_maximum_prefix_configured)
+        return true;
+    limit = &af->topology_maximum_prefix;
+    uint32_t count = srl_active_topology_prefix_count(runtime);
+    if (eigrp_prefix_limit_threshold_crossed(limit, count))
+        eigrp_log(EIGRP_LOG_WARNING,
+                  "EIGRP topology maximum-prefix threshold reached (%u/%u)",
+                  count + 1U, limit->maximum);
+    if (!limit->warning_only && count >= limit->maximum) {
+        if (existing && srl_prefix_is_query_retained_passive(existing)) {
+            srl_prune_other_query_retained_routes(runtime, existing, NULL);
+            eigrp_update_topology_table_prefix(runtime, runtime->topology_table, existing);
+        }
+        (void)eigrp_eventlog_msg_add(runtime, EIGRP_EVENTLOG_OPCODE_PREFIX_LIMIT_REJECT,
+                                     prefix, EIGRP_EVENTLOG_PREFIX_LIMIT_TOPOLOGY,
+                                     count + 1U, limit->maximum, 0);
+        return false;
+    }
+    return true;
+}
+
+static _Thread_local eigrp_packet_decoder_t srl_saved_update_decoder = NULL;
+static _Thread_local eigrp_packet_decoder_t srl_saved_query_decoder = NULL;
+static _Thread_local bool srl_in_unreachable_update = false;
+
 bool __wrap_eigrp_nbr_prefix_admit(eigrp_instance_t *runtime, eigrp_nbr_t *neighbor,
                                    const eigrp_prefix_t *prefix)
 {
     if (srl_in_unreachable_update)
         return true;
-    if (!__real_eigrp_nbr_prefix_admit(runtime, neighbor, prefix))
-        return false;
-    if (runtime && prefix && eigrp_topology_table_lookup(runtime->topology_table, prefix))
-        return __wrap_eigrp_topology_prefix_admit(runtime, prefix);
-    return true;
+    return __real_eigrp_nbr_prefix_admit(runtime, neighbor, prefix);
 }
 
 static eigrp_route_descriptor_t *srl_update_tlv_decoder_intercept(
@@ -407,17 +160,6 @@ static eigrp_route_descriptor_t *srl_update_tlv_decoder_intercept(
         return route;
     }
 
-    if (topology_route) {
-        if (!__wrap_eigrp_nbr_prefix_admit(eigrp, nbr, &route->dest)) {
-            if (srl_prefix_is_query_retained_passive(prefix)) {
-                eigrp_route_descriptor_delete(eigrp, prefix, topology_route);
-                eigrp_update_topology_table_prefix(eigrp, eigrp->topology_table, prefix);
-            }
-            eigrp_topology_route_free(route);
-            return NULL;
-        }
-    }
-
     if (srl_prefix_is_query_retained_passive(prefix))
         srl_prune_other_query_retained_routes(eigrp, prefix, nbr);
 
@@ -432,13 +174,6 @@ void __wrap_eigrp_update_receive(eigrp_instance_t *eigrp, eigrp_nbr_t *nbr,
                                  struct eigrp_header *eigrph, eigrp_stream_t *pkt,
                                  eigrp_intf_t *ei, int length)
 {
-    if (nbr && eigrph) {
-        uint32_t flags = ntohl(eigrph->flags);
-        uint32_t seq = ntohl(eigrph->sequence);
-        if (!(flags & EIGRP_INIT_FLAG) && seq != 0 && nbr->peer_init_sequence_number != 0) {
-            nbr->peer_init_sequence_number = UINT32_MAX;
-        }
-    }
     eigrp_packet_decoder_t prev_saved = srl_saved_update_decoder;
     eigrp_packet_decoder_t orig_decoder = NULL;
     if (nbr && nbr->decoder && nbr->decoder != srl_update_tlv_decoder_intercept) {
@@ -451,9 +186,55 @@ void __wrap_eigrp_update_receive(eigrp_instance_t *eigrp, eigrp_nbr_t *nbr,
     if (nbr && orig_decoder)
         nbr->decoder = orig_decoder;
     srl_saved_update_decoder = prev_saved;
-    if (nbr && (nbr->state == EIGRP_NEIGHBOR_PENDING || nbr->state == EIGRP_NEIGHBOR_UP) && !nbr->t_holddown) {
-        eigrp_nbr_holddown_update(nbr);
+}
+
+static eigrp_route_descriptor_t *srl_query_tlv_decoder_intercept(
+    eigrp_instance_t *eigrp, eigrp_nbr_t *nbr,
+    eigrp_stream_t *pkt, uint16_t pktlen)
+{
+    if (!srl_saved_query_decoder)
+        return NULL;
+    eigrp_route_descriptor_t *route = srl_saved_query_decoder(eigrp, nbr, pkt, pktlen);
+    if (!route || !eigrp || !nbr)
+        return route;
+
+    eigrp_prefix_descriptor_t *prefix =
+        eigrp_topology_table_lookup(eigrp->topology_table, &route->dest);
+    if (prefix && srl_prefix_is_query_retained_passive(prefix)) {
+        bool poisoned_or_denied =
+            (route->metric.delay == EIGRP_MAX_METRIC
+             || route->metric.delay == EIGRP_METRIC_MAX
+             || (nbr->ei && eigrp_filter_prefix_update(eigrp, nbr->ei, EIGRP_FILTER_IN, &route->dest)));
+        if (poisoned_or_denied) {
+            eigrp_route_descriptor_t *topology_route =
+                eigrp_prefix_descriptor_lookup(prefix, nbr);
+            if (topology_route)
+                eigrp_route_descriptor_delete(eigrp, prefix, topology_route);
+            eigrp_update_topology_table_prefix(eigrp, eigrp->topology_table, prefix);
+        }
     }
+    return route;
+}
+
+extern void __real_eigrp_query_receive(eigrp_instance_t *eigrp, eigrp_nbr_t *nbr,
+                                       struct eigrp_header *eigrph, eigrp_stream_t *pkt,
+                                       eigrp_intf_t *ei, int length);
+
+void __wrap_eigrp_query_receive(eigrp_instance_t *eigrp, eigrp_nbr_t *nbr,
+                                struct eigrp_header *eigrph, eigrp_stream_t *pkt,
+                                eigrp_intf_t *ei, int length)
+{
+    eigrp_packet_decoder_t prev_saved = srl_saved_query_decoder;
+    eigrp_packet_decoder_t orig_decoder = NULL;
+    if (nbr && nbr->decoder && nbr->decoder != srl_query_tlv_decoder_intercept) {
+        orig_decoder = nbr->decoder;
+        srl_saved_query_decoder = orig_decoder;
+        nbr->decoder = srl_query_tlv_decoder_intercept;
+    }
+    __real_eigrp_query_receive(eigrp, nbr, eigrph, pkt, ei, length);
+    if (nbr && orig_decoder)
+        nbr->decoder = orig_decoder;
+    srl_saved_query_decoder = prev_saved;
 }
 
 extern void __real_eigrp_topology_neighbor_down(eigrp_instance_t *eigrp, eigrp_nbr_t *nbr);
@@ -476,18 +257,29 @@ void __wrap_eigrp_topology_neighbor_down(eigrp_instance_t *eigrp, eigrp_nbr_t *n
     }
 
     __real_eigrp_topology_neighbor_down(eigrp, nbr);
+}
 
-    if (eigrp && eigrp->topology_table && nbr) {
-        eigrp_table_node_t *rn;
-        for (rn = eigrp_table_first(eigrp->topology_table); rn; rn = eigrp_table_next(rn)) {
-            eigrp_prefix_descriptor_t *pe = rn->info;
-            if (!pe)
-                continue;
-            eigrp_route_descriptor_t *route = eigrp_prefix_descriptor_lookup(pe, nbr);
-            if (route)
-                route->adv_router = NULL;
-        }
+extern void __real_eigrp_nbr_codec_select(eigrp_nbr_t *nbr, uint8_t tlv_version);
+extern void __real_eigrp_nbr_codec_update(eigrp_instance_t *eigrp);
+
+static __thread bool srl_in_codec_update = false;
+
+void __wrap_eigrp_nbr_codec_select(eigrp_nbr_t *nbr, uint8_t tlv_version)
+{
+    uint8_t old_version = nbr ? nbr->tlv_version : 0;
+    __real_eigrp_nbr_codec_select(nbr, tlv_version);
+    if (!srl_in_codec_update && nbr && nbr->ei && old_version != nbr->tlv_version &&
+        nbr->state == EIGRP_NEIGHBOR_UP) {
+        eigrp_intf_encoder_peer_remove(nbr->ei, old_version);
+        eigrp_intf_encoder_peer_add(nbr->ei, nbr->tlv_version);
     }
+}
+
+void __wrap_eigrp_nbr_codec_update(eigrp_instance_t *eigrp)
+{
+    srl_in_codec_update = true;
+    __real_eigrp_nbr_codec_update(eigrp);
+    srl_in_codec_update = false;
 }
 
 static eigrp_route_descriptor_t *srl_test_mock_route = NULL;
@@ -558,7 +350,7 @@ int srlTestRel030OverridesCheck(void)
     r1->reported_metric = r1->metric;
     r1->reported_distance = eigrp_metric_calculate(&eigrp, r1->reported_metric);
     r1->distance = eigrp_metric_total_calculate(&eigrp, r1);
-    eigrp_list_insert(p1->internal_routes, r1);
+    eigrp_topology_route_insert(&eigrp, p1, r1, true);
 
     eigrp_route_descriptor_t *r2 = eigrp_topology_route_create(&ei);
     r2->adv_router = &nbr2;
@@ -570,7 +362,7 @@ int srlTestRel030OverridesCheck(void)
     r2->reported_metric = r2->metric;
     r2->reported_distance = eigrp_metric_calculate(&eigrp, r2->reported_metric);
     r2->distance = eigrp_metric_total_calculate(&eigrp, r2);
-    eigrp_list_insert(p1->internal_routes, r2);
+    eigrp_topology_route_insert(&eigrp, p1, r2, true);
 
     eigrp_prefix_descriptor_add(eigrp.topology_table, p1);
 
@@ -609,32 +401,134 @@ int srlTestRel030OverridesCheck(void)
         return -8;
     eigrp_topology_route_free(reach);
 
-    /* 4. Retained poisoned route after neighbor-down must have adv_router detached to NULL. */
-    eigrp_route_descriptor_t *r_poison = eigrp_topology_route_create(&ei);
-    r_poison->adv_router = &nbr1;
-    r_poison->prefix = p1;
-    r_poison->dest = p1->destination;
-    r_poison->type = EIGRP_TLV_IPv4_INT;
-    r_poison->metric.delay = EIGRP_MAX_METRIC;
-    r_poison->reported_metric.delay = EIGRP_MAX_METRIC;
-    r_poison->reported_distance = EIGRP_MAX_METRIC;
-    r_poison->distance = EIGRP_MAX_METRIC;
-    p1->distance = 281600;
-    p1->fdistance = 281600;
-    p1->reported_metric.delay = eigrp_delay_to_scaled(10);
-    p1->req_action |= EIGRP_FSM_NEED_UPDATE;
-    eigrp_list_insert(p1->internal_routes, r_poison);
+    /* 4. Poisoned QUERY from nbr1 on query-retained prefix must delete nbr1's retained RDB. */
+    eigrp_route_descriptor_t *r1_new = eigrp_topology_route_create(&ei);
+    r1_new->adv_router = &nbr1;
+    r1_new->prefix = p1;
+    r1_new->dest = p1->destination;
+    r1_new->type = EIGRP_TLV_IPv4_INT;
+    r1_new->metric.bandwidth = eigrp_bandwidth_to_scaled(100000);
+    r1_new->metric.delay = eigrp_delay_to_scaled(10);
+    r1_new->reported_metric = r1_new->metric;
+    r1_new->reported_distance = eigrp_metric_calculate(&eigrp, r1_new->reported_metric);
+    r1_new->distance = eigrp_metric_total_calculate(&eigrp, r1_new);
+    eigrp_topology_route_insert(&eigrp, p1, r1_new, true);
 
-    __wrap_eigrp_topology_neighbor_down(&eigrp, &nbr1);
-    if (r_poison->adv_router != NULL)
+    eigrp_route_descriptor_t *poison_q = eigrp_topology_route_create(&ei);
+    poison_q->dest = p1->destination;
+    poison_q->type = EIGRP_TLV_IPv4_INT;
+    poison_q->metric.delay = EIGRP_MAX_METRIC;
+    srl_saved_query_decoder = srl_test_mock_decoder;
+    srl_test_mock_route = poison_q;
+    dummy_pkt.getp = 0;
+    if (srl_query_tlv_decoder_intercept(&eigrp, &nbr1, &dummy_pkt, 1) != poison_q)
         return -9;
+    if (eigrp_prefix_descriptor_lookup(p1, &nbr1) != NULL)
+        return -10;
+    eigrp_topology_route_free(poison_q);
 
-    eigrp_route_descriptor_delete(&eigrp, p1, r_poison);
-    eigrp_prefix_descriptor_delete(&eigrp, eigrp.topology_table, p1);
+    /* 5. Peer codec downgrade on UP neighbor must update interface encoder peer counts. */
+    {
+        eigrp.tlv1_codec.encoder = (void *)1;
+        eigrp.tlv1_codec.decoder = (void *)1;
+        eigrp.tlv2_codec.encoder = (void *)2;
+        eigrp.tlv2_codec.decoder = (void *)2;
+        nbr1.state = EIGRP_NEIGHBOR_UP;
+        nbr1.tlv_version = EIGRP_TLV_64B_VERSION;
+        ei.tlv2_peer_count = 1;
+        ei.tlv1_peer_count = 0;
+        __wrap_eigrp_nbr_codec_select(&nbr1, EIGRP_TLV_32B_VERSION);
+        if (ei.tlv2_peer_count != 0 || ei.tlv1_peer_count != 1)
+            return -11;
+    }
+
+    /* 6. ACTIVE withdrawing prefix with poisoned successor and unselected non-FS route must not count. */
+    eigrp_prefix_descriptor_t *p2 = eigrp_topology_prefix_create();
+    p2->destination.address.afi = EIGRP_AFI_IPV4;
+    p2->destination.address.bytes[0] = 10;
+    p2->destination.address.bytes[1] = 99;
+    p2->destination.address.bytes[2] = 2;
+    p2->destination.prefix_length = 24;
+    p2->state = EIGRP_FSM_STATE_ACTIVE_3;
+    p2->distance = 28160;
+    p2->fdistance = 28160;
+
+    eigrp_route_descriptor_t *p2_succ = eigrp_topology_route_create(&ei);
+    p2_succ->adv_router = &nbr1;
+    p2_succ->prefix = p2;
+    p2_succ->dest = p2->destination;
+    p2_succ->type = EIGRP_TLV_IPv4_INT;
+    p2_succ->flags = EIGRP_ROUTE_DESCRIPTOR_SUCCESSOR_FLAG;
+    p2_succ->metric.delay = EIGRP_MAX_METRIC;
+    p2_succ->distance = EIGRP_MAX_METRIC;
+    eigrp_topology_route_insert(&eigrp, p2, p2_succ, true);
+
+    eigrp_route_descriptor_t *p2_nonfs = eigrp_topology_route_create(&ei);
+    p2_nonfs->adv_router = &nbr2;
+    p2_nonfs->prefix = p2;
+    p2_nonfs->dest = p2->destination;
+    p2_nonfs->type = EIGRP_TLV_IPv4_INT;
+    p2_nonfs->flags = 0;
+    p2_nonfs->metric.bandwidth = eigrp_bandwidth_to_scaled(100000);
+    p2_nonfs->metric.delay = eigrp_delay_to_scaled(50);
+    p2_nonfs->distance = eigrp_metric_total_calculate(&eigrp, p2_nonfs);
+    eigrp_topology_route_insert(&eigrp, p2, p2_nonfs, true);
+    eigrp_prefix_descriptor_add(eigrp.topology_table, p2);
+
+    if (srl_active_topology_prefix_count(&eigrp) != 0)
+        return -12;
+
+    /* 7. Maximum-prefix admission admits while p2 is withdrawing, and rejects cleanly without AF teardown when full. */
+    eigrp_af_config_t af_cfg;
+    memset(&af_cfg, 0, sizeof(af_cfg));
+    af_cfg.runtime = &eigrp;
+    af_cfg.topology_maximum_prefix_configured = true;
+    af_cfg.topology_maximum_prefix.maximum = 1;
+    af_cfg.topology_maximum_prefix.threshold = 75;
+    af_cfg.topology_maximum_prefix.warning_only = false;
+    bool created_vr_list = false;
+    if (!eigrp_process.virt_router) {
+        eigrp_process.virt_router = eigrp_list_create();
+        created_vr_list = true;
+    }
+    (void)eigrp_named_config_create("srl-test-ovr");
+    eigrp_named_config_t *parent_cfg = eigrp_named_config_read("srl-test-ovr");
+    if (!parent_cfg) {
+        if (created_vr_list)
+            eigrp_list_delete(&eigrp_process.virt_router);
+        return -13;
+    }
+    parent_cfg->address_families = &af_cfg;
+
+    int rc = 0;
+    if (!__wrap_eigrp_topology_prefix_admit(&eigrp, &p2->destination))
+        rc = -14;
+    else {
+        p2->state = EIGRP_FSM_STATE_PASSIVE;
+        p2_nonfs->flags = EIGRP_ROUTE_DESCRIPTOR_SUCCESSOR_FLAG;
+        if (srl_active_topology_prefix_count(&eigrp) != 1)
+            rc = -15;
+        else if (__wrap_eigrp_topology_prefix_admit(&eigrp, &p1->destination))
+            rc = -16;
+        else if (eigrp.eigrp_pfxlimits_af_state != 0)
+            rc = -17;
+    }
+    parent_cfg->address_families = NULL;
+    (void)eigrp_named_config_delete("srl-test-ovr");
+    if (created_vr_list)
+        eigrp_list_delete(&eigrp_process.virt_router);
+    if (rc != 0)
+        return rc;
+
+    if (eigrp_topology_table_lookup(eigrp.topology_table, &p2->destination))
+        eigrp_prefix_descriptor_delete(&eigrp, eigrp.topology_table, p2);
+    if (eigrp_topology_table_lookup(eigrp.topology_table, &p1->destination))
+        eigrp_prefix_descriptor_delete(&eigrp, eigrp.topology_table, p1);
     eigrp_list_delete(&ei.nbrs);
     eigrp_list_delete(&eigrp.eiflist);
     eigrp_list_delete(&eigrp.topology_changes);
     eigrp_table_free(eigrp.topology_table);
     srl_saved_update_decoder = NULL;
+    srl_saved_query_decoder = NULL;
     return 0;
 }

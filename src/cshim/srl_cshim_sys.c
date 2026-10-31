@@ -44,6 +44,7 @@
 #include "eigrp_instance.h"
 #include "eigrp_packetizer.h"
 #include "eigrp_summary.h"
+#include "eigrp_pfxlimits.h"
 
 extern int srl_netns_socket_open(const char *netinst);
 extern int srl_netns_enter(const char *netinst, int *saved_ns);
@@ -59,6 +60,25 @@ static inline void srl_strlcpy(char *dst, const char *src, size_t size) {
     } else {
         memcpy(dst, src, srclen + 1);
     }
+}
+
+int eigrp_vsnprintf(char *dst, size_t size, const char *fmt, va_list args) {
+    if (!dst && size != 0) return -1;
+    if (!fmt) {
+        if (dst && size) dst[0] = '\0';
+        return -1;
+    }
+    return vsnprintf(dst, size, fmt, args);
+}
+
+int eigrp_snprintf(char *dst, size_t size, const char *fmt, ...) {
+    va_list args;
+    int written;
+
+    va_start(args, fmt);
+    written = eigrp_vsnprintf(dst, size, fmt, args);
+    va_end(args);
+    return written;
 }
 
 /* ------------------------------------------------------------------------
@@ -742,7 +762,7 @@ static void srl_pkt_multicast_membership(int pkt_fd, int ifindex, bool join) {
     setsockopt(pkt_fd, SOL_PACKET, opt, &mr, sizeof(mr));
 
     static const uint8_t eigrp_v4_mcast_mac[6] = {0x01, 0x00, 0x5e, 0x00, 0x00, 0x0a};
-    static const uint8_t eigrp_v6_mcast_mac[6] = {0x33, 0x33, 0x00, 0x00, 0x0a};
+    static const uint8_t eigrp_v6_mcast_mac[6] = {0x33, 0x33, 0x00, 0x00, 0x00, 0x0a};
 
     // Targeted multicast join for IPv4 EIGRP (224.0.0.10 -> 01:00:5e:00:00:0a)
     memset(&mr, 0, sizeof(mr));
@@ -1372,6 +1392,8 @@ eigrp_instance_t *eigrp_sys_work_queue_instance(eigrp_work_queue_t *q) {
  * Sockets & Multicast
  * ------------------------------------------------------------------------ */
 
+static void srl_apply_stored_metrics_locked(const char *ni, eigrp_instance_t *eigrp);
+
 eigrp_result_t eigrp_sys_socket_open(eigrp_instance_t *eigrp) {
     if (!eigrp) return EIGRP_RESULT_INVALID_ARGUMENT;
 
@@ -1380,6 +1402,7 @@ eigrp_result_t eigrp_sys_socket_open(eigrp_instance_t *eigrp) {
     if (g_pending_netinst[0]) {
         netinst = g_pending_netinst;
     }
+    srl_apply_stored_metrics_locked(netinst, eigrp);
     pthread_mutex_unlock(&g_data_lock);
 
     bool is_v6 = (eigrp_instance_afi(eigrp) == EIGRP_AFI_IPV6);
@@ -1890,6 +1913,7 @@ static eigrp_ifindex_t srl_resolve_wire_interface_v6(const char *netinst, uint32
         if (vlan_id > 0) {
             for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
                 if (strcmp(ci->netinst, netinst) != 0 || !ci->active_v6) continue;
+                if (ci->address_v6.address.afi != EIGRP_AFI_IPV6 && ci->global_v6.address.afi != EIGRP_AFI_IPV6) continue;
                 if (!srl_intf_matches_vlan(ci, vlan_id, vlan_suffix)) continue;
                 if (ci->root_ifindex == 0) ci->root_ifindex = srl_resolve_root_ifindex(ci->ifname);
                 if (ci->root_ifindex == (eigrp_ifindex_t)sll_ifindex) {
@@ -1903,6 +1927,7 @@ static eigrp_ifindex_t srl_resolve_wire_interface_v6(const char *netinst, uint32
         if (found_idx == 0 && dst_ip6) {
             for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
                 if (strcmp(ci->netinst, netinst) != 0 || !ci->active_v6) continue;
+                if (ci->address_v6.address.afi != EIGRP_AFI_IPV6 && ci->global_v6.address.afi != EIGRP_AFI_IPV6) continue;
                 if (!srl_intf_matches_vlan_candidate(ci, vlan_id)) continue;
                 if (ci->root_ifindex == 0) ci->root_ifindex = srl_resolve_root_ifindex(ci->ifname);
                 if (ci->root_ifindex == (eigrp_ifindex_t)sll_ifindex) {
@@ -1922,6 +1947,7 @@ static eigrp_ifindex_t srl_resolve_wire_interface_v6(const char *netinst, uint32
         if (found_idx == 0 && vlan_id == 0) {
             for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
                 if (strcmp(ci->netinst, netinst) != 0 || !ci->active_v6) continue;
+                if (ci->address_v6.address.afi != EIGRP_AFI_IPV6 && ci->global_v6.address.afi != EIGRP_AFI_IPV6) continue;
                 if (ci->vlan_explicit && ci->vlan_id != 0) continue;
                 if (ci->root_ifindex == 0) ci->root_ifindex = srl_resolve_root_ifindex(ci->ifname);
                 if (ci->root_ifindex == (eigrp_ifindex_t)sll_ifindex) {
@@ -1940,6 +1966,7 @@ static eigrp_ifindex_t srl_resolve_wire_interface_v6(const char *netinst, uint32
         if (found_idx == 0) {
             for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
                 if (strcmp(ci->netinst, netinst) != 0 || !ci->active_v6) continue;
+                if (ci->address_v6.address.afi != EIGRP_AFI_IPV6 && ci->global_v6.address.afi != EIGRP_AFI_IPV6) continue;
                 if (!srl_intf_matches_vlan(ci, vlan_id, vlan_suffix)) continue;
                 if (ci->root_ifindex == 0) ci->root_ifindex = srl_resolve_root_ifindex(ci->ifname);
                 if (ci->root_ifindex == (eigrp_ifindex_t)sll_ifindex) {
@@ -1957,6 +1984,7 @@ static eigrp_ifindex_t srl_resolve_wire_interface_v6(const char *netinst, uint32
     if (found_idx == 0) {
         for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
             if (strcmp(ci->netinst, netinst) != 0 || !ci->active_v6) continue;
+            if (ci->address_v6.address.afi != EIGRP_AFI_IPV6 && ci->global_v6.address.afi != EIGRP_AFI_IPV6) continue;
             if (!srl_intf_matches_vlan(ci, vlan_id, vlan_suffix)) continue;
             if (root_ifname[0] && srl_match_ifname(ci->ifname, root_ifname)) {
                 found_idx = ci->ifindex;
@@ -2459,14 +2487,16 @@ bool eigrp_sys_ipv6_packet_receive(eigrp_instance_t *eigrp, uint8_t *buffer, siz
             if (rx_idx > 0) {
                 pthread_mutex_lock(&g_data_lock);
                 for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
-                    if (strcmp(ci->netinst, b->netinst) == 0 && ci->ifindex == rx_idx && ci->active_v6) {
+                    if (strcmp(ci->netinst, b->netinst) == 0 && ci->ifindex == rx_idx && ci->active_v6 &&
+                        (ci->address_v6.address.afi == EIGRP_AFI_IPV6 || ci->global_v6.address.afi == EIGRP_AFI_IPV6)) {
                         is_active_v6 = true;
                         break;
                     }
                 }
                 pthread_mutex_unlock(&g_data_lock);
             }
-            if (is_active_v6) {
+            eigrp_intf_t *rx_ei = (rx_idx > 0) ? eigrp_intf_lookup_by_ifindex(eigrp, rx_idx) : NULL;
+            if (is_active_v6 && rx_ei && rx_ei->operative) {
                 uint16_t eigrp_csum = 0;
                 if (n >= 4) {
                     memcpy(&eigrp_csum, buffer + 2, 2);
@@ -2567,6 +2597,8 @@ bool eigrp_sys_ipv6_packet_receive(eigrp_instance_t *eigrp, uint8_t *buffer, siz
             eigrp_ifindex_t found_idx = srl_resolve_wire_interface_v6(b->netinst, (uint32_t)sll.sll_ifindex, vlan_id, src_ip6, dst_ip6);
 
             if (found_idx == 0) continue;
+            eigrp_intf_t *pkt_ei = eigrp_intf_lookup_by_ifindex(eigrp, found_idx);
+            if (!pkt_ei || !pkt_ei->operative) continue;
 
             // Check deduplication against packets received on b->fd
             uint16_t eigrp_csum = 0;
@@ -3863,6 +3895,20 @@ void srlShimInterfacesReport(const char *netinst) {
     }
 }
 
+static void srl_send_active_hellos(eigrp_instance_t *runtime) {
+    if (!runtime || !runtime->eiflist) return;
+    eigrp_list_item_t *node;
+    eigrp_intf_t *ei;
+    for (EIGRP_LIST_ITERATE_RO(runtime->eiflist, node, ei)) {
+        if (!ei || eigrp_intf_is_passive(ei) || eigrp_intf_shutdown_effective(ei)) continue;
+        const char *ifn = eigrp_intf_name_string(ei);
+        if (ifn && (strstr(ifn, "system") != NULL || strstr(ifn, "lo") != NULL)) continue;
+        if (!eigrp_nbr_static_hello_send(ei)) {
+            eigrp_hello_send(ei, EIGRP_HELLO_NORMAL, NULL);
+        }
+    }
+}
+
 typedef struct {
     const eigrp_nbr_clear_request_t *req;
     size_t affected;
@@ -3871,7 +3917,11 @@ typedef struct {
 static eigrp_result_t srl_nbr_clear_msg_cb(eigrp_instance_t *runtime, void *arg) {
     srl_nbr_clear_args_t *nca = (srl_nbr_clear_args_t *)arg;
     if (!runtime || !nca || !nca->req) return EIGRP_RESULT_INVALID_ARGUMENT;
-    return eigrp_nbr_clear(runtime, nca->req, NULL, NULL, &nca->affected);
+    eigrp_result_t res = eigrp_nbr_clear(runtime, nca->req, NULL, NULL, &nca->affected);
+    if (res == EIGRP_RESULT_SUCCESS && nca->affected > 0) {
+        srl_send_active_hellos(runtime);
+    }
+    return res;
 }
 
 int srlShimNeighborClear(const char *netinst, const char *neighbor_ip) {
@@ -3974,12 +4024,9 @@ static eigrp_result_t srl_topo_prefix_cb(const eigrp_topology_prefix_state_t *st
     inet_ntop(afi, st->destination.address.bytes, pfx_str, sizeof(pfx_str));
     snprintf(e->u.pfx.prefix, sizeof(e->u.pfx.prefix), "%s/%u", pfx_str, st->destination.prefix_length);
 
-    uint8_t rib_scale = srl_get_rib_scale(ctx->ni);
-    if (rib_scale == 0) rib_scale = 128;
-
     e->u.pfx.active = st->active ? 1 : 0;
     e->u.pfx.fd = st->feasible_distance;
-    e->u.pfx.wide_fd = ((uint64_t)st->feasible_distance) * rib_scale;
+    e->u.pfx.wide_fd = (uint64_t)st->feasible_distance;
     e->u.pfx.successor_count = st->successor_count;
     return EIGRP_RESULT_SUCCESS;
 }
@@ -4002,15 +4049,12 @@ static eigrp_result_t srl_topo_route_cb(const eigrp_topology_route_state_t *st, 
         e->u.route.ifname[0] = '\0';
     }
 
-    uint8_t rib_scale = srl_get_rib_scale(ctx->ni);
-    if (rib_scale == 0) rib_scale = 128;
-
     e->u.route.is_succ = st->successor ? 1 : 0;
     e->u.route.is_feas_succ = st->feasible_successor ? 1 : 0;
     e->u.route.dist = st->distance;
-    e->u.route.wide_dist = ((uint64_t)st->distance) * rib_scale;
+    e->u.route.wide_dist = (uint64_t)st->distance;
     e->u.route.rd = st->reported_distance;
-    e->u.route.wide_rd = ((uint64_t)st->reported_distance) * rib_scale;
+    e->u.route.wide_rd = (uint64_t)st->reported_distance;
     return EIGRP_RESULT_SUCCESS;
 }
 
@@ -4088,7 +4132,20 @@ typedef struct {
 
 static eigrp_result_t srl_intf_traffic_cb(const eigrp_intf_state_t *st, void *arg) {
     srl_traffic_report_ctx_t *ctx = (srl_traffic_report_ctx_t *)arg;
-    if (!ctx || !st || ctx->count >= ctx->capacity) return EIGRP_RESULT_SUCCESS;
+    if (!ctx || !st) return EIGRP_RESULT_SUCCESS;
+    const char *ifname = st->interface_name ? st->interface_name : "";
+    for (int i = 0; i < ctx->count; i++) {
+        if (strcmp(ctx->reports[i].ifname, ifname) == 0) {
+            ctx->reports[i].reliable_multicast_sent += st->reliable_multicast_sent;
+            ctx->reports[i].unreliable_multicast_sent += st->unreliable_multicast_sent;
+            ctx->reports[i].reliable_unicast_sent += st->reliable_unicast_sent;
+            ctx->reports[i].unreliable_unicast_sent += st->unreliable_unicast_sent;
+            ctx->reports[i].retransmissions_sent += st->retransmissions_sent;
+            ctx->reports[i].cr_packets_sent += st->cr_packets_sent;
+            return EIGRP_RESULT_SUCCESS;
+        }
+    }
+    if (ctx->count >= ctx->capacity) return EIGRP_RESULT_SUCCESS;
     srl_rep_traffic_t *r = &ctx->reports[ctx->count++];
     memset(r, 0, sizeof(*r));
     if (st->interface_name) {
@@ -4144,13 +4201,20 @@ void srlShimTrafficReport(const char *netinst) {
     }
 }
 
-int srlShimVarianceUpdate(const char *netinst, uint8_t variance) {
+static int srl_parse_afi_filter(const char *afi_name);
+
+int srlShimVarianceUpdateAfi(const char *netinst, const char *afi_name, uint8_t variance) {
     const char *ni = (netinst && netinst[0]) ? netinst : "default";
+    int target_afi = srl_parse_afi_filter(afi_name);
+    uint8_t var = variance ? variance : 1;
     eigrp_instance_t *instances[32];
     int count = 0;
     pthread_mutex_lock(&g_data_lock);
     for (srl_binding_t *b = g_bindings; b && count < 32; b = b->next) {
         if (strcmp(b->netinst, ni) == 0 && b->eigrp) {
+            if (target_afi != -1 && (int)eigrp_instance_afi(b->eigrp) != target_afi) {
+                continue;
+            }
             instances[count++] = b->eigrp;
         }
     }
@@ -4161,18 +4225,58 @@ int srlShimVarianceUpdate(const char *netinst, uint8_t variance) {
         memset(&ctx, 0, sizeof(ctx));
         ctx.runtime = instances[i];
         ctx.config = eigrp_af_config_runtime_read(instances[i]);
-        (void)eigrp_metric_variance_update(EIGRP_SET, &ctx, variance);
+        (void)eigrp_metric_variance_update(EIGRP_SET, &ctx, var);
+    }
+    return 0;
+}
+
+int srlShimVarianceUpdate(const char *netinst, uint8_t variance) {
+    return srlShimVarianceUpdateAfi(netinst, NULL, variance);
+}
+
+int srlShimMaxPathsUpdateAfi(const char *netinst, const char *afi_name, uint8_t max_paths) {
+    const char *ni = (netinst && netinst[0]) ? netinst : "default";
+    int target_afi = srl_parse_afi_filter(afi_name);
+    uint8_t mp = max_paths ? max_paths : 4;
+    eigrp_instance_t *instances[32];
+    int count = 0;
+    pthread_mutex_lock(&g_data_lock);
+    for (srl_binding_t *b = g_bindings; b && count < 32; b = b->next) {
+        if (strcmp(b->netinst, ni) == 0 && b->eigrp) {
+            if (target_afi != -1 && (int)eigrp_instance_afi(b->eigrp) != target_afi) {
+                continue;
+            }
+            instances[count++] = b->eigrp;
+        }
+    }
+    pthread_mutex_unlock(&g_data_lock);
+
+    for (int i = 0; i < count; i++) {
+        eigrp_instance_context_t ctx;
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.runtime = instances[i];
+        ctx.config = eigrp_af_config_runtime_read(instances[i]);
+        (void)eigrp_topology_maximum_paths_update(EIGRP_SET, &ctx, mp);
     }
     return 0;
 }
 
 int srlShimMaxPathsUpdate(const char *netinst, uint8_t max_paths) {
+    return srlShimMaxPathsUpdateAfi(netinst, NULL, max_paths);
+}
+
+int srlShimMaxHopsUpdateAfi(const char *netinst, const char *afi_name, uint8_t max_hops) {
     const char *ni = (netinst && netinst[0]) ? netinst : "default";
+    int target_afi = srl_parse_afi_filter(afi_name);
+    uint8_t mh = max_hops ? max_hops : 100;
     eigrp_instance_t *instances[32];
     int count = 0;
     pthread_mutex_lock(&g_data_lock);
     for (srl_binding_t *b = g_bindings; b && count < 32; b = b->next) {
         if (strcmp(b->netinst, ni) == 0 && b->eigrp) {
+            if (target_afi != -1 && (int)eigrp_instance_afi(b->eigrp) != target_afi) {
+                continue;
+            }
             instances[count++] = b->eigrp;
         }
     }
@@ -4183,31 +4287,13 @@ int srlShimMaxPathsUpdate(const char *netinst, uint8_t max_paths) {
         memset(&ctx, 0, sizeof(ctx));
         ctx.runtime = instances[i];
         ctx.config = eigrp_af_config_runtime_read(instances[i]);
-        (void)eigrp_topology_maximum_paths_update(EIGRP_SET, &ctx, max_paths);
+        (void)eigrp_metric_maximum_hops_update(EIGRP_SET, &ctx, mh);
     }
     return 0;
 }
 
 int srlShimMaxHopsUpdate(const char *netinst, uint8_t max_hops) {
-    const char *ni = (netinst && netinst[0]) ? netinst : "default";
-    eigrp_instance_t *instances[32];
-    int count = 0;
-    pthread_mutex_lock(&g_data_lock);
-    for (srl_binding_t *b = g_bindings; b && count < 32; b = b->next) {
-        if (strcmp(b->netinst, ni) == 0 && b->eigrp) {
-            instances[count++] = b->eigrp;
-        }
-    }
-    pthread_mutex_unlock(&g_data_lock);
-
-    for (int i = 0; i < count; i++) {
-        eigrp_instance_context_t ctx;
-        memset(&ctx, 0, sizeof(ctx));
-        ctx.runtime = instances[i];
-        ctx.config = eigrp_af_config_runtime_read(instances[i]);
-        (void)eigrp_metric_maximum_hops_update(EIGRP_SET, &ctx, max_hops);
-    }
-    return 0;
+    return srlShimMaxHopsUpdateAfi(netinst, NULL, max_hops);
 }
 
 int srlShimActiveTimeUpdate(const char *netinst, uint16_t minutes) {
@@ -5560,29 +5646,64 @@ int srlShimInstanceCreateV6(const char *netinst, uint16_t asn, const char *route
 typedef struct srl_rib_scale_entry {
     char netinst[64];
     uint8_t scale;
+    uint8_t applied_scale;
+    bool has_metrics;
+    bool wide_metrics;
+    uint8_t k_values[6];
     struct srl_rib_scale_entry *next;
 } srl_rib_scale_entry_t;
 
 static srl_rib_scale_entry_t *g_rib_scales = NULL;
 
-void srl_set_rib_scale(const char *netinst, uint8_t scale) {
-    const char *ni = (netinst && netinst[0]) ? netinst : "default";
-    if (scale == 0) scale = 128;
-    pthread_mutex_lock(&g_data_lock);
+static srl_rib_scale_entry_t *srl_get_or_create_rib_scale_locked(const char *ni) {
     srl_rib_scale_entry_t *e = g_rib_scales;
     while (e) {
         if (strcmp(e->netinst, ni) == 0) {
-            e->scale = scale;
-            pthread_mutex_unlock(&g_data_lock);
-            return;
+            return e;
         }
         e = e->next;
     }
     e = calloc(1, sizeof(*e));
     srl_strlcpy(e->netinst, ni, sizeof(e->netinst));
-    e->scale = scale;
+    e->scale = 128;
+    e->applied_scale = 128;
+    e->wide_metrics = true;
+    e->k_values[0] = EIGRP_K1_DEFAULT;
+    e->k_values[1] = EIGRP_K2_DEFAULT;
+    e->k_values[2] = EIGRP_K3_DEFAULT;
+    e->k_values[3] = EIGRP_K4_DEFAULT;
+    e->k_values[4] = EIGRP_K5_DEFAULT;
+    e->k_values[5] = EIGRP_K6_DEFAULT;
     e->next = g_rib_scales;
     g_rib_scales = e;
+    return e;
+}
+
+static void srl_apply_stored_metrics_locked(const char *ni, eigrp_instance_t *eigrp) {
+    if (!ni || !eigrp) return;
+    srl_rib_scale_entry_t *e = g_rib_scales;
+    while (e) {
+        if (strcmp(e->netinst, ni) == 0) {
+            if (e->has_metrics) {
+                eigrp->metric_version = e->wide_metrics ? EIGRP_TLV_64B_VERSION : EIGRP_TLV_32B_VERSION;
+                for (int i = 0; i < 6; i++) {
+                    eigrp->k_values[i] = e->k_values[i];
+                }
+            }
+            return;
+        }
+        e = e->next;
+    }
+}
+
+void srl_set_rib_scale(const char *netinst, uint8_t scale) {
+    const char *ni = (netinst && netinst[0]) ? netinst : "default";
+    if (scale == 0) scale = 128;
+    pthread_mutex_lock(&g_data_lock);
+    srl_rib_scale_entry_t *e = srl_get_or_create_rib_scale_locked(ni);
+    if (e) {
+        e->scale = scale;
+    }
     pthread_mutex_unlock(&g_data_lock);
 }
 
@@ -5604,6 +5725,7 @@ uint8_t srl_get_rib_scale(const char *netinst) {
 
 int srlShimMetricsUpdate(const char *netinst, uint8_t k1, uint8_t k2, uint8_t k3, uint8_t k4, uint8_t k5, uint8_t k6, uint8_t rib_scale, bool wide_metrics) {
     const char *ni = (netinst && netinst[0]) ? netinst : "default";
+    if (rib_scale == 0) rib_scale = 128;
     srl_set_rib_scale(ni, rib_scale);
     eigrp_metric_weights_t weights;
     memset(&weights, 0, sizeof(weights));
@@ -5617,20 +5739,46 @@ int srlShimMetricsUpdate(const char *netinst, uint8_t k1, uint8_t k2, uint8_t k3
 
     eigrp_instance_t *instances[32];
     int count = 0;
+    bool scale_changed = false;
     pthread_mutex_lock(&g_data_lock);
+    srl_rib_scale_entry_t *e = srl_get_or_create_rib_scale_locked(ni);
+    if (e) {
+        scale_changed = (e->applied_scale != rib_scale);
+        e->applied_scale = rib_scale;
+        e->has_metrics = true;
+        e->wide_metrics = wide_metrics;
+        e->k_values[0] = k1;
+        e->k_values[1] = k2;
+        e->k_values[2] = k3;
+        e->k_values[3] = k4;
+        e->k_values[4] = k5;
+        e->k_values[5] = k6;
+    }
     for (srl_binding_t *b = g_bindings; b && count < 32; b = b->next) {
         if (strcmp(b->netinst, ni) == 0 && b->eigrp) {
             instances[count++] = b->eigrp;
-            b->eigrp->metric_version = wide_metrics ? EIGRP_TLV_64B_VERSION : EIGRP_TLV_32B_VERSION;
         }
     }
     pthread_mutex_unlock(&g_data_lock);
 
+    uint8_t target_ver = wide_metrics ? EIGRP_TLV_64B_VERSION : EIGRP_TLV_32B_VERSION;
     for (int i = 0; i < count; i++) {
+        eigrp_instance_t *rt = instances[i];
         eigrp_instance_context_t ctx;
         memset(&ctx, 0, sizeof(ctx));
-        ctx.runtime = instances[i];
-        eigrp_metric_weights_update(EIGRP_SET, &ctx, &weights);
+        ctx.runtime = rt;
+        ctx.config = eigrp_af_config_runtime_read(rt);
+
+        bool ver_changed = (rt->metric_version != target_ver);
+        bool k_changed = (rt->k_values[0] != k1 || rt->k_values[1] != k2 ||
+                          rt->k_values[2] != k3 || rt->k_values[3] != k4 ||
+                          rt->k_values[4] != k5 || rt->k_values[5] != k6);
+        if (ver_changed) {
+            eigrp_metric_version_update(wide_metrics ? EIGRP_RESET : EIGRP_SET, &ctx);
+        }
+        if (k_changed || scale_changed) {
+            eigrp_metric_weights_update(EIGRP_SET, &ctx, &weights);
+        }
     }
     return 0;
 }
@@ -5973,13 +6121,11 @@ int srlShimGracefulRestartUpdate(const char *netinst, bool enabled, uint16_t res
 static eigrp_result_t srl_graceful_shutdown_msg_cb(eigrp_instance_t *runtime, void *arg) {
     (void)arg;
     if (!runtime || !runtime->eiflist) return EIGRP_RESULT_SUCCESS;
-    eigrp_list_item_t *node;
-    eigrp_intf_t *ei;
-    for (EIGRP_LIST_ITERATE_RO(runtime->eiflist, node, ei)) {
-        if (ei) {
-            eigrp_hello_send(ei, EIGRP_HELLO_GRACEFUL_SHUTDOWN, NULL);
-        }
-    }
+    eigrp_nbr_clear_request_t req;
+    memset(&req, 0, sizeof(req));
+    size_t affected = 0;
+    (void)eigrp_nbr_clear(runtime, &req, NULL, NULL, &affected);
+    srl_send_active_hellos(runtime);
     return EIGRP_RESULT_SUCCESS;
 }
 
@@ -6719,8 +6865,9 @@ static uint32_t srl_active_topology_prefix_count(eigrp_instance_t *runtime) {
         eigrp_prefix_descriptor_t *pe = rn->info;
         if (!pe || !eigrp_prefix_valid(&pe->destination)) continue;
         eigrp_route_descriptor_t *best = eigrp_topology_route_read(pe);
-        if (pe->distance != EIGRP_MAX_METRIC && best &&
-            best->distance != EIGRP_MAX_METRIC && best->metric.delay != EIGRP_MAX_METRIC) {
+        if (pe->distance != EIGRP_MAX_METRIC && pe->fdistance != EIGRP_MAX_METRIC && best &&
+            best->distance != EIGRP_MAX_METRIC && best->metric.delay != EIGRP_MAX_METRIC &&
+            (best->flags & (EIGRP_ROUTE_DESCRIPTOR_SUCCESSOR_FLAG | EIGRP_ROUTE_DESCRIPTOR_FSUCCESSOR_FLAG)) != 0) {
             count++;
         }
     }
@@ -6760,8 +6907,9 @@ static eigrp_result_t srl_max_prefix_msg_cb(eigrp_instance_t *runtime, void *arg
                 eigrp_prefix_descriptor_t *pe = rn->info;
                 if (!pe || !eigrp_prefix_valid(&pe->destination)) continue;
                 eigrp_route_descriptor_t *best = eigrp_topology_route_read(pe);
-                if (pe->distance == EIGRP_MAX_METRIC || !best ||
-                    best->distance == EIGRP_MAX_METRIC || best->metric.delay == EIGRP_MAX_METRIC) continue;
+                if (pe->distance == EIGRP_MAX_METRIC || pe->fdistance == EIGRP_MAX_METRIC || !best ||
+                    best->distance == EIGRP_MAX_METRIC || best->metric.delay == EIGRP_MAX_METRIC ||
+                    (best->flags & (EIGRP_ROUTE_DESCRIPTOR_SUCCESSOR_FLAG | EIGRP_ROUTE_DESCRIPTOR_FSUCCESSOR_FLAG)) == 0) continue;
                 if (pe->nt != EIGRP_TOPOLOGY_TYPE_REMOTE && pe->nt != EIGRP_TOPOLOGY_TYPE_REMOTE_EXTERNAL) continue;
                 if (runtime->neighbor_self && eigrp_prefix_descriptor_lookup(pe, runtime->neighbor_self) != NULL) continue;
                 victim = pe;
@@ -6771,10 +6919,13 @@ static eigrp_result_t srl_max_prefix_msg_cb(eigrp_instance_t *runtime, void *arg
             eigrp_prefix_descriptor_delete(runtime, runtime->topology_table, victim);
         }
     } else if (was_hard_limit && (mpa->max_prefixes == 0 || mpa->warning_only || mpa->max_prefixes > prev_max)) {
+        (void)eigrp_pfxlimits_state_clear(runtime);
+        (void)eigrp_redist_limit_clear(runtime);
         eigrp_nbr_clear_request_t req;
         memset(&req, 0, sizeof(req));
         size_t affected = 0;
         (void)eigrp_nbr_clear(runtime, &req, NULL, NULL, &affected);
+        srl_send_active_hellos(runtime);
     }
     return EIGRP_RESULT_SUCCESS;
 }
@@ -6821,7 +6972,26 @@ static eigrp_result_t srl_topology_clear_msg_cb(eigrp_instance_t *runtime, void 
     memset(&ctx, 0, sizeof(ctx));
     ctx.runtime = runtime;
     ctx.config = eigrp_af_config_runtime_read(runtime);
-    return eigrp_topology_clear(&ctx, tca->req, &tca->affected);
+    size_t initial_prefixes = srl_active_topology_prefix_count(runtime);
+    size_t nbr_affected = 0;
+    if (!tca->req->destination) {
+        (void)eigrp_pfxlimits_state_clear(runtime);
+        (void)eigrp_redist_limit_clear(runtime);
+        eigrp_nbr_clear_request_t nreq;
+        memset(&nreq, 0, sizeof(nreq));
+        (void)eigrp_nbr_clear(runtime, &nreq, NULL, NULL, &nbr_affected);
+    }
+    eigrp_result_t res = eigrp_topology_clear(&ctx, tca->req, &tca->affected);
+    if (!tca->req->destination) {
+        if (tca->affected < initial_prefixes) {
+            tca->affected = initial_prefixes;
+        }
+        if (tca->affected == 0 && nbr_affected > 0) {
+            tca->affected = nbr_affected;
+        }
+        srl_send_active_hellos(runtime);
+    }
+    return res;
 }
 
 int srlShimTopologyClear(const char *netinst, const char *prefix_str) {

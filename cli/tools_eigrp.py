@@ -133,15 +133,19 @@ class Plugin(ToolsPlugin):
                 update_location=False
             )
         if not topo.has_command("clear"):
+            clear_topo = Syntax("clear", help="Clear EIGRP topology table and re-synchronize with peers")
+            clear_topo.add_named_argument("prefix", default="*", help="Clear a specific prefix from EIGRP topology")
             topo.add_command(
-                Syntax("clear", help="Clear EIGRP topology table and re-synchronize with peers"),
+                clear_topo,
                 update_location=False,
                 callback=self.tools_clear_topology
             )
 
         if not eigrp.has_command("clear-topology"):
+            clear_topo_alias = Syntax("clear-topology", help="Clear EIGRP topology table and re-synchronize with peers")
+            clear_topo_alias.add_named_argument("prefix", default="*", help="Clear a specific prefix from EIGRP topology")
             eigrp.add_command(
-                Syntax("clear-topology", help="Clear EIGRP topology table and re-synchronize with peers"),
+                clear_topo_alias,
                 update_location=False,
                 callback=self.tools_clear_topology
             )
@@ -287,7 +291,25 @@ class Plugin(ToolsPlugin):
         if hasattr(state, "line_commands") and state.line_commands.has_node("network-instance"):
             netinst = state.line_commands.get_node("network-instance").get_or("name", "default")
 
-        res = send_ipc({"action": "clear-topology", "netinst": netinst})
+        pfx = None
+        if hasattr(arguments, "get_value_or"):
+            for node_name in ("prefix", "clear", "clear-topology"):
+                val = arguments.get_value_or(node_name, "prefix", None)
+                if val and val != "*":
+                    pfx = val
+                    break
+        if not pfx:
+            for node_name in ("prefix", "clear", "clear-topology"):
+                if hasattr(arguments, "has_node") and arguments.has_node(node_name):
+                    val = arguments.get_node(node_name).get_or("prefix", None)
+                    if val and val != "*":
+                        pfx = val
+                        break
+
+        payload = {"action": "clear-topology", "netinst": netinst}
+        if pfx:
+            payload["prefix"] = pfx
+        res = send_ipc(payload)
         if res.get("status") == "ok":
             output.print_line(f"Success: {res.get('message', 'EIGRP topology table cleared')}")
         else:

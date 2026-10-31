@@ -374,12 +374,6 @@ module srl_nokia-eigrp {
       units "10-microseconds";
       description "Interface delay in 10-microsecond units by default";
     }
-    leaf bandwidth-percent {
-      type uint32 { range "1..999999"; }
-      default 50;
-      units "percent";
-      description "Maximum percentage of interface bandwidth that EIGRP may use by default";
-    }
     uses eigrp-default-interface-address-family-config;
   }
 
@@ -409,12 +403,6 @@ module srl_nokia-eigrp {
       units "10-microseconds";
       description "Configured interface delay in 10-microsecond units";
     }
-    leaf bandwidth-percent {
-      type uint32 { range "1..999999"; }
-      default 50;
-      units "percent";
-      description "Maximum percentage of interface bandwidth that EIGRP may use";
-    }
     leaf ip-address {
       config false;
       type srl_nokia-comm:ip-address;
@@ -424,6 +412,16 @@ module srl_nokia-eigrp {
       config false;
       type uint8;
       description "IPv4 prefix length of the interface";
+    }
+    container statistics {
+      config false;
+      description "Per-interface EIGRP protocol traffic statistics";
+      leaf reliable-multicast { type srl_nokia-comm:zero-based-counter64; description "Reliable multicast packets"; }
+      leaf unreliable-multicast { type srl_nokia-comm:zero-based-counter64; description "Unreliable multicast packets"; }
+      leaf reliable-unicast { type srl_nokia-comm:zero-based-counter64; description "Reliable unicast packets"; }
+      leaf unreliable-unicast { type srl_nokia-comm:zero-based-counter64; description "Unreliable unicast packets"; }
+      leaf retransmissions { type srl_nokia-comm:zero-based-counter64; description "Retransmitted packets"; }
+      leaf cr-packets { type srl_nokia-comm:zero-based-counter64; description "Conditional Receive packets"; }
     }
     uses eigrp-interface-address-family-config;
   }
@@ -447,30 +445,6 @@ module srl_nokia-eigrp {
         type srl_nokia-comm:ipv4-address;
         description "EIGRP 32-bit Router ID";
       }
-      leaf variance {
-        type uint8 {
-          range "1..128";
-        }
-        default 1;
-        description
-          "Multiplier for unequal-cost load balancing. Feasible successor routes
-           within the variance window are installed into the SR Linux FIB as
-           uniform ECMP multipath due to NDK schema boundaries.";
-      }
-      leaf maximum-paths {
-        type uint8 {
-          range "1..64";
-        }
-        default 4;
-        description "Maximum number of parallel equal-cost paths (ECMP)";
-      }
-      leaf maximum-hops {
-        type uint8 {
-          range "1..255";
-        }
-        default 100;
-        description "Maximum hop count limit for EIGRP routes";
-      }
       leaf rib-scale {
         type uint8 {
           range "1..255";
@@ -478,34 +452,10 @@ module srl_nokia-eigrp {
         default 128;
         description "Scale factor for converting 64-bit wide metrics to 32-bit RIB metrics";
       }
-      leaf preference {
-        type uint8 {
-          range "1..255";
-        }
-        default 90;
-        description "Route table preference (administrative distance) for internal EIGRP routes";
-      }
-      leaf external-preference {
-        type uint8 {
-          range "1..255";
-        }
-        default 170;
-        description "Route table preference (administrative distance) for external EIGRP routes";
-      }
       leaf wide-metrics {
         type boolean;
         default true;
         description "Enable RFC 7868 64-bit wide metrics";
-      }
-      leaf traffic-share-balanced {
-        type boolean;
-        default false;
-        description "Distribute traffic proportionally to route metrics across unequal-cost paths";
-      }
-      leaf auto-summary {
-        type boolean;
-        default false;
-        description "Enable automatic classful network boundary route summarization";
       }
       leaf event-log-size {
         type uint32 {
@@ -538,68 +488,6 @@ module srl_nokia-eigrp {
         config false;
         type uint32;
         description "Number of learned EIGRP routes";
-      }
-      container default-metric {
-        description "Default seed metric for redistributed routes";
-        leaf bandwidth {
-          type uint32 {
-            range "1..10000000";
-          }
-          default 100000;
-          units "kilobits-per-second";
-          description "Default bandwidth metric in kilobits per second (K1)";
-        }
-        leaf delay {
-          type uint32 {
-            range "1..16777215";
-          }
-          default 100;
-          units "10-microseconds";
-          description "Default delay metric in 10-microsecond units (K3)";
-        }
-        leaf reliability {
-          type uint8 {
-            range "1..255";
-          }
-          default 255;
-          description "Default reliability metric from 1 to 255 (K4)";
-        }
-        leaf load {
-          type uint8 {
-            range "1..255";
-          }
-          default 1;
-          description "Default effective load metric from 1 to 255 (K2)";
-        }
-        leaf mtu {
-          type uint32 {
-            range "1..65535";
-          }
-          default 1500;
-          description "Default Maximum Transmission Unit in bytes (K5)";
-        }
-      }
-      container maximum-prefix {
-        description "Maximum number of prefixes accepted in the EIGRP topology table";
-        leaf limit {
-          type uint32 {
-            range "1..4294967295";
-          }
-          description "Maximum number of prefixes allowed";
-        }
-        leaf threshold {
-          type uint8 {
-            range "1..100";
-          }
-          default 75;
-          units "percent";
-          description "Warning threshold percentage";
-        }
-        leaf warning-only {
-          type boolean;
-          default false;
-          description "Log warning message only when limit is exceeded without dropping routes";
-        }
       }
       container graceful-restart {
         description "Graceful restart (Non-Stop Forwarding / NSF) configuration";
@@ -668,38 +556,6 @@ module srl_nokia-eigrp {
           description "DUAL SIA timer";
         }
       }
-      container authentication {
-        description "Instance-wide packet authentication configuration";
-        leaf admin-state {
-          type srl_nokia-comm:admin-state;
-          default "enable";
-          description "Administrative state of authentication";
-        }
-        leaf oper-state {
-          config false;
-          type srl_nokia-comm:oper-state;
-          description "Operational state of authentication";
-        }
-        leaf mode {
-          type enumeration {
-            enum none;
-            enum md5;
-            enum hmac-sha-256;
-          }
-          default "none";
-          description "Authentication mode for EIGRP packets";
-        }
-        leaf keychain {
-          type leafref {
-            path "/srl_nokia-system:system/srl_nokia-keychains:authentication/srl_nokia-keychains:keychain/srl_nokia-keychains:name";
-          }
-          description "Reference to system authentication keychain (/system/authentication/keychain)";
-        }
-        leaf authentication-key {
-          type string;
-          description "Direct plaintext authentication key or password";
-        }
-      }
 
       list address-family {
         key "name";
@@ -737,6 +593,30 @@ module srl_nokia-eigrp {
             path "/srl-rpol:routing-policy/srl-rpol:policy/srl-rpol:name";
           }
           description "Import policy for filtering EIGRP routes in this address family";
+        }
+        leaf variance {
+          type uint8 {
+            range "1..128";
+          }
+          default 1;
+          description
+            "Multiplier for unequal-cost load balancing in this address family.
+             Feasible successor routes within the variance window are installed into
+             the SR Linux FIB as uniform ECMP multipath due to NDK schema boundaries.";
+        }
+        leaf maximum-paths {
+          type uint8 {
+            range "1..64";
+          }
+          default 4;
+          description "Maximum number of parallel equal-cost paths (ECMP) in this address family";
+        }
+        leaf maximum-hops {
+          type uint8 {
+            range "1..255";
+          }
+          default 100;
+          description "Maximum hop count limit for EIGRP routes in this address family";
         }
         leaf preference {
           type uint8 {
@@ -832,14 +712,17 @@ module srl_nokia-eigrp {
         uses eigrp-default-interface-config;
       }
 
-      list event-log {
-        key "id";
+      container event-log {
         config false;
-        srl_nokia-ext:unordered-state-list "true";
-        description "DUAL finite state machine and protocol event log entries";
-        leaf id { type uint32; description "Event sequence number"; }
-        leaf timestamp { type string; description "Event timestamp"; }
-        leaf message { type string; description "Formatted event description"; }
+        description "DUAL finite state machine and protocol event log";
+        list entry {
+          key "id";
+          srl_nokia-ext:unordered-state-list "true";
+          description "DUAL finite state machine and protocol event log entries";
+          leaf id { type uint32; description "Event sequence number"; }
+          leaf timestamp { type string; description "Event timestamp"; }
+          leaf message { type string; description "Formatted event description"; }
+        }
       }
 
       list interface {
@@ -870,20 +753,6 @@ module srl_nokia-eigrp {
         leaf auth-mode { type string; description "Authentication mode negotiated/used"; }
         leaf oper-down-reason { type string; description "Reason why neighbor is down or failed to establish"; }
       }
-      list route {
-        key "prefix";
-        config false;
-        srl_nokia-ext:unordered-state-list "true";
-        description "Learned EIGRP routes";
-        leaf prefix { type srl_nokia-comm:ip-prefix; }
-        leaf next-hop { type srl_nokia-comm:ip-address; }
-        leaf interface { type string; description "Outgoing interface for next-hop"; }
-        leaf metric { type uint32; }
-        leaf wide-metric { type uint64; description "64-bit RFC 7868 wide composite metric"; }
-        leaf rib-scale { type uint8; description "RIB scale factor used to derive metric"; }
-        leaf external { type boolean; }
-        leaf preference { type uint8; }
-      }
       list static-neighbor {
         key "ip-address";
         description "Statically configured EIGRP neighbors";
@@ -907,42 +776,42 @@ module srl_nokia-eigrp {
           description "Reason why the static neighbor is operationally down";
         }
       }
-      list topology {
-        key "destination";
+      container topology {
         config false;
-        srl_nokia-ext:unordered-state-list "true";
-        description "DUAL topology table entries";
-        leaf destination { type srl_nokia-comm:ip-prefix; }
-        leaf active { type boolean; }
-        leaf feasible-distance { type uint32; }
-        leaf wide-feasible-distance { type uint64; description "64-bit feasible distance"; }
-        leaf successor-count { type uint32; }
-        list route {
-          key "next-hop";
-          srl_nokia-ext:unordered-state-list "true";
-          description "Candidate paths and feasible successors for this topology destination";
-          leaf next-hop { type srl_nokia-comm:ip-address; }
-          leaf interface { type string; }
-          leaf successor { type boolean; }
-          leaf feasible-successor { type boolean; }
-          leaf distance { type uint32; }
-          leaf wide-distance { type uint64; }
-          leaf reported-distance { type uint32; }
-          leaf wide-reported-distance { type uint64; }
+        description "DUAL topology table state";
+        leaf total-prefixes {
+          type uint32;
+          description "Total number of prefixes in the topology table";
         }
-      }
-      list traffic {
-        key "interface";
-        config false;
-        srl_nokia-ext:unordered-state-list "true";
-        description "Per-interface protocol traffic statistics";
-        leaf interface { type string; }
-        leaf reliable-multicast { type srl_nokia-comm:zero-based-counter64; }
-        leaf unreliable-multicast { type srl_nokia-comm:zero-based-counter64; }
-        leaf reliable-unicast { type srl_nokia-comm:zero-based-counter64; }
-        leaf unreliable-unicast { type srl_nokia-comm:zero-based-counter64; }
-        leaf retransmissions { type srl_nokia-comm:zero-based-counter64; }
-        leaf cr-packets { type srl_nokia-comm:zero-based-counter64; }
+        leaf active-prefixes {
+          type uint32;
+          description "Number of prefixes currently in DUAL Active state";
+        }
+        list prefix {
+          key "prefix";
+          srl_nokia-ext:unordered-state-list "true";
+          description "DUAL topology table entries";
+          leaf prefix { type srl_nokia-comm:ip-prefix; }
+          leaf active { type boolean; }
+          leaf feasible-distance { type uint32; }
+          leaf wide-feasible-distance { type uint64; description "64-bit feasible distance"; }
+          leaf successor-count { type uint32; }
+          leaf external { type boolean; description "True if redistributed external route"; }
+          leaf preference { type uint8; description "Administrative distance (route preference)"; }
+          list route {
+            key "next-hop";
+            srl_nokia-ext:unordered-state-list "true";
+            description "Candidate paths and feasible successors for this topology prefix";
+            leaf next-hop { type srl_nokia-comm:ip-address; }
+            leaf interface { type string; }
+            leaf successor { type boolean; }
+            leaf feasible-successor { type boolean; }
+            leaf distance { type uint32; }
+            leaf wide-distance { type uint64; }
+            leaf reported-distance { type uint32; }
+            leaf wide-reported-distance { type uint64; }
+          }
+        }
       }
     }
   }

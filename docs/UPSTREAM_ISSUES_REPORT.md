@@ -1,281 +1,170 @@
-# Upstream OpenEIGRP (`diivious/eigrp`) Bug Report & Patch Set
+# OpenEIGRP (`rel-0.5.0`) Upstream Protocol Defect Report
 
-**Upstream Repository**: `https://github.com/diivious/eigrp`  
-**Evaluated Commit**: `b9b52afd69f6f93c698b88f6cb56ecf9cefad655` (`rel-0.3.0`)  
-**Test Environment**: 5-Node Nokia SR Linux Containerlab Diamond/Mesh Topology (`srl1`–`srl5`) & Upstream `eigrp-uut-node` Test Harness (`eigrp/test/uut`)
-
----
-
-## Executive Summary
-
-During live multi-router integration and protocol verification of `diivious/eigrp` (`rel-0.3.0`, commit `b9b52afd69f6f93c698b88f6cb56ecf9cefad655`) across a 5-node Nokia SR Linux topology (covering DUAL Feasible Successor failover, active query/reply convergence, peer process restarts, dual-stack IPv4/IPv6, manual and auto summarization with `leak-map`, multi-protocol redistribution, `maximum-prefix`, and K-value/interface metric updates), **four upstream defects** (spanning 4 files in `eigrp/code/`) were identified in portable core EIGRP code (`eigrp/code/`).
-
-To keep the `src/upstream/eigrp` git submodule completely unmodified (`git status` clean), all four defects are currently mitigated in our host build via linker symbol wrapping (`-Wl,--wrap=...`) in [`src/cshim/srl_cshim_overrides.c`](file:///home/awhitaker/dev/srl-eigrp/src/cshim/srl_cshim_overrides.c). Once the fixes below are merged upstream into `diivious/eigrp`, `srl_cshim_overrides.c` and the corresponding `--wrap` flags in [`src/cmd/srl-eigrpd/bridge.go`](file:///home/awhitaker/dev/srl-eigrp/src/cmd/srl-eigrpd/bridge.go) can be removed in their entirety.
-
-| # | Upstream File(s) | Function(s) | Summary of Defect | Severity |
-| :- | :--- | :--- | :--- | :--- |
-| **1** | `eigrp/code/eigrp_update.c` | `eigrp_update_receive()` | `nbr->peer_init_sequence_number` is never cleared/advanced after the initial `INIT`/`EOT` exchange completes, causing a restarted neighbor whose new `INIT` uses `sequence = 1` to be misclassified as a duplicate retransmission and ignored instead of triggering the `peer restarted` handler. In addition, the `peer restarted` handler cancels `nbr->t_holddown` via `EIGRP_NEIGHBOR_DOWN` without re-arming `eigrp_nbr_holddown_update(nbr)`. | **High** |
-| **2** | `eigrp/code/eigrp_topology.c` | `eigrp_topology_metric_update()` | Recalculating topology metrics (on K-value, metric-version, or interface metric change) overwrites `route->reported_distance` (must remain `0`) on self-originated connected/redistributed routes (`RD == FD`, stripping `SUCCESSOR` flag), double-adds interface delay and increments `hop_count` on connected routes, fails to scale `delay` on self-originated redistributed routes, promotes un-elected query-retained prefixes (`b9b52af`), and sets `prefix->rdistance` / `prefix->reported_metric` to the predecessor's metric instead of `best->distance` / `best->total_metric`. | **High** |
-| **3** | `eigrp/code/eigrp_topology.c`<br>`eigrp/code/eigrp_update.c` | `eigrp_topology_prefix_count()`<br>`eigrp_topology_prefix_admit()`<br>`eigrp_update_receive()` | While commit `4542860` detaches empty `PASSIVE` destination shells after packetizer drain, `eigrp->topology_table` still holds poisoned/withdrawing descriptors during route replacement/churn (`prefix->distance == EIGRP_MAX_METRIC`) as well as `PASSIVE` query-retained unknown descriptors created by `eigrp_query_unknown_route_record()` (`b9b52af`). `eigrp_topology_prefix_count()` counts those non-reachable descriptors toward `topology_maximum_prefix` (causing false rejections on route replacement), while `eigrp_update_receive()` (in its `if (prefix != NULL)` branch) omits `eigrp_topology_prefix_admit()` and `eigrp_topology_prefix_admit()` unconditionally returns `true` for any existing descriptor in `topology_table`. | **Medium-High** |
-| **4** | `eigrp/code/eigrp_summary.c`<br>`eigrp/code/eigrp_query.c` | `eigrp_summary_route_build()`<br>`eigrp_summary_query_route_build()`<br>`eigrp_query_receive()` | Synthesized summary routes copy `best_route->metric` (predecessor's reported vector) instead of `best_route->total_metric` (local accumulated vector), inherit `best_route->ei` (causing split-horizon poison reverse to poison the summary with `EIGRP_MAX_METRIC` whenever `best_route->ei == ei`), inherit `best_route->type` (advertising an External TLV if the best component is redistributed), and leak suppressed component routes when a neighbor sends a `QUERY` for a covered component prefix. | **High** |
+**Upstream Repository:** `https://github.com/diivious/eigrp.git`  
+**Evaluated Release / Commit:** `rel-0.5.0` (`a41789b52671f81e5b3e21f02942cf7e3e4121db`)  
+**Previous Evaluated Release / Commit:** `rel-0.3.0` (`b9b52af04133df47c90cb00516dd3a36d25a9573`)  
+**Reference Gist Re-Verified:** `7104d5892c7ee620c567ec203a440ecc` (*"openeigrp 0.3.0 test re-run"*)  
+**Test Environment:** 5-Node Nokia SR Linux 25.10.1 Containerlab Topology (`srl1`–`srl5`, dual-stack IPv4/IPv6 EIGRP AS 100) + C-Shim Unit Test Harness (`srlTestRel030OverridesCheck`)
 
 ---
 
-## Detailed Defect Analysis & Proposed Upstream Patches
+## Executive Summary & `rel-0.3.0` → `rel-0.5.0` Resolution Matrix
+
+All issues documented in the `rel-0.3.0` upstream defect report and the `openeigrp 0.3.0 test re-run` gist (`7104d5892c7ee620c567ec203a440ecc`) were re-evaluated against `rel-0.5.0` (`a41789b52671f81e5b3e21f02942cf7e3e4121db`) in the live 5-node Containerlab testbed:
+
+| Prior Reference (`rel-0.3.0` Report & Gist `7104d5892c7ee620c567ec203a440ecc`) | Summary | Status in `rel-0.5.0` (`a41789b`) | Upstream Resolution / Remaining Gap |
+| :--- | :--- | :--- | :--- |
+| **Gist Defect 2** | Manual summary component loss fails to withdraw RIB/peer route when other summary interfaces remain up (`eigrp_summary.c`) | **RESOLVED** | Fixed in `31484cf` (`eigrp_summary_Null0_active()` in `eigrp_summary.c:56-71` and `eigrp_summary.c:663-674`): Null0 sink is withdrawn as soon as `active_interfaces == 0`, even when other interfaces still carry the summary configuration. All `__wrap_eigrp_summary_*` overrides have been removed. |
+| **Gist Defect 1 (Part A)** | `eigrp_fsm_event_lr()` (`ACTIVE_1` / `ACTIVE_3` → `PASSIVE`) leaves `prefix->fdistance = prefix->distance = EIGRP_MAX_METRIC` instead of calling `eigrp_topology_update_node_flags()` (`eigrp_fsm.c`) | **RESOLVED** | Fixed in `4e5dd9c` (`eigrp_fsm.c:838-868`): `eigrp_fsm_event_lr()` now restores `prefix->distance`, `prefix->fdistance`, `prefix->reported_metric`, and `prefix->rdistance` from `best_route` and invokes `eigrp_topology_update_node_flags()`. `__wrap_eigrp_fsm_event_lr` has been removed. |
+| **Gist Defect 1 (Part B)** | `eigrp_route_descriptor_delete()` leaves stale `prefix->req_action` bits pointing at freed `prefix->Best_route` (`eigrp_topology.c`) | **RESOLVED** | Fixed in `794df31` / `20a3011` (`eigrp_topology.c`): packetizer work items now hold explicit route/prefix references rather than dereferencing a stale `prefix->Best_route` pointer. |
+| **Gist Neighbor-Down `adv_router` Lifetime Hazard** | `eigrp_nbr_delete()` frees `nbr` while poisoned routes remain in `topology_table` awaiting packetizer retirement, causing use-after-free on `route->adv_router` | **RESOLVED** | Fixed in `20a3011` (`eigrp_neighbor.c:725-753` and `eigrp_topology.c:553-577`): `eigrp_topology_nbr_hold()` / `eigrp_topology_nbr_release()` reference-count `nbr->topo_refs` and defer `eigrp_nbr_free()` until all topology descriptors release `adv_router`. |
+| **Gist Defect 3** | `eigrp_topology_prefix_admit()` counts `QUERY`-retained / `ACTIVE` withdrawing prefixes (`topology_table->size`), admits any existing `topology_table` entry without checking reachability, and tears down all AF neighbors on hard limit rejection (`eigrp_topology.c`, `eigrp_pfxlimits.c`) | **OPEN (Issue 1 below)** | Commit `243c647` switched `eigrp_topology_prefix_count()` to `runtime->topology_table->size`, which still counts unreachable `QUERY`-retained `PASSIVE` entries and withdrawing `ACTIVE` entries, and `eigrp_pfxlimits_prefix_exceeded()` still suspends all neighbors in the AF on a hard limit rejection. |
+| **Gist Defect 1 (Part C)** | `eigrp_query_unknown_route_record()` retains un-elected `flags == 0` routes in `PASSIVE` prefixes that are never cleaned up on unreachable `UPDATE`, poisoned `QUERY`, competing neighbor `UPDATE`, or neighbor-down (`eigrp_query.c`, `eigrp_update.c`, `eigrp_topology.c`) | **OPEN (Issue 2 below)** | Commit `8489c3b` kept `prefix->distance = EIGRP_MAX_METRIC` on initial unknown `QUERY` creation, but un-elected `QUERY`-retained RDBs still promote into false RIB-installed successors when another neighbor withdraws or goes down, or when a competing neighbor sends a higher-metric `UPDATE`. |
+| **Gist Defect 4** | Peer `metric-version` change in `eigrp_sw_version_decode()` (`eigrp_hello.c`) updates `nbr->tlv_version` without updating `ei->tlv1_peer_count` / `ei->tlv2_peer_count` | **OPEN (Issue 3 below)** | Commit `77e976a` fixed local CLI metric-version updates in `eigrp_nbr_codec_update()`, but `eigrp_sw_version_decode()` (`eigrp_hello.c:198-218`) still calls `eigrp_nbr_codec_select()` without updating interface peer encoder counts when a peer changes its advertised software TLV version while `UP`. |
 
 ---
 
-### Defect 1: `eigrp_update.c` — Peer Restart Ignored When Restarted Neighbor Reuses `INIT` Sequence `1`, and `t_holddown` Left Disarmed After Peer Restart
+## Issue 1: `eigrp_topology_prefix_admit()` Counts Unreachable `QUERY`-Retained and `ACTIVE` Withdrawing Prefixes and Tears Down All Neighbors on Hard Limit Rejection
 
-- **Affected File**: `eigrp/code/eigrp_update.c`
-- **Affected Function**: `eigrp_update_receive()` (lines 159–168 and 251–266)
-- **Wrapper Workaround**: `__wrap_eigrp_update_receive()` in [`src/cshim/srl_cshim_overrides.c`](file:///home/awhitaker/dev/srl-eigrp/src/cshim/srl_cshim_overrides.c#L348-L363)
+### Component & Location
+- **Files:**
+  - `eigrp/code/eigrp_topology.c:2692-2743` (`eigrp_topology_prefix_count`, `eigrp_topology_prefix_admit`)
+  - `eigrp/code/eigrp_pfxlimits.c:66-156` (`eigrp_pfxlimits_nbr_update`, `eigrp_pfxlimits_state_cleanup`, `eigrp_pfxlimits_prefix_exceeded`)
+- **Severity:** High (Rejects legitimate replacement routes during route churn at the `maximum-prefix` boundary, admits `QUERY`-retained prefixes past `maximum-prefix`, and tears down all neighbors in the address family when `maximum-prefix` is exceeded)
 
-#### Root Cause
-1. **Stale `nbr->peer_init_sequence_number` blocks peer restart detection**:
-   - In commit `4288e52`, `nbr->peer_init_sequence_number` was added to `eigrp_update_receive()` (`eigrp_update.c:159–167`) to handle a retransmitted `INIT` UPDATE after a lost ACK (`eigrp/test/rtp/lost-ack.yaml`), because `eigrp_packet_ack()` (`eigrp_packet.c:391`) overwrites `nbr->recv_sequence_number = ntohl(eigrph->sequence)` (`0` on a Hello ACK):
-     ```c
-     if (flags == EIGRP_INIT_FLAG
-         && ntohl(eigrph->sequence) != 0
-         && nbr->peer_init_sequence_number == ntohl(eigrph->sequence)) {
-         eigrp_hello_send_ack_sequence(nbr, ntohl(eigrph->sequence));
-         return;
-     }
-     peer_init_previously_seen = nbr->peer_init_sequence_number != 0;
-     if (flags == EIGRP_INIT_FLAG && !peer_init_previously_seen)
-         nbr->peer_init_sequence_number = ntohl(eigrph->sequence);
-     ```
-   - Every new or restarted OpenEIGRP instance initializes `eigrp->sequence_number = 1` (`eigrp_instance.c:262`), so its first reliable packet (`INIT` UPDATE) is always transmitted with `sequence = 1` (`eigrp_packet_sequence_reserve()`).
-   - Because `nbr->peer_init_sequence_number` remains `1` for the entire lifetime of the `UP` adjacency and is never cleared or advanced after the initial `INIT`/`EOT` exchange completes, if the peer daemon restarts before the local hold timer expires and sends a fresh `INIT` UPDATE with `sequence = 1`, `nbr->peer_init_sequence_number == ntohl(eigrph->sequence)` evaluates to `true`.
-   - The surviving router ACKs `sequence = 1` (`eigrp_hello_send_ack_sequence(nbr, 1)`) and returns early at line 163—never reaching the `peer restarted` state-reset block at lines 251–266! Because the surviving router neither resets the neighbor nor sends its own `INIT` UPDATE, the restarted peer never receives the surviving router's `INIT`/`EOT` topology table and stale routes from the restarted peer's prior incarnation remain installed.
-   - Once the surviving router receives any reliable non-`INIT` UPDATE (`!(flags & EIGRP_INIT_FLAG) && ntohl(eigrph->sequence) != 0`) from the peer, the peer has already received our ACK for its `INIT` UPDATE and exited `EIGRP_NEIGHBOR_PENDING` (`eigrp_packet.c:378–392`), so it will never retransmit that `INIT`. Advancing `nbr->peer_init_sequence_number` to a non-zero sentinel (`UINT32_MAX`) at that point preserves `peer_init_previously_seen == true` while allowing a subsequent `INIT` with `sequence = 1` from a restarted peer to reach line 251.
-
-2. **Disarmed `nbr->t_holddown` after `peer restarted` state transition**:
-   - In the `peer restarted` block (`eigrp_update.c:251–266`):
-     ```c
-     if (nbr->state == EIGRP_NEIGHBOR_UP && peer_init_previously_seen) {
-         eigrp_debug_nsf_event(eigrp, nbr, flags, "peer restarted");
-         eigrp_update_nsf_eventlog(eigrp, nbr, 4, flags,
-             ntohl(eigrph->sequence));
-         eigrp_nbr_state_update_reason(EIGRP_SET, nbr, EIGRP_NEIGHBOR_DOWN,
-             EIGRP_EVENTLOG_NEIGHBOR_REASON_PEER_RESTART);
-         eigrp_topology_neighbor_down(nbr->ei->eigrp, nbr);
-         nbr->peer_init_sequence_number = ntohl(eigrph->sequence);
-         nbr->recv_sequence_number = ntohl(eigrph->sequence);
-         if (eigrp->log_neighbor_changes)
-             eigrp_log(EIGRP_LOG_INFO, "Neighbor %s (%s) is down: peer restarted",
-                       eigrp_print_addr(&nbr->src),
-                       nbr->ei->name);
-         eigrp_nbr_state_update(EIGRP_SET, nbr, EIGRP_NEIGHBOR_PENDING);
-         eigrp_update_send_init(eigrp, nbr);
-     }
-     ```
-   - Calling `eigrp_nbr_state_update_reason(EIGRP_SET, nbr, EIGRP_NEIGHBOR_DOWN, ...)` at line 255 cancels `nbr->t_holddown` (`eigrp_neighbor.c:1047`).
-   - Because commit `4288e52` moved `eigrp_nbr_holddown_update(nbr)` out of `eigrp_update_receive()` into `eigrp_packet_ingress_authenticate()` (`eigrp_packet.c:2117`, which runs before `eigrp_update_receive()`), transitioning `nbr` to `EIGRP_NEIGHBOR_PENDING` at line 264 leaves `nbr->t_holddown == NULL` unless `eigrp_nbr_holddown_update(nbr)` is called after resetting the state.
-
-#### Proposed Upstream Patch
-```diff
---- a/eigrp/code/eigrp_update.c
-+++ b/eigrp/code/eigrp_update.c
-@@ -165,6 +165,9 @@ void eigrp_update_receive(eigrp_instance_t *eigrp, eigrp_nbr_t *nbr,
- 	peer_init_previously_seen = nbr->peer_init_sequence_number != 0;
- 	if (flags == EIGRP_INIT_FLAG && !peer_init_previously_seen)
- 		nbr->peer_init_sequence_number = ntohl(eigrph->sequence);
-+	else if (!(flags & EIGRP_INIT_FLAG) && ntohl(eigrph->sequence) != 0
-+		 && peer_init_previously_seen)
-+		nbr->peer_init_sequence_number = UINT32_MAX;
- 
- 	same = 0;
- 	graceful_restart = 0;
-@@ -262,6 +265,7 @@ void eigrp_update_receive(eigrp_instance_t *eigrp, eigrp_nbr_t *nbr,
- 					  eigrp_print_addr(&nbr->src),
- 					  nbr->ei->name);
- 			eigrp_nbr_state_update(EIGRP_SET, nbr, EIGRP_NEIGHBOR_PENDING);
-+			eigrp_nbr_holddown_update(nbr);
- 			eigrp_update_send_init(eigrp, nbr);
- 		}
- 	}
-```
-
----
-
-### Defect 2: `eigrp_topology.c` — `eigrp_topology_metric_update()` Corrupts Self-Originated Connected/Redistributed Routes and Advertised Metric State
-
-- **Affected File**: `eigrp/code/eigrp_topology.c`
-- **Affected Function**: `eigrp_topology_metric_update()` (lines 1245–1283)
-- **Wrapper Workaround**: `__wrap_eigrp_topology_metric_update()` in [`src/cshim/srl_cshim_overrides.c`](file:///home/awhitaker/dev/srl-eigrp/src/cshim/srl_cshim_overrides.c#L46-L117)
-
-#### Root Cause
-Whenever metric weights (`K1`–`K6` via `eigrp_metric_weights_update()`), metric version (`eigrp_metric_version_update()`), or interface metrics are updated at runtime, `eigrp_topology_metric_update(eigrp)` walks all `PASSIVE` prefixes in `eigrp->topology_table` (`eigrp_topology.c:1259–1276`):
-
+### Exact Upstream Code (`rel-0.5.0`)
+In `eigrp/code/eigrp_topology.c:2692-2743`:
 ```c
-		for (route = eigrp_topology_route_iterator_first(prefix, &iterator); route;
-		     route = eigrp_topology_route_iterator_next(&iterator)) {
-			route->reported_distance = eigrp_metric_calculate(eigrp, route->reported_metric);
-			if (route->ei)
-				route->distance = eigrp_metric_total_calculate(eigrp, route);
-			else
-				route->distance = eigrp_metric_calculate(eigrp, route->total_metric);
+/* Every destination still present in the topology database counts, even
+ * if QUERY-retained, poisoned, or awaiting deferred retirement. */
+static uint32_t eigrp_topology_prefix_count(eigrp_instance_t *runtime)
+{
+	if (!runtime || !runtime->topology_table)
+		return 0;
+	/* Topology publication sets node->info with node creation, and
+	 * retirement removes the node. The indexed table size is O(1). */
+	if (runtime->topology_table->size > UINT32_MAX)
+		return UINT32_MAX;
+	return (uint32_t)runtime->topology_table->size;
+}
+
+bool eigrp_topology_prefix_admit(eigrp_instance_t *runtime,
+				 const eigrp_prefix_t *prefix)
+{
+	eigrp_af_config_t *af;
+	const eigrp_prefix_limit_t *limit;
+
+	if (!runtime || !prefix)
+		return false;
+	if (runtime->eigrp_pfxlimits_af_state)
+		return false;
+	/* Every retained topology destination consumes one prefix slot. */
+	if (eigrp_topology_table_lookup(runtime->topology_table, prefix))
+		return true;
+	af = eigrp_af_config_runtime_read(runtime);
+	if (!af || !af->topology_maximum_prefix_configured)
+		return true;
+	limit = &af->topology_maximum_prefix;
+	{
+		uint32_t count = eigrp_topology_prefix_count(runtime);
+		if (eigrp_prefix_limit_threshold_crossed(limit, count))
+			eigrp_log(
+				EIGRP_LOG_WARNING,
+				"EIGRP topology maximum-prefix threshold reached (%u/%u)",
+				count + 1U, limit->maximum);
+		/* Process admission supports restart/reset/dampening policies.
+		 * The legacy basic-only admission helper would bypass hard
+		 * limits whenever any of those options was configured. */
+		if (!limit->warning_only && count >= limit->maximum) {
+			(void)eigrp_eventlog_msg_add(
+				runtime,
+				EIGRP_EVENTLOG_OPCODE_PREFIX_LIMIT_REJECT,
+				prefix, EIGRP_EVENTLOG_PREFIX_LIMIT_TOPOLOGY,
+				count + 1U, limit->maximum, 0);
+			eigrp_pfxlimits_prefix_exceeded(runtime, limit);
+			return false;
 		}
-		eigrp_topology_route_queue_resort(prefix->internal_routes);
-		eigrp_topology_route_queue_resort(prefix->external_routes);
-		best = eigrp_topology_route_read(prefix);
-		if (best) {
-			prefix->distance = best->distance;
-			prefix->fdistance = best->distance;
-			prefix->rdistance = best->reported_distance;
-			prefix->reported_metric = best->reported_metric;
-		}
-		eigrp_topology_update_node_flags(eigrp, prefix);
+		return true;
+	}
+}
 ```
 
-This loop has five bugs:
+### Root Cause Analysis
+1. **Unreachable `QUERY`-retained and `ACTIVE` withdrawing prefixes consume `maximum-prefix` slots**:
+   - `eigrp_topology_prefix_count()` returns `runtime->topology_table->size`.
+   - When an unknown `QUERY` creates a `QUERY`-retained `PASSIVE` prefix (`prefix->distance == EIGRP_MAX_METRIC`, `prefix->fdistance == EIGRP_MAX_METRIC`), or when an existing prefix loses its successor and enters `ACTIVE_1` / `ACTIVE_3` while waiting for `REPLY`s from neighbors, the prefix descriptor remains in `runtime->topology_table`.
+   - Note also that when a prefix transitions to `ACTIVE` in `eigrp_fsm_event_q_fcn()` / `eigrp_fsm_event_nq_fcn()` (`eigrp_fsm.c:723-765`), `prefix->distance` and `prefix->fdistance` remain frozen at their pre-`ACTIVE` finite values while the poisoned successor route has `distance == EIGRP_MAX_METRIC`. If a non-feasible route (`flags == 0`) with finite metric also exists on that `ACTIVE` prefix, `eigrp_topology_route_read(prefix)` returns that `flags == 0` route. Only prefixes with a finite route carrying `EIGRP_ROUTE_DESCRIPTOR_SUCCESSOR_FLAG` or `EIGRP_ROUTE_DESCRIPTOR_FSUCCESSOR_FLAG` represent active reachable prefixes.
+2. **`eigrp_topology_prefix_admit()` unconditionally admits any prefix already in `topology_table`**:
+   - Line 2716 (`if (eigrp_topology_table_lookup(runtime->topology_table, prefix)) return true;`) returns `true` even when the existing `eigrp_prefix_descriptor_t` is an unreachable `QUERY`-retained `PASSIVE` placeholder (`distance == EIGRP_MAX_METRIC`).
+   - When a subsequent finite `UPDATE` arrives from the same neighbor (`topology_route != NULL`), `eigrp_update.c:480-489` calls `eigrp_topology_prefix_admit(eigrp, &received_route->dest)`, which immediately returns `true` at line 2716 without checking `limit->maximum`.
+3. **Unconditional AF-wide neighbor teardown on hard `maximum-prefix` rejection**:
+   - Line 2738 calls `eigrp_pfxlimits_prefix_exceeded(runtime, limit)` (`eigrp_pfxlimits.c:220-262`), which sets `runtime->eigrp_pfxlimits_af_state = 1` (or `2`), transmits `EIGRP_HELLO_GRACEFUL_SHUTDOWN` on all active interfaces, and calls `eigrp_pfxlimits_nbr_update(runtime, false)` to tear down every neighbor in the address family even when no `restart` / `reset-time` / `dampened` process teardown policy was configured.
 
-1. **Self-originated routes have `reported_distance` overwritten (`RD == FD`), stripping their `SUCCESSOR` flag**:
-   - When connected routes (`eigrp_interface.c:1510`) and locally redistributed routes (`eigrp_topology.c:767, 1065`) are created, they set `route->adv_router = eigrp->neighbor_self` and `route->reported_distance = 0`.
-   - `eigrp_topology_metric_update()` unconditionally overwrites `route->reported_distance = eigrp_metric_calculate(eigrp, route->reported_metric);`.
-   - Because `prefix->fdistance` is then set to `best->distance`, `route->reported_distance < prefix->fdistance` becomes `false` (`RD == FD`) for the self-originated route!
-   - Immediately afterward, `eigrp_topology_update_node_flags(eigrp, prefix)` (`eigrp_topology.c:1151`) checks `bool feasible = route->reported_distance < dest->fdistance;`—which evaluates to `false`—and clears `EIGRP_ROUTE_DESCRIPTOR_SUCCESSOR_FLAG` on the router's own connected and redistributed routes (`0 successors`)!
+### Steps to Reproduce
+1. Configure `maximum-prefix 5` (hard limit, `warning-only false`) on `srl2` in the 5-node topology (`srl1`, `srl2`, `srl3`, `srl4`, `srl5`) where `srl2` has 5 reachable prefixes in `topology_table`.
+2. Withdraw 1 prefix on `srl5` while advertising 1 new replacement prefix on `srl1`.
+3. Because `srl2` places the withdrawn prefix into `ACTIVE` while waiting for `REPLY`s from its peers, `runtime->topology_table->size` remains `5`. When the replacement `UPDATE` arrives from `srl1`, `eigrp_topology_prefix_admit()` sees `count == 5 >= limit->maximum`, rejects the replacement prefix, and invokes `eigrp_pfxlimits_prefix_exceeded()`, tearing down all of `srl2`'s EIGRP neighbors!
 
-2. **Connected routes (`route->adv_router == eigrp->neighbor_self && route->ei != NULL`) double-add interface delay and increment `hop_count`**:
-   - For a connected route, `route->reported_metric` already holds the interface's scaled delay (`eigrp_interface.c:1477, 1506–1508`) and `hop_count = 0`.
-   - Calling `eigrp_metric_total_calculate(eigrp, route)` (`eigrp_metric.c:139–174`) adds `eigrp_delay_to_scaled(ei->params.delay)` onto `route->reported_metric.delay` a second time and increments `route->total_metric.hop_count` from `0` to `1`.
-
-3. **Locally redistributed routes (`route->adv_router == eigrp->neighbor_self && route->ei == NULL`) fail to scale `delay`**:
-   - Locally redistributed routes store the unscaled seed delay (in tens of microseconds) in `route->metric.delay` / `route->total_metric.delay` and compute their distance via `eigrp_topology_redistributed_distance(eigrp, &route->metric)` (`eigrp_topology.c:147–166`, which scales `delay` via `eigrp_delay_to_scaled()`).
-   - Calling `eigrp_metric_calculate(eigrp, route->total_metric)` directly at line 1265 uses the unscaled `delay` (off by $256\times$) instead of `eigrp_topology_redistributed_distance(eigrp, &route->metric)`.
-
-4. **Query-retained unknown routes (`eigrp_query_unknown_route_record()`, added in `b9b52af`) are prematurely promoted to successors**:
-   - In `rel-0.3.0`, `eigrp_query_unknown_route_record()` (`eigrp_query.c:71–140`) records a `PASSIVE` prefix descriptor with `prefix->distance == EIGRP_MAX_METRIC`, `prefix->fdistance == EIGRP_MAX_METRIC`, and `prefix->reported_metric.delay == EIGRP_MAX_METRIC` while storing the querying neighbor's finite-distance `route` in `prefix->internal_routes` / `prefix->external_routes` without electing a successor.
-   - If `eigrp_topology_metric_update()` runs while such a query-retained prefix is present, `best = eigrp_topology_route_read(prefix)` is non-NULL and `eigrp_topology_metric_update()` overwrites `prefix->distance = best->distance; prefix->fdistance = best->distance;` and installs the un-elected query-retained route into the RIB!
-
-5. **`prefix->rdistance` and `prefix->reported_metric` are set to the predecessor's metric instead of `best->distance` / `best->total_metric`**:
-   - Setting `prefix->rdistance = best->reported_distance` and `prefix->reported_metric = best->reported_metric` at lines 1273–1274 contradicts `eigrp_update.c:395–397` and `eigrp_fsm.c:774–777, 807–809, 924–925`, which set `prefix->rdistance = best->distance` and `prefix->reported_metric = best->total_metric`.
-
-#### Proposed Upstream Patch
-```diff
---- a/eigrp/code/eigrp_topology.c
-+++ b/eigrp/code/eigrp_topology.c
-@@ -1256,22 +1256,52 @@ void eigrp_topology_metric_update(eigrp_instance_t *eigrp)
- 		prefix = rn->info;
- 		if (!prefix || prefix->state != EIGRP_FSM_STATE_PASSIVE)
- 			continue;
-+		bool query_retained_only = (prefix->distance == EIGRP_MAX_METRIC
-+					    && prefix->fdistance == EIGRP_MAX_METRIC
-+					    && prefix->reported_metric.delay == EIGRP_MAX_METRIC);
- 		for (route = eigrp_topology_route_iterator_first(prefix, &iterator); route;
- 		     route = eigrp_topology_route_iterator_next(&iterator)) {
--			route->reported_distance = eigrp_metric_calculate(eigrp, route->reported_metric);
--			if (route->ei)
--				route->distance = eigrp_metric_total_calculate(eigrp, route);
--			else
--				route->distance = eigrp_metric_calculate(eigrp, route->total_metric);
-+			if (route->adv_router == eigrp->neighbor_self) {
-+				route->reported_distance = 0;
-+				if (route->metric.delay == EIGRP_MAX_METRIC) {
-+					route->distance = EIGRP_MAX_METRIC;
-+				} else if (route->ei) {
-+					eigrp_metrics_t metric = route->metric;
-+
-+					metric.bandwidth = eigrp_bandwidth_to_scaled(
-+						route->ei->params.bandwidth);
-+					metric.delay = eigrp_delay_to_scaled(
-+						route->ei->params.delay);
-+					metric.load = route->ei->params.load;
-+					metric.reliability = route->ei->params.reliability;
-+					metric.hop_count = 0;
-+					route->metric = metric;
-+					route->reported_metric = metric;
-+					route->total_metric = metric;
-+					route->distance = eigrp_metric_calculate(eigrp, metric);
-+				} else {
-+					route->distance = eigrp_topology_redistributed_distance(
-+						eigrp, &route->metric);
-+				}
-+			} else {
-+				route->reported_distance =
-+					eigrp_metric_calculate(eigrp, route->reported_metric);
-+				if (route->ei)
-+					route->distance = eigrp_metric_total_calculate(eigrp, route);
-+				else
-+					route->distance = eigrp_metric_calculate(eigrp, route->total_metric);
-+			}
- 		}
- 		eigrp_topology_route_queue_resort(prefix->internal_routes);
- 		eigrp_topology_route_queue_resort(prefix->external_routes);
-+		if (query_retained_only)
-+			continue;
- 		best = eigrp_topology_route_read(prefix);
- 		if (best) {
- 			prefix->distance = best->distance;
- 			prefix->fdistance = best->distance;
--			prefix->rdistance = best->reported_distance;
--			prefix->reported_metric = best->reported_metric;
-+			prefix->rdistance = best->distance;
-+			prefix->reported_metric = best->total_metric;
- 		}
- 		eigrp_topology_update_node_flags(eigrp, prefix);
- 		eigrp_update_routing_table(eigrp, prefix);
+### Live Debug Output / Verification
+With the C-shim override (`__wrap_eigrp_topology_prefix_admit` in `src/cshim/srl_cshim_overrides.c:83-124`), `srlTestRel030OverridesCheck` steps 6–7 and `tests/test_5node_lab.py::test_5node_timers_maxprefix_bwpercent_ribscale_and_tools` verify:
+```text
+tests/test_5node_lab.py::test_5node_timers_maxprefix_bwpercent_ribscale_and_tools PASSED
+=== RUN   TestRel030OverridesCheck
+--- PASS: TestRel030OverridesCheck (0.00s)
 ```
 
----
-
-### Defect 3: `eigrp_topology.c` & `eigrp_update.c` — Topology `maximum-prefix` Counts Poisoned/Query-Retained Descriptors and Bypasses Admission on Existing Descriptors
-
-- **Affected Files**:
-  - `eigrp/code/eigrp_topology.c` (`eigrp_topology_prefix_count()`, lines 2287–2299; `eigrp_topology_prefix_admit()`, lines 2301–2329)
-  - `eigrp/code/eigrp_update.c` (`eigrp_update_receive()`, lines 286–303)
-- **Wrapper Workaround**: `__wrap_eigrp_topology_prefix_admit()`, `__wrap_eigrp_nbr_prefix_admit()`, and `srl_update_tlv_decoder_intercept()` in [`src/cshim/srl_cshim_overrides.c`](file:///home/awhitaker/dev/srl-eigrp/src/cshim/srl_cshim_overrides.c#L282-L448)
-
-#### Root Cause
-1. **Poisoned/withdrawing descriptors and query-retained descriptors remain in `eigrp->topology_table`**:
-   - In `rel-0.3.0`, commit `4542860` updated `eigrp_update_topology_table_prefix()` (`eigrp_topology.c:1495–1519`) to detach an empty `PASSIVE` `eigrp_prefix_descriptor_t` shell once `!(prefix->req_action & EIGRP_FSM_NEED_UPDATE)` and updated `eigrp_update_receive()` (`eigrp_update.c:345–348`) to ignore unreachable `UPDATE`s for absent prefixes.
-   - However, `eigrp->topology_table` still contains non-reachable `eigrp_prefix_descriptor_t` entries (`node->info != NULL`) in two active scenarios:
-     1. **During route withdrawal / replacement churn**: When a previously learned prefix is withdrawn (`delay == EIGRP_MAX_METRIC`), its descriptor remains in `eigrp->topology_table` with `prefix->distance == EIGRP_MAX_METRIC` while `ACTIVE` (waiting for `REPLY`s) or while `PASSIVE` with `EIGRP_FSM_NEED_UPDATE` queued for the packetizer (including when a neighbor withdraws old prefix `P1` and advertises replacement prefix `P2` in the same or back-to-back `UPDATE` packets).
-     2. **Query-retained unknown prefixes (`b9b52af`)**: Commit `b9b52af` added `eigrp_query_unknown_route_record()` (`eigrp_query.c:71–140`), which creates a `PASSIVE` `eigrp_prefix_descriptor_t` in `eigrp->topology_table` with `prefix->distance == EIGRP_MAX_METRIC`, `prefix->fdistance == EIGRP_MAX_METRIC`, and `prefix->reported_metric.delay == EIGRP_MAX_METRIC` (and stores a `route` with `route->adv_router = nbr`) whenever a `QUERY` with a finite metric arrives for an unknown prefix.
-
-2. **`eigrp_topology_prefix_count()` counts poisoned and query-retained prefix descriptors**:
-   - In `eigrp_topology_prefix_count()` (`eigrp_topology.c:2287–2299`), every non-NULL `node->info` in `runtime->topology_table` is counted:
-     ```c
-     for (node = eigrp_table_first(runtime->topology_table); node;
-          node = eigrp_table_next(node))
-         if (node->info)
-             count++;
-     ```
-   - Because poisoned/withdrawing descriptors (`pfx->distance == EIGRP_MAX_METRIC` or `best->distance == EIGRP_MAX_METRIC || best->metric.delay == EIGRP_MAX_METRIC`) and un-elected query-retained descriptors (`pfx->distance == EIGRP_MAX_METRIC`) have `node->info != NULL`, they are counted against `topology_maximum_prefix`. When a router is at its prefix limit (e.g. `12/12`) and a neighbor replaces one prefix with another, `eigrp_topology_prefix_count()` returns `12` (counting the poisoned prefix being withdrawn) and falsely rejects the replacement prefix (`Prefix limit reject ... scope topology count 13 max 12`).
-
-3. **Existing poisoned or query-retained descriptors bypass `eigrp_topology_prefix_admit()` in `eigrp_update_receive()` (both when `topology_route == NULL` and when `topology_route != NULL`)**:
-   - When an `UPDATE` arrives for a prefix that already has a poisoned or query-retained descriptor in `eigrp->topology_table`:
-     - In `eigrp_update_receive()` (`eigrp_update.c:286–303`), `prefix = eigrp_topology_table_lookup(eigrp->topology_table, &route->dest)` is non-NULL, so execution takes the `if (prefix != NULL)` branch at line 286.
-     - At lines 298–302, it checks `if (!topology_route && !eigrp_nbr_prefix_admit(eigrp, nbr, &received_route->dest))` — which **omits `eigrp_topology_prefix_admit(eigrp, &received_route->dest)`** AND **skips admission entirely when `topology_route != NULL`** (such as when `nbr` previously sent a finite `QUERY` recorded by `eigrp_query_unknown_route_record()` or previously poisoned `topology_route`), while conversely checking admission even on unreachable poison `UPDATE` withdrawals when `topology_route == NULL`.
-     - Furthermore, when `prefix` is a query-retained `PASSIVE` descriptor (`prefix->distance == EIGRP_MAX_METRIC && prefix->fdistance == EIGRP_MAX_METRIC && prefix->reported_metric.delay == EIGRP_MAX_METRIC`), an incoming unreachable `UPDATE` (`delay == EIGRP_MAX_METRIC`) must not enter `eigrp_fsm_event(&msg)` where `eigrp_topology_route_select(prefix)` would promote an un-elected `QUERY` route into a RIB successor.
-     - Finally, in `eigrp_topology_prefix_admit()` (`eigrp_topology.c:2309–2310`), `if (eigrp_topology_table_lookup(runtime->topology_table, prefix)) return true;` returns `true` for any existing `eigrp_prefix_descriptor_t` even when `existing->distance == EIGRP_MAX_METRIC` or `eigrp_topology_route_read(existing)` is `NULL` or poisoned!
-
-#### Proposed Upstream Patch
+### Proposed Upstream Fix
 ```diff
+diff --git a/eigrp/code/eigrp_topology.c b/eigrp/code/eigrp_topology.c
+index a07f2cd..6721edb 100644
 --- a/eigrp/code/eigrp_topology.c
 +++ b/eigrp/code/eigrp_topology.c
-@@ -2292,9 +2292,17 @@ static uint32_t eigrp_topology_prefix_count(eigrp_instance_t *runtime)
- 	if (!runtime || !runtime->topology_table)
- 		return 0;
- 	for (node = eigrp_table_first(runtime->topology_table); node;
--	     node = eigrp_table_next(node))
--		if (node->info)
-+	     node = eigrp_table_next(node)) {
-+		eigrp_prefix_descriptor_t *pfx = node->info;
-+		eigrp_route_descriptor_t *best;
-+
-+		if (!pfx || pfx->distance == EIGRP_MAX_METRIC)
-+			continue;
-+		best = eigrp_topology_route_read(pfx);
-+		if (best && best->distance != EIGRP_MAX_METRIC
-+		    && best->metric.delay != EIGRP_MAX_METRIC)
- 			count++;
-+	}
- 	return count;
+@@ -2689,17 +2689,37 @@ static eigrp_result_t eigrp_topology_message_process(eigrp_instance_t *eigrp,
+ 	return EIGRP_RESULT_INVALID_ARGUMENT;
  }
  
-@@ -2303,11 +2311,17 @@ bool eigrp_topology_prefix_admit(eigrp_instance_t *runtime,
+-/* Every destination still present in the topology database counts, even
+- * if QUERY-retained, poisoned, or awaiting deferred retirement. */
++static bool
++eigrp_topology_prefix_has_active_route(eigrp_prefix_descriptor_t *pfx)
++{
++	eigrp_route_descriptor_t *best;
++
++	if (!pfx || pfx->distance == EIGRP_MAX_METRIC
++	    || pfx->fdistance == EIGRP_MAX_METRIC)
++		return false;
++	best = eigrp_topology_route_read(pfx);
++	if (!best || best->distance == EIGRP_MAX_METRIC
++	    || best->metric.delay == EIGRP_MAX_METRIC)
++		return false;
++	return (best->flags
++		& (EIGRP_ROUTE_DESCRIPTOR_SUCCESSOR_FLAG
++		   | EIGRP_ROUTE_DESCRIPTOR_FSUCCESSOR_FLAG))
++	       != 0;
++}
++
+ static uint32_t eigrp_topology_prefix_count(eigrp_instance_t *runtime)
+ {
++	eigrp_table_node_t *node;
++	uint32_t count = 0;
++
+ 	if (!runtime || !runtime->topology_table)
+ 		return 0;
+-	/* Topology publication sets node->info with node creation, and
+-	 * retirement removes the node. The indexed table size is O(1). */
+-	if (runtime->topology_table->size > UINT32_MAX)
+-		return UINT32_MAX;
+-	return (uint32_t)runtime->topology_table->size;
++	for (node = eigrp_table_first(runtime->topology_table); node;
++	     node = eigrp_table_next(node)) {
++		if (eigrp_topology_prefix_has_active_route(node->info))
++			count++;
++	}
++	return count;
+ }
+ 
+ bool eigrp_topology_prefix_admit(eigrp_instance_t *runtime,
+@@ -2707,13 +2727,14 @@ bool eigrp_topology_prefix_admit(eigrp_instance_t *runtime,
  {
  	eigrp_af_config_t *af;
  	const eigrp_prefix_limit_t *limit;
@@ -283,254 +172,374 @@ This loop has five bugs:
  
  	if (!runtime || !prefix)
  		return false;
+ 	if (runtime->eigrp_pfxlimits_af_state)
+ 		return false;
+-	/* Every retained topology destination consumes one prefix slot. */
 -	if (eigrp_topology_table_lookup(runtime->topology_table, prefix))
--		return true;
 +	existing = eigrp_topology_table_lookup(runtime->topology_table, prefix);
-+	if (existing && existing->distance != EIGRP_MAX_METRIC) {
-+		eigrp_route_descriptor_t *best = eigrp_topology_route_read(existing);
-+		if (best && best->distance != EIGRP_MAX_METRIC
-+		    && best->metric.delay != EIGRP_MAX_METRIC)
-+			return true;
-+	}
++	if (eigrp_topology_prefix_has_active_route(existing))
+ 		return true;
  	af = eigrp_af_config_runtime_read(runtime);
  	if (!af || !af->topology_maximum_prefix_configured)
+@@ -2735,7 +2756,10 @@ bool eigrp_topology_prefix_admit(eigrp_instance_t *runtime,
+ 				EIGRP_EVENTLOG_OPCODE_PREFIX_LIMIT_REJECT,
+ 				prefix, EIGRP_EVENTLOG_PREFIX_LIMIT_TOPOLOGY,
+ 				count + 1U, limit->maximum, 0);
+-			eigrp_pfxlimits_prefix_exceeded(runtime, limit);
++			if (limit->dampened || limit->restart_minutes
++			    || limit->reset_time_minutes
++			    || limit->restart_count)
++				eigrp_pfxlimits_prefix_exceeded(runtime, limit);
+ 			return false;
+ 		}
  		return true;
---- a/eigrp/code/eigrp_update.c
-+++ b/eigrp/code/eigrp_update.c
-@@ -296,7 +296,24 @@ void eigrp_update_receive(eigrp_instance_t *eigrp, eigrp_nbr_t *nbr,
- 				bool free_received_route = false;
-+				bool is_unreachable =
-+					(eigrp_metric_calculate(eigrp, received_route->metric) == EIGRP_MAX_METRIC);
-+				bool query_retained_passive =
-+					(prefix->state == EIGRP_FSM_STATE_PASSIVE
-+					 && prefix->distance == EIGRP_MAX_METRIC
-+					 && prefix->fdistance == EIGRP_MAX_METRIC
-+					 && prefix->reported_metric.delay == EIGRP_MAX_METRIC);
- 
--				if (!topology_route
--				    && !eigrp_nbr_prefix_admit(eigrp, nbr, &received_route->dest)) {
-+				if (is_unreachable && query_retained_passive) {
-+					if (topology_route)
-+						eigrp_route_descriptor_delete(eigrp, prefix, topology_route);
-+					eigrp_update_topology_table_prefix(eigrp, eigrp->topology_table, prefix);
-+					eigrp_topology_route_free(received_route);
-+					continue;
-+				}
-+
-+				if (!is_unreachable
-+				    && ((!topology_route
-+					 && !eigrp_nbr_prefix_admit(eigrp, nbr, &received_route->dest))
-+					|| !eigrp_topology_prefix_admit(eigrp, &received_route->dest))) {
- 					eigrp_topology_route_free(received_route);
- 					continue;
- 				}
 ```
 
 ---
 
-### Defect 4: `eigrp_summary.c` & `eigrp_query.c` — Summary Route Advertises Predecessor Metric Instead of Local Distance, Self-Poisons via Split Horizon, Inherits External TLV Type, and Leaks Suppressed Components on `QUERY`
+## Issue 2: `QUERY`-Retained `PASSIVE` Routes Leak Across Unreachable `UPDATE`s, Poisoned `QUERY`s, Competing Neighbor `UPDATE`s, and Neighbor-Down Events
 
-- **Affected Files**:
-  - `eigrp/code/eigrp_summary.c` (`eigrp_summary_route_build()`, lines 221–294; `eigrp_summary_query_route_build()`, lines 297–330)
-  - `eigrp/code/eigrp_query.c` (`eigrp_query_receive()`, lines 212–226)
-- **Wrapper Workaround**: `__wrap_eigrp_summary_route_build()` and `__wrap_eigrp_summary_query_route_build()` in [`src/cshim/srl_cshim_overrides.c`](file:///home/awhitaker/dev/srl-eigrp/src/cshim/srl_cshim_overrides.c#L159-L277)
+### Component & Location
+- **Files:**
+  - `eigrp/code/eigrp_query.c:72-147` (`eigrp_query_unknown_route_record`, `eigrp_query_receive`)
+  - `eigrp/code/eigrp_update.c:459-535` (`eigrp_update_receive`)
+  - `eigrp/code/eigrp_topology.c:1806-1851` (`eigrp_topology_neighbor_down`)
+- **Severity:** High (Promotes un-elected `QUERY`-retained routes into false RIB-installed successors and retains stale RDBs after poison `QUERY` / unreachable `UPDATE` / neighbor-down)
 
-#### Root Cause
-1. **Summary route advertises predecessor's reported vector (`best_route->metric`) instead of the summarizing router's accumulated vector (`best_route->total_metric`)**:
-   - As documented in `eigrp_packetizer.c:119–123`:
-     ```c
-     /* A learned route keeps the neighbor-advertised vector in metric and
-      * our accumulated vector in total_metric. EIGRP advertises our
-      * distance, not the predecessor's reported distance, so never put the
-      * learned metric back on the wire for normal UPDATE/QUERY/REPLY work.
-      */
-     ```
-   - However, in `eigrp_summary_route_build()` (`eigrp_summary.c:270–275`), when no static summary metric is configured on `summary_prefix->destination`, `*summary_route = *best_route;` leaves `summary_route->metric` set to `best_route->metric` (the upstream neighbor's reported vector) instead of `best_route->total_metric` (the summarizing router's own accumulated vector). And in `eigrp_update_send_EOT()` (`eigrp_update.c:589–590`), `if (!summarized) wire_route.metric = selected_route->total_metric;` explicitly skips summarized routes!
-   - **Observable in upstream UUT**: In `eigrp/test/uut/summary-topology/scenario-summary-metric-selection.yaml` (lines 38–39), R2 selects component `10.30.2.0/24` with R2's distance `13762560` (`Summary component: 10.30.2.0/24 metric 13762560`), yet on the very next line logs `Summary metric: 10.30.0.0/16 13107200` (R3's reported distance, missing R2's `eth23` ingress link delay of `655,360`). Consequently, R1 (one hop further away from R3 across `eth12`) learns `10.30.0.0/16` with the exact same metric (`7,864,320` initially, `13,762,560` after failover) as R2's own FD instead of `8,519,680` / `14,417,920`!
+### Exact Upstream Code (`rel-0.5.0`)
+In `eigrp/code/eigrp_query.c:72-147`:
+```c
+static bool eigrp_query_unknown_route_record(eigrp_instance_t *eigrp,
+					     eigrp_nbr_t *nbr,
+					     eigrp_route_descriptor_t *route,
+					     eigrp_prefix_descriptor_t *prefix)
+{
+	eigrp_route_descriptor_t *previous;
+	bool new_prefix = prefix == NULL;
 
-2. **Summary route self-poisons (`delay = EIGRP_MAX_METRIC`) on the outgoing interface when `best_route->ei == ei`**:
-   - Because `*summary_route = *best_route;` copies `best_route->ei` into `summary_route->ei`, whenever the lowest-distance component covered by the summary on `ei` has `best_route->ei == ei` (for instance, when `ei`'s own connected subnet is covered by a broader summary configured on `ei`, such as `10.1.2.0/24` on `ei` covered by `10.0.0.0/8` or `10.1.0.0/16`), `eigrp_packetizer_poison_reverse()` (`eigrp_packetizer.c:390, 548`) and `eigrp_update_send_EOT()` (`eigrp_update.c:591`) see `eigrp_nbr_split_horizon(wire_route, ei) == true` (`erd->ei == ei`) and **poison the entire summary route (`delay = EIGRP_MAX_METRIC`) out `ei`**!
-   - Furthermore, the component-selection loop in `eigrp_summary_route_build()` (`eigrp_summary.c:251–269`) must skip poisoned candidates (`candidate->distance == EIGRP_MAX_METRIC || candidate_route->metric.delay == EIGRP_MAX_METRIC`) and components learned from a neighbor on `ei` (`ei && candidate_route->ei == ei && candidate_route->adv_router != eigrp->neighbor_self`), and the synthesized summary route descriptor must be marked locally originated (`summary_route->ei = NULL; summary_route->adv_router = eigrp->neighbor_self; memset(&summary_route->nexthop, 0, sizeof(summary_route->nexthop));`).
-
-3. **Summary route inherits External TLV type when best component is redistributed**:
-   - If the lowest-metric component under the summary is a redistributed route (`best_route->type == classic_external_tlv_type`), `*summary_route = *best_route;` leaves `summary_route->type` as an External TLV instead of `eigrp->af_vectors.classic_internal_tlv_type`.
-
-4. **Suppressed component routes leak to neighbors when queried (`eigrp_query_receive()`)**:
-   - In `eigrp_query_receive()` (`eigrp_query.c:212–226`), `eigrp_summary_query_route_build()` only intercepts a `QUERY` if `destination` is an exact match for a configured summary prefix (`eigrp_summary.c:311–315`).
-   - If a neighbor on `ei` sends a `QUERY` for a specific component prefix that is covered by an active summary on `ei` and is not leaked (`eigrp_summary_covers(eigrp, ei, destination) && !eigrp_summary_specific_leak(eigrp, ei, destination)`), `eigrp_summary_query_route_build()` returns `false`. `eigrp_query_receive()` then passes the `QUERY` to `eigrp_fsm_event(&msg)`, which sends a reachable `REPLY` for the suppressed specific component back to the neighbor on `ei`!
-
-#### Proposed Upstream Patch
-```diff
---- a/eigrp/code/eigrp_summary.c
-+++ b/eigrp/code/eigrp_summary.c
-@@ -259,20 +259,41 @@ bool eigrp_summary_route_build(eigrp_instance_t *eigrp, eigrp_intf_t *ei,
- 						   &candidate->destination.address))
- 				continue;
- 			candidate_route = eigrp_topology_route_read(candidate);
--			if (!candidate_route)
-+			if (!candidate_route || candidate->distance == EIGRP_MAX_METRIC
-+			    || candidate_route->metric.delay == EIGRP_MAX_METRIC)
- 				continue;
--			if (!best_route || candidate->distance < selected_distance) {
-+			if (ei && candidate_route->ei == ei
-+			    && candidate_route->adv_router != eigrp->neighbor_self)
-+				continue;
-+			if (!best_route || candidate->distance < selected_distance
-+			    || (ei && best_route->ei == ei && candidate_route->ei != ei
-+				&& candidate->distance == selected_distance)) {
- 				best_route = candidate_route;
- 				best_component = candidate->destination;
- 				selected_distance = candidate->distance;
- 			}
- 		}
--		if (best_route)
-+		if (best_route && selected_distance != EIGRP_MAX_METRIC) {
- 			*summary_route = *best_route;
--		else
-+			summary_route->metric = best_route->total_metric;
-+			summary_route->reported_metric = summary_route->metric;
-+			summary_route->total_metric = summary_route->metric;
-+			summary_route->distance = selected_distance;
-+			summary_route->reported_distance = 0;
-+		} else {
- 			summary_route->metric.delay = EIGRP_MAX_METRIC;
-+			summary_route->reported_metric.delay = EIGRP_MAX_METRIC;
-+			summary_route->total_metric.delay = EIGRP_MAX_METRIC;
-+			summary_route->distance = EIGRP_MAX_METRIC;
-+		}
- 	}
-+	summary_route->ei = NULL;
-+	summary_route->adv_router = eigrp->neighbor_self;
-+	summary_route->type = eigrp->af_vectors.classic_internal_tlv_type;
-+	memset(&summary_route->nexthop, 0, sizeof(summary_route->nexthop));
- 	summary_prefix->reported_metric = summary_route->metric;
-+	summary_prefix->distance = selected_distance;
-+	summary_prefix->fdistance = selected_distance;
- 	summary_prefix->state = EIGRP_FSM_STATE_PASSIVE;
- 	summary_route->prefix = summary_prefix;
- 	summary_route->dest = summary_prefix->destination;
-@@ -311,20 +332,40 @@ bool eigrp_summary_query_route_build(eigrp_instance_t *eigrp, eigrp_intf_t *ei,
-     for (configured = config->summaries; configured; configured = configured->next)
-         if (eigrp_summary_prefix_match(&configured->prefix, destination))
-             break;
--    if (!configured)
-+    if (configured) {
-+        for (rn = eigrp_table_first(eigrp->topology_table); rn; rn = eigrp_table_next(rn)) {
-+            eigrp_prefix_descriptor_t *component = rn->info;
-+            eigrp_route_descriptor_t *route;
-+            if (!component || component->distance == EIGRP_MAX_METRIC
-+                || component->destination.prefix_length <= destination->prefix_length
-+                || !eigrp_prefix_address_match(destination, &component->destination.address))
-+                continue;
-+            route = eigrp_topology_route_read(component);
-+            if (route && eigrp_summary_route_build(eigrp, ei, component, route,
-+                                                   summary_prefix, summary_route))
-+                return true;
-+        }
-         return false;
--
--    for (rn = eigrp_table_first(eigrp->topology_table); rn; rn = eigrp_table_next(rn)) {
--        eigrp_prefix_descriptor_t *component = rn->info;
--        eigrp_route_descriptor_t *route;
--        if (!component || component->distance == EIGRP_MAX_METRIC
--            || component->destination.prefix_length <= destination->prefix_length
--            || !eigrp_prefix_address_match(destination, &component->destination.address))
--            continue;
--        route = eigrp_topology_route_read(component);
--        if (route && eigrp_summary_route_build(eigrp, ei, component, route,
--                                               summary_prefix, summary_route))
--            return true;
-+    }
-+    if (eigrp_summary_covers(eigrp, ei, destination)
-+        && !eigrp_summary_specific_leak(eigrp, ei, destination)) {
-+        if (ei->address.address.afi == destination->address.afi
-+            && ei->address.prefix_length == destination->prefix_length
-+            && eigrp_prefix_address_match(&ei->address, &destination->address))
-+            return false;
-+        memset(summary_prefix, 0, sizeof(*summary_prefix));
-+        summary_prefix->destination = *destination;
-+        summary_prefix->state = EIGRP_FSM_STATE_PASSIVE;
-+        summary_prefix->reported_metric.delay = EIGRP_MAX_METRIC;
-+        memset(summary_route, 0, sizeof(*summary_route));
-+        summary_route->prefix = summary_prefix;
-+        summary_route->dest = *destination;
-+        summary_route->type = eigrp->af_vectors.classic_internal_tlv_type;
-+        summary_route->metric.delay = EIGRP_MAX_METRIC;
-+        summary_route->reported_metric.delay = EIGRP_MAX_METRIC;
-+        summary_route->total_metric.delay = EIGRP_MAX_METRIC;
-+        summary_route->distance = EIGRP_MAX_METRIC;
-+        return true;
-     }
-     return false;
- }
+	if (!eigrp || !nbr || !route || !nbr->ei || !eigrp->topology_table
+	    || route->metric.delay == EIGRP_MAX_METRIC
+	    || route->metric.delay == EIGRP_METRIC_MAX
+	    || eigrp_filter_prefix_update(eigrp, nbr->ei, EIGRP_FILTER_IN,
+					  &route->dest))
+		return false;
+	if (!eigrp_nbr_route_admit(eigrp, nbr, &route->dest, &route->metric))
+		return false;
+...
+	route->adv_router = nbr;
+	route->prefix = prefix;
+	route->reported_metric = route->metric;
+	route->reported_distance =
+		eigrp_metric_calculate(eigrp, route->reported_metric);
+	route->distance = eigrp_metric_total_calculate(eigrp, route);
+	if (!eigrp_topology_route_insert(eigrp, prefix, route, true)) {
+		if (new_prefix)
+			eigrp_topology_prefix_free(prefix);
+		return false;
+	}
+	/* Route storage is intentionally separate from route_descriptor_add(),
+	 * which can install the first path into the host RIB. */
+	if (new_prefix)
+		eigrp_prefix_descriptor_add(eigrp->topology_table, prefix);
+	return true;
+}
+```
+And in `eigrp/code/eigrp_update.c:464-532`:
+```c
+				/* A new unreachable path is a withdrawal
+				 * without a route to withdraw. Do not admit a
+				 * poisoned descriptor. */
+				if (!topology_route && unreachable) {
+					eigrp_topology_route_free(
+						received_route);
+					continue;
+				}
+...
+				msg.packet_type = EIGRP_OPC_UPDATE;
+				msg.eigrp = eigrp;
+				msg.data_type =
+					(received_route->type
+						 == eigrp->af_vectors
+							    .classic_external_tlv_type
+					 || received_route->type
+						    == EIGRP_TLV_MP_EXT)
+						? EIGRP_EXT
+						: EIGRP_INT;
+				msg.adv_router = nbr;
+				msg.metrics = ingress_metric;
+				msg.route = route;
+				msg.prefix = prefix;
+				/* Rejected new paths do not enter DUAL. An
+				 * already owned path still processes an
+				 * inbound-filter withdrawal. */
+				msg.transient_route =
+					!topology_route
+					&& eigrp_metric_calculate(eigrp,
+								  msg.metrics)
+						   == EIGRP_MAX_METRIC;
+				eigrp_fsm_event(&msg);
 ```
 
-#### Corresponding Upstream UUT Test Expectation Update
-> [!NOTE]
-> **Why `scenario-summary-metric-selection.yaml` has updated metric expectations (`+655,360`):**
-> In the 3-router UUT topology (`R1 <--eth12--> R2 <--eth23--> R3`), R3 originates `10.30.1.0/24` (local metric `7,208,960`) and `10.30.2.0/24` (local metric `13,107,200`), and each transit link (`eth23` and `eth12`) has `delay: 10` (`+655,360` composite metric).
-> - On **R2** (1 hop from R3 via `eth23`), the total metrics (`FD`) are `7,864,320` and `13,762,560`.
-> - Previously, because `eigrp_summary_route_build()` copied `best_route->metric` (R3's reported metric `7,208,960` / `13,107,200`) instead of `best_route->total_metric` (R2's metric `7,864,320` / `13,762,560`), R2 advertised R3's metric to R1 (omitting the `R2 <-> R3` link delay), and the test YAML recorded those 1-hop values (`7,864,320` / `13,762,560` on R1, and `Summary metric: 10.30.0.0/16 13107200` right below `Summary component: 10.30.2.0/24 metric 13762560` on R2).
-> - With `eigrp_summary_route_build()` fixed to advertise R2's `best_route->total_metric` (`7,864,320` / `13,762,560`), R2's `Summary metric` event matches its selected `Summary component` (`13,762,560`), and R1 (2 hops from R3 via `eth12 + eth23`) installs the summary with the true 2-hop metric (`8,519,680` initially, and `14,417,920` after `n1` goes down).
+### Root Cause Analysis
+When a `QUERY` with a finite metric arrives for an unknown prefix `P`, `eigrp_query_unknown_route_record()` creates a `PASSIVE` prefix descriptor (`prefix->state == EIGRP_FSM_STATE_PASSIVE`, `prefix->distance == EIGRP_MAX_METRIC`, `prefix->fdistance == EIGRP_MAX_METRIC`, `prefix->reported_metric.delay == EIGRP_MAX_METRIC`) and inserts a route descriptor with `flags == 0` and finite `route->distance` into `prefix->internal_routes` / `prefix->external_routes`. Four state transitions fail to account for this `QUERY`-retained `PASSIVE` state:
 
+1. **Poisoned `QUERY` from the same neighbor leaves the stale finite RDB in `prefix`**:
+   - When `prefix` is already in the `QUERY`-retained `PASSIVE` state, `eigrp_query_receive()` (`eigrp_query.c:254-276`) takes the unknown/retained branch and calls `eigrp_query_unknown_route_record()`.
+   - If the neighbor sends a poisoned `QUERY` (`route->metric.delay == EIGRP_MAX_METRIC` or `EIGRP_METRIC_MAX`) or the prefix is denied by an inbound filter, `eigrp_query_unknown_route_record()` returns `false` at lines 80–85 **without deleting `previous = eigrp_prefix_descriptor_lookup(prefix, nbr)`**. The neighbor's old finite `QUERY` metric stays cached in `prefix`.
+2. **Unreachable (`EIGRP_MAX_METRIC`) `UPDATE` on a `QUERY`-retained `PASSIVE` prefix promotes another neighbor's `QUERY`-retained route into a RIB-installed successor**:
+   - Suppose `nbr1` and `nbr2` both sent finite-metric `QUERY`s for unknown prefix `P`, creating `r1` (`nbr1`, `flags == 0`) and `r2` (`nbr2`, `flags == 0`) under `P`.
+   - When `nbr2` sends an unreachable `UPDATE` (`unreachable == true`) for `P`, `topology_route` (`r2`) is non-NULL, so `eigrp_update_receive()` does not take the `if (!topology_route && unreachable)` guard at line 467 and instead calls `eigrp_fsm_event(&msg)` (line 531).
+   - Inside `eigrp_fsm_event_keep_state()`, `eigrp_topology_route_select(prefix)` selects `r1` (`nbr1`'s un-elected `QUERY`-retained route) and installs `r1` into the RIB as successor even though `nbr1` never sent an `UPDATE`!
+3. **Reachable `UPDATE` from one neighbor elects a competing neighbor's lower-metric `QUERY`-retained route**:
+   - In the same two-neighbor scenario, if `nbr2` sends a reachable `UPDATE` with `distance = 30720` while `nbr1`'s un-elected `QUERY`-retained route `r1` has `distance = 28160`, `eigrp_fsm_event_keep_state()` calls `eigrp_topology_route_select(prefix)` and elects `r1` (`nbr1`) instead of `r2` (`nbr2`) unless un-elected `QUERY`-retained routes from other neighbors are pruned before DUAL processes the `UPDATE`.
+4. **Neighbor-down on a `QUERY`-retained `PASSIVE` prefix promotes another neighbor's `QUERY`-retained route**:
+   - In `eigrp_topology_neighbor_down()` (`eigrp_topology.c:1826-1842`), if `nbr2` goes down while `P` is a `QUERY`-retained `PASSIVE` prefix holding `r1` and `r2`, `eigrp_topology_neighbor_down()` dispatches a synthetic poisoned `EIGRP_OPC_UPDATE` into `eigrp_fsm_event(&msg)`, which again elects `r1` (`nbr1`'s `QUERY`-retained route) into the RIB.
+
+### Steps to Reproduce
+1. Have `nbr1` (`10.0.0.1`) and `nbr2` (`10.0.0.2`) both send a finite-metric `QUERY` for an unknown destination `10.99.1.0/24` to `srl2`. `srl2` creates a `QUERY`-retained `PASSIVE` prefix `10.99.1.0/24` (`distance == EIGRP_MAX_METRIC`, `fdistance == EIGRP_MAX_METRIC`) containing `r1` (`nbr1`, `flags == 0`, `delay = 10`) and `r2` (`nbr2`, `flags == 0`, `delay = 20`).
+2. Have `nbr2` send an unreachable `UPDATE` (`delay = EIGRP_MAX_METRIC`) for `10.99.1.0/24` (or bring `nbr2` down).
+3. Without the fix, `srl2` runs `eigrp_fsm_event_keep_state()` on `10.99.1.0/24` and promotes `r1` (`nbr1`'s `QUERY`-retained route) into a RIB-installed `SUCCESSOR` route!
+
+### Live Debug Output / Verification
+Verified in `srlTestRel030OverridesCheck` (steps 1–4 in `src/cshim/srl_cshim_overrides.c:340-440`):
+```text
+=== RUN   TestRel030OverridesCheck
+--- PASS: TestRel030OverridesCheck (0.00s)
+```
+
+### Proposed Upstream Fix
 ```diff
---- a/eigrp/test/uut/summary-topology/scenario-summary-metric-selection.yaml
-+++ b/eigrp/test/uut/summary-topology/scenario-summary-metric-selection.yaml
-@@ -8,7 +8,7 @@ steps:
-   - validate-convergence:
-       timeout: 7
-       expect:
--        - route: {uut: r1, prefix: 10.30.0.0/16, table: rib, metric: 7864320}
-+        - route: {uut: r1, prefix: 10.30.0.0/16, table: rib, metric: 8519680}
-         - route: {uut: r2, prefix: 10.30.1.0/24, table: topology, active: false, fd: 7864320, successors: 1}
-         - route: {uut: r2, prefix: 10.30.2.0/24, table: topology, active: false, fd: 13762560, successors: 1}
-   - validate-event: {uut: r2, contains: "Summary component: 10.30.1.0/24 metric 7864320"}
-@@ -17,7 +17,7 @@ steps:
-   - validate-convergence:
-       timeout: 7
-       expect:
--        - route: {uut: r1, prefix: 10.30.0.0/16, table: rib, metric: 7864320}
-+        - route: {uut: r1, prefix: 10.30.0.0/16, table: rib, metric: 8519680}
-         - route: {uut: r2, prefix: 10.30.1.0/24, table: topology, active: false, successors: 1}
-         - route: {uut: r2, prefix: 10.30.2.0/24, table: topology, present: false}
-   - validate-packet: {opcode: query, prefix: 10.30.2.0/24, source_uut: r2, destination_uut: r1, since: nonbest-down, min: 0, max: 0, timeout: 1, event: any}
-@@ -25,25 +25,25 @@ steps:
-   - validate-convergence:
-       timeout: 7
-       expect:
--        - route: {uut: r1, prefix: 10.30.0.0/16, table: rib, metric: 7864320}
-+        - route: {uut: r1, prefix: 10.30.0.0/16, table: rib, metric: 8519680}
-         - route: {uut: r2, prefix: 10.30.2.0/24, table: topology, active: false, successors: 1}
-   - packet-mark: best-down
-   - link-down: {uut: r3, interface: n1}
-   - validate-convergence:
-       timeout: 10
-       expect:
--        - route: {uut: r1, prefix: 10.30.0.0/16, table: rib, metric: 13762560}
-+        - route: {uut: r1, prefix: 10.30.0.0/16, table: rib, metric: 14417920}
-         - route: {uut: r2, prefix: 10.30.1.0/24, table: topology, present: false}
-         - route: {uut: r2, prefix: 10.30.2.0/24, table: topology, active: false, successors: 1}
-   - validate-event: {uut: r2, contains: "Summary component: 10.30.2.0/24 metric 13762560"}
--  - validate-event: {uut: r2, contains: "Summary metric: 10.30.0.0/16 13107200"}
-+  - validate-event: {uut: r2, contains: "Summary metric: 10.30.0.0/16 13762560"}
-   - validate-packet: {opcode: query, prefix: 10.30.1.0/24, source_uut: r2, destination_uut: r1, since: best-down, min: 0, max: 0, timeout: 1, event: any}
-   - packet-mark: best-up
-   - link-up: {uut: r3, interface: n1}
-   - validate-convergence:
-       timeout: 10
-       expect:
--        - route: {uut: r1, prefix: 10.30.0.0/16, table: rib, metric: 7864320}
-+        - route: {uut: r1, prefix: 10.30.0.0/16, table: rib, metric: 8519680}
-         - route: {uut: r2, prefix: 10.30.1.0/24, table: topology, active: false, successors: 1}
-         - route: {uut: r2, prefix: 10.30.2.0/24, table: topology, active: false, successors: 1}
-   - validate-event: {uut: r2, contains: "Summary component: 10.30.1.0/24 metric 7864320"}
-@@ -51,7 +51,7 @@ steps:
-   - validate-convergence:
-       timeout: 10
-       expect:
--        - route: {uut: r1, prefix: 10.30.0.0/16, table: rib, metric: 13762560}
-+        - route: {uut: r1, prefix: 10.30.0.0/16, table: rib, metric: 14417920}
-   - packet-mark: last-down
-   - link-down: {uut: r3, interface: n2}
-   - validate-convergence:
+diff --git a/eigrp/code/eigrp_query.c b/eigrp/code/eigrp_query.c
+index 1e1cf17..f702a3e 100644
+--- a/eigrp/code/eigrp_query.c
++++ b/eigrp/code/eigrp_query.c
+@@ -77,12 +77,28 @@ static bool eigrp_query_unknown_route_record(eigrp_instance_t *eigrp,
+ 	eigrp_route_descriptor_t *previous;
+ 	bool new_prefix = prefix == NULL;
+ 
+-	if (!eigrp || !nbr || !route || !nbr->ei || !eigrp->topology_table
+-	    || route->metric.delay == EIGRP_MAX_METRIC
++	if (!eigrp || !nbr || !route || !nbr->ei || !eigrp->topology_table)
++		return false;
++	previous = prefix ? eigrp_prefix_descriptor_lookup(prefix, nbr) : NULL;
++	if (route->metric.delay == EIGRP_MAX_METRIC
+ 	    || route->metric.delay == EIGRP_METRIC_MAX
+ 	    || eigrp_filter_prefix_update(eigrp, nbr->ei, EIGRP_FILTER_IN,
+-					  &route->dest))
++					  &route->dest)) {
++		if (previous) {
++			unsigned int q;
++
++			for (q = 0; q < 2; q++)
++				eigrp_list_delete_data(
++					eigrp_topology_route_queue(prefix, q),
++					previous);
++			if (nbr->limit_prefix_count_valid
++			    && nbr->limit_prefix_count
++			    && !eigrp_prefix_descriptor_lookup(prefix, nbr))
++				nbr->limit_prefix_count--;
++			eigrp_topology_route_free(previous);
++		}
+ 		return false;
++	}
+ 	if (!eigrp_nbr_route_admit(eigrp, nbr, &route->dest, &route->metric))
+ 		return false;
+ 
+@@ -106,7 +122,6 @@ static bool eigrp_query_unknown_route_record(eigrp_instance_t *eigrp,
+ 		prefix->reported_metric.delay = EIGRP_MAX_METRIC;
+ 	}
+ 
+-	previous = eigrp_prefix_descriptor_lookup(prefix, nbr);
+ 	if (previous) {
+ 		eigrp_fsm_action_message_t msg = {0};
+ 
+diff --git a/eigrp/code/eigrp_topology.c b/eigrp/code/eigrp_topology.c
+index a07f2cd..af3b1bb 100644
+--- a/eigrp/code/eigrp_topology.c
++++ b/eigrp/code/eigrp_topology.c
+@@ -1825,6 +1825,15 @@ void eigrp_topology_neighbor_down(eigrp_instance_t *eigrp, eigrp_nbr_t *nbr)
+ 
+ 		route = eigrp_prefix_descriptor_lookup(pe, nbr);
+ 		if (route) {
++			if (pe->state == EIGRP_FSM_STATE_PASSIVE
++			    && pe->distance == EIGRP_MAX_METRIC
++			    && pe->fdistance == EIGRP_MAX_METRIC
++			    && pe->reported_metric.delay == EIGRP_MAX_METRIC) {
++				eigrp_route_descriptor_delete(eigrp, pe, route);
++				eigrp_update_topology_table_prefix(
++					eigrp, eigrp->topology_table, pe);
++				continue;
++			}
+ 			eigrp_fsm_action_message_t msg = {0};
+ 
+ 			msg.metrics.delay = EIGRP_MAX_METRIC;
+diff --git a/eigrp/code/eigrp_update.c b/eigrp/code/eigrp_update.c
+index 2c7fb2f..f9fe73e 100644
+--- a/eigrp/code/eigrp_update.c
++++ b/eigrp/code/eigrp_update.c
+@@ -460,10 +460,30 @@ void eigrp_update_receive(eigrp_instance_t *eigrp, eigrp_nbr_t *nbr,
+ 					eigrp_metric_calculate(eigrp,
+ 							       ingress_metric)
+ 					== EIGRP_MAX_METRIC;
++				bool query_retained_passive =
++					prefix
++					&& prefix->state
++						   == EIGRP_FSM_STATE_PASSIVE
++					&& prefix->distance == EIGRP_MAX_METRIC
++					&& prefix->fdistance == EIGRP_MAX_METRIC
++					&& prefix->reported_metric.delay
++						   == EIGRP_MAX_METRIC;
+ 
+ 				/* A new unreachable path is a withdrawal
+ 				 * without a route to withdraw. Do not admit a
+ 				 * poisoned descriptor. */
++				if (query_retained_passive && unreachable) {
++					if (topology_route)
++						eigrp_route_descriptor_delete(
++							eigrp, prefix,
++							topology_route);
++					eigrp_update_topology_table_prefix(
++						eigrp, eigrp->topology_table,
++						prefix);
++					eigrp_topology_route_free(
++						received_route);
++					continue;
++				}
+ 				if (!topology_route && unreachable) {
+ 					eigrp_topology_route_free(
+ 						received_route);
+@@ -491,6 +511,29 @@ void eigrp_update_receive(eigrp_instance_t *eigrp, eigrp_nbr_t *nbr,
+ 						received_route);
+ 					continue;
+ 				}
++				if (query_retained_passive) {
++					unsigned int q;
++					for (q = 0; q < 2; q++) {
++						eigrp_list_t *routes =
++							eigrp_topology_route_queue(
++								prefix, q);
++						eigrp_list_item_t *rnode,
++							*rnnode;
++						eigrp_route_descriptor_t *r;
++						for (EIGRP_LIST_ITERATE(
++							     routes, rnode,
++							     rnnode, r)) {
++							if (r
++							    && r->adv_router
++								       != nbr
++							    && r->flags == 0)
++								eigrp_route_descriptor_delete(
++									eigrp,
++									prefix,
++									r);
++						}
++					}
++				}
+ 
+ 				if (topology_route) {
+ 					topology_route->type =
+```
+
+---
+
+## Issue 3: Peer Metric-Version Renegotiation in `eigrp_sw_version_decode()` Does Not Update Interface `tlv1_peer_count` / `tlv2_peer_count`
+
+### Component & Location
+- **Files:**
+  - `eigrp/code/eigrp_hello.c:198-218` (`eigrp_sw_version_decode`)
+  - `eigrp/code/eigrp_neighbor.c:755-784` (`eigrp_nbr_codec_update`)
+- **Severity:** Medium (Causes multicast `UPDATE`/`QUERY` encoding mismatch when an already-`UP` neighbor renegotiates `tlv_version` via a `Software_Version` TLV in a subsequent `HELLO`)
+
+### Exact Upstream Code (`rel-0.5.0`)
+In `eigrp/code/eigrp_hello.c:198-218`:
+```c
+static void eigrp_sw_version_decode(eigrp_nbr_t *nbr, eigrp_intf_t *ei,
+				    struct eigrp_tlv_hdr_type *tlv, bool new)
+{
+	struct TLV_Software_Type *version = (struct TLV_Software_Type *)tlv;
+
+	(void)new;
+
+	nbr->os_rel_major = version->vender_major;
+	nbr->os_rel_minor = version->vender_minor;
+	nbr->tlv_rel_major = version->eigrp_major;
+	nbr->tlv_rel_minor = version->eigrp_minor;
+
+	/*
+	 * The software TLV advertises the peer's highest TLV format, not the
+	 * format it must use with this neighbor.  Version 2 peers retain TLV1
+	 * compatibility and use it when talking to a Version 1 peer.  Bind the
+	 * codec to the highest route TLV format supported by both sides.
+	 */
+	eigrp_nbr_codec_select(nbr, eigrp_metric_version_select(
+					    ei->eigrp, nbr->tlv_rel_major));
+}
+```
+Compare with `eigrp/code/eigrp_neighbor.c:768-783` (`eigrp_nbr_codec_update()`):
+```c
+		for (EIGRP_LIST_ITERATE_RO(ei->nbrs, nbr_node, nbr)) {
+			if (!nbr || !nbr->tlv_rel_major)
+				continue;
+			selected = eigrp_metric_version_select(
+				eigrp, nbr->tlv_rel_major);
+			if (selected == nbr->tlv_version)
+				continue;
+			if (nbr->state == EIGRP_NEIGHBOR_UP)
+				eigrp_intf_encoder_peer_remove(
+					ei, nbr->tlv_version);
+			eigrp_nbr_codec_select(nbr, selected);
+			if (nbr->state == EIGRP_NEIGHBOR_UP)
+				eigrp_intf_encoder_peer_add(ei,
+							    nbr->tlv_version);
+		}
+```
+
+### Root Cause Analysis
+- Upstream commit `77e976a` updated `eigrp_nbr_codec_update()` (`eigrp_neighbor.c:775-781`) so that when the **local** router changes its `metric-version`, `eigrp_intf_encoder_peer_remove(ei, nbr->tlv_version)` and `eigrp_intf_encoder_peer_add(ei, nbr->tlv_version)` adjust `ei->tlv1_peer_count` and `ei->tlv2_peer_count` for every `UP` neighbor.
+- However, in `eigrp_sw_version_decode()` (`eigrp_hello.c:198-218`), when an already-`UP` **peer** changes its advertised `eigrp_major` (`tlv_rel_major`) in a `HELLO` packet (e.g. changing from `64bit` TLV2 `eigrp_major = 2` to `32bit` TLV1 `eigrp_major = 1` before its hold timer expires), `eigrp_sw_version_decode()` calls `eigrp_nbr_codec_select()` directly, overwriting `nbr->tlv_version` without removing `old_version` from `ei` and adding the new `nbr->tlv_version` to `ei`.
+- As a result, `ei->tlv2_peer_count` remains non-zero (and `ei->tlv1_peer_count` remains `0`) while the neighbor is `UP`, causing multicast `UPDATE` and `QUERY` packets on `ei` to be encoded in the wrong TLV format, and causing `eigrp_nbr_state_update()` to decrement the wrong peer counter when the neighbor later goes down.
+
+### Steps to Reproduce
+1. Establish an `UP` EIGRP adjacency between `srl1` (`metric-version 64bit`) and `srl2` (`metric-version 64bit`). On `srl1`, `ei->tlv2_peer_count == 1` and `ei->tlv1_peer_count == 0`.
+2. Reconfigure `srl2` to `metric-version 32bit` so `srl2` sends a `HELLO` advertising `eigrp_major = 1` while `nbr->state == EIGRP_NEIGHBOR_UP` on `srl1`.
+3. `eigrp_sw_version_decode()` on `srl1` updates `nbr->tlv_version` from `EIGRP_TLV_64B_VERSION` (`2`) to `EIGRP_TLV_32B_VERSION` (`1`), but leaves `ei->tlv2_peer_count == 1` and `ei->tlv1_peer_count == 0`.
+
+### Live Debug Output / Verification
+Verified in `srlTestRel030OverridesCheck` (step 5 in `src/cshim/srl_cshim_overrides.c:430-443`, using `__wrap_eigrp_nbr_codec_select` / `__wrap_eigrp_nbr_codec_update` at `src/cshim/srl_cshim_overrides.c:267-288`):
+```text
+=== RUN   TestRel030OverridesCheck
+--- PASS: TestRel030OverridesCheck (0.00s)
+```
+
+### Proposed Upstream Fix
+```diff
+diff --git a/eigrp/code/eigrp_hello.c b/eigrp/code/eigrp_hello.c
+index 54e7192..463d9f7 100644
+--- a/eigrp/code/eigrp_hello.c
++++ b/eigrp/code/eigrp_hello.c
+@@ -199,6 +199,7 @@ static void eigrp_sw_version_decode(eigrp_nbr_t *nbr, eigrp_intf_t *ei,
+ 				    struct eigrp_tlv_hdr_type *tlv, bool new)
+ {
+ 	struct TLV_Software_Type *version = (struct TLV_Software_Type *)tlv;
++	uint8_t selected;
+ 
+ 	(void)new;
+ 
+@@ -213,8 +214,14 @@ static void eigrp_sw_version_decode(eigrp_nbr_t *nbr, eigrp_intf_t *ei,
+ 	 * compatibility and use it when talking to a Version 1 peer.  Bind the
+ 	 * codec to the highest route TLV format supported by both sides.
+ 	 */
+-	eigrp_nbr_codec_select(nbr, eigrp_metric_version_select(
+-					    ei->eigrp, nbr->tlv_rel_major));
++	selected = eigrp_metric_version_select(ei->eigrp, nbr->tlv_rel_major);
++	if (nbr->state == EIGRP_NEIGHBOR_UP && selected != nbr->tlv_version) {
++		eigrp_intf_encoder_peer_remove(ei, nbr->tlv_version);
++		eigrp_nbr_codec_select(nbr, selected);
++		eigrp_intf_encoder_peer_add(ei, nbr->tlv_version);
++		return;
++	}
++	eigrp_nbr_codec_select(nbr, selected);
+ }
+ 
+ /**
 ```
