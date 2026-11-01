@@ -46,9 +46,6 @@ func schemaRank(jsPath string) int {
 	if strings.Contains(jsPath, ".default-interface.address-family{") {
 		return 2
 	}
-	if strings.Contains(jsPath, ".event-log.entry{") {
-		return 3
-	}
 	if strings.Contains(jsPath, ".interface{") {
 		if strings.Contains(jsPath, ".address-family{") {
 			if strings.Contains(jsPath, ".summary-address{") {
@@ -375,7 +372,7 @@ func publishInterfaceSublists(
 				Key:  &ndk.TelemetryKey{JsPath: afIfKey},
 				Data: &ndk.TelemetryData{JsonContent: string(b)},
 			})
-			log.Info().Str("key", afIfKey).Str("data", string(b)).Msg("Adding interface AF to telemetry")
+			log.Debug().Str("key", afIfKey).Str("data", string(b)).Msg("Adding interface AF to telemetry")
 		}
 
 		// Summary address under address-family
@@ -441,7 +438,7 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 		operState            string
 		ribScale             uint8
 		wideMetrics          bool
-		eventLogSize         uint32
+		traceOptions         []string
 		gracefulRestart      *GracefulRestartConfig
 		timers               *TimersConfig
 		metrics              *MetricsConfig
@@ -454,7 +451,6 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 		intfList             []*InterfaceInfo
 		topoList             []*TopologyPrefixInfo
 		trafficList          []*TrafficInfo
-		eventLog             []*EventLogInfo
 	}
 	allInstData := make([]instData, 0, len(d.instances))
 	for ni, inst := range d.instances {
@@ -594,12 +590,9 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 			}
 			topoList = append(topoList, &tCopy)
 		}
-		eventLogList := make([]*EventLogInfo, 0, len(inst.eventLog))
-		for _, ev := range inst.eventLog {
-			if ev != nil {
-				evCopy := *ev
-				eventLogList = append(eventLogList, &evCopy)
-			}
+		var traceOpts []string
+		if len(inst.traceOptions) > 0 {
+			traceOpts = append([]string(nil), inst.traceOptions...)
 		}
 
 		adminState := inst.adminState
@@ -687,10 +680,6 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 		if ribScale == 0 {
 			ribScale = 128
 		}
-		evLogSize := inst.eventLogSize
-		if evLogSize == 0 {
-			evLogSize = 500
-		}
 
 		cfgIntfs := make(map[string]*InterfaceConfig, len(inst.configuredInterfaces))
 		for k, v := range inst.configuredInterfaces {
@@ -768,7 +757,7 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 			operState:            operState,
 			ribScale:             ribScale,
 			wideMetrics:          inst.wideMetrics,
-			eventLogSize:         evLogSize,
+			traceOptions:         traceOpts,
 			gracefulRestart:      grCopy,
 			timers:               timersCopy,
 			metrics:              metricsCopy,
@@ -781,7 +770,6 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 			intfList:             intfList,
 			topoList:             topoList,
 			trafficList:          trafficList,
-			eventLog:             eventLogList,
 		})
 	}
 	d.mu.RUnlock()
@@ -799,7 +787,9 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 			"oper-state":        item.operState,
 			"rib-scale":         item.ribScale,
 			"wide-metrics":      item.wideMetrics,
-			"event-log-size":    item.eventLogSize,
+			"trace-options": map[string]interface{}{
+				"trace": item.traceOptions,
+			},
 			"graceful-restart":  item.gracefulRestart,
 			"default-interface": item.defaultIntf,
 			"timers":            item.timers,
@@ -815,7 +805,6 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 			"route":             item.routeList,
 			"topology":          item.topoList,
 			"traffic":           item.trafficList,
-			"event-log":         item.eventLog,
 		}
 		instancesState[item.ni] = instSnapshot
 		if item.ni == "default" {
@@ -1071,7 +1060,6 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 			"oper-state":        item.operState,
 			"rib-scale":         item.ribScale,
 			"wide-metrics":      item.wideMetrics,
-			"event-log-size":    item.eventLogSize,
 			"total-neighbors":   len(item.nbrList),
 			"total-routes":      len(item.routeList),
 			"total-interfaces":  len(item.intfList),
@@ -1135,7 +1123,7 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 					Key:  &ndk.TelemetryKey{JsPath: snKey},
 					Data: &ndk.TelemetryData{JsonContent: string(b)},
 				})
-				log.Info().Str("key", snKey).Str("data", string(b)).Msg("Added static-neighbor to telemetry")
+				log.Debug().Str("key", snKey).Str("data", string(b)).Msg("Added static-neighbor to telemetry")
 			}
 		}
 
@@ -1232,7 +1220,7 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 					Key:  &ndk.TelemetryKey{JsPath: intfKey},
 					Data: &ndk.TelemetryData{JsonContent: string(b)},
 				})
-				log.Info().Str("key", intfKey).Str("data", string(b)).Msg("Adding interface to telemetry")
+				log.Debug().Str("key", intfKey).Str("data", string(b)).Msg("Adding interface to telemetry")
 			}
 
 			publishInterfaceSublists(
@@ -1482,30 +1470,6 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 				}
 			}
 		}
-
-		// Event log (publish latest 32 entries separately to NDK telemetry)
-		evStart := 0
-		if len(item.eventLog) > 32 {
-			evStart = len(item.eventLog) - 32
-		}
-		for _, ev := range item.eventLog[evStart:] {
-			if ev == nil || ev.ID == 0 {
-				continue
-			}
-			evKey := fmt.Sprintf(".network_instance{.name==\"%s\"}.protocols.eigrp.event-log.entry{.id==%d}", ni, ev.ID)
-			currentKeys[evKey] = struct{}{}
-			evData := map[string]interface{}{
-				"id":        ev.ID,
-				"timestamp": ev.Timestamp,
-				"message":   ev.Message,
-			}
-			if b, err := json.Marshal(evData); err == nil {
-				states = append(states, &ndk.TelemetryInfo{
-					Key:  &ndk.TelemetryKey{JsPath: evKey},
-					Data: &ndk.TelemetryData{JsonContent: string(b)},
-				})
-			}
-		}
 	}
 
 	// Delete removed keys
@@ -1552,7 +1516,7 @@ func (d *EigrpDaemon) publishTelemetryLocked(ctx context.Context) {
 		} else if resp.GetStatus() != ndk.SdkMgrStatus_SDK_MGR_STATUS_SUCCESS {
 			log.Warn().Str("error", resp.GetErrorStr()).Msg("TelemetryAddOrUpdate rejected")
 		} else {
-			log.Info().Int("count", len(states)).Msg("TelemetryAddOrUpdate succeeded")
+			log.Debug().Int("count", len(states)).Msg("TelemetryAddOrUpdate succeeded")
 		}
 	}
 }

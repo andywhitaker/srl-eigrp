@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/syslog"
 	"net"
 	"os"
 	"os/signal"
 	"os/user"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,7 +35,7 @@ import "C"
 const (
 	ndkSocket = "unix:///opt/srlinux/var/run/sr_sdk_service_manager:50053"
 	appName   = "srl_eigrpd"
-	version   = "0.1.3"
+	version   = "0.1.4"
 )
 
 type RouteInfo struct {
@@ -112,12 +114,6 @@ type TrafficInfo struct {
 	CRPackets       uint64 `json:"cr-packets"`
 }
 
-type EventLogInfo struct {
-	ID        uint32 `json:"id"`
-	Timestamp string `json:"timestamp"`
-	Message   string `json:"message"`
-}
-
 type IPCRequest struct {
 	Action   string `json:"action"`
 	Netinst  string `json:"netinst"`
@@ -141,7 +137,7 @@ type EigrpInstance struct {
 	defaultIntf          *DefaultInterfaceConfig
 	ribScale             uint8
 	wideMetrics          bool
-	eventLogSize         uint32
+	traceOptions         []string
 	hasV6                bool
 	gracefulRestart      *GracefulRestartConfig
 	metrics              *MetricsConfig
@@ -159,14 +155,12 @@ type EigrpInstance struct {
 	interfaces    map[string]*InterfaceInfo
 	topology      map[string]*TopologyPrefixInfo
 	traffic       map[string]*TrafficInfo
-	eventLog      []*EventLogInfo
 	currentPfx    *TopologyPrefixInfo
 
 	tempNeighbors  map[string]*NeighborInfo
 	tempInterfaces map[string]*InterfaceInfo
 	tempTopology   map[string]*TopologyPrefixInfo
 	tempTraffic    map[string]*TrafficInfo
-	tempEventLog   []*EventLogInfo
 	collecting     bool
 }
 
@@ -475,7 +469,6 @@ func newEigrpInstance(netinst string) *EigrpInstance {
 		operState:            "up",
 		ribScale:             128,
 		wideMetrics:          true,
-		eventLogSize:         500,
 		configuredInterfaces: make(map[string]*InterfaceConfig),
 		staticNeighbors:      make(map[string]*StaticNeighborConfig),
 		routes:               make(map[string]*RouteInfo),
@@ -484,12 +477,10 @@ func newEigrpInstance(netinst string) *EigrpInstance {
 		interfaces:           make(map[string]*InterfaceInfo),
 		topology:             make(map[string]*TopologyPrefixInfo),
 		traffic:              make(map[string]*TrafficInfo),
-		eventLog:             make([]*EventLogInfo, 0),
 		tempNeighbors:        make(map[string]*NeighborInfo),
 		tempInterfaces:       make(map[string]*InterfaceInfo),
 		tempTopology:         make(map[string]*TopologyPrefixInfo),
 		tempTraffic:          make(map[string]*TrafficInfo),
-		tempEventLog:         make([]*EventLogInfo, 0),
 		bfdSessions:          make(map[string]string),
 		redistributedRoutes:  make(map[string]string),
 		redistributedHashes:  make(map[string]string),
@@ -501,7 +492,6 @@ func (inst *EigrpInstance) PrepareTelemetryCollection() {
 	inst.tempInterfaces = make(map[string]*InterfaceInfo)
 	inst.tempTopology = make(map[string]*TopologyPrefixInfo)
 	inst.tempTraffic = make(map[string]*TrafficInfo)
-	inst.tempEventLog = make([]*EventLogInfo, 0)
 	inst.collecting = true
 }
 
@@ -526,16 +516,10 @@ func (inst *EigrpInstance) CommitTelemetryCollection() {
 	} else if inst.traffic == nil {
 		inst.traffic = make(map[string]*TrafficInfo)
 	}
-	if inst.tempEventLog != nil {
-		inst.eventLog = inst.tempEventLog
-	} else if inst.eventLog == nil {
-		inst.eventLog = make([]*EventLogInfo, 0)
-	}
 	inst.tempNeighbors = nil
 	inst.tempInterfaces = nil
 	inst.tempTopology = nil
 	inst.tempTraffic = nil
-	inst.tempEventLog = nil
 	inst.collecting = false
 }
 
@@ -708,6 +692,10 @@ func (d *EigrpDaemon) DeleteInstance(netinst string) {
 	if netinst == "" {
 		netinst = "default"
 	}
+	cNetinst := C.CString(netinst)
+	C.srlShimTraceOptionsUpdate(cNetinst, 0)
+	C.free(unsafe.Pointer(cNetinst))
+
 	d.StopRouteWorker(netinst)
 	d.InvalidateCandidateRouteCache(netinst)
 	d.mu.Lock()
@@ -754,12 +742,10 @@ func (d *EigrpDaemon) CollectAndPublish(ctx context.Context) {
 			C.srlShimNeighborsReport(cNetinst)
 			C.srlShimTopologyReport(cNetinst)
 			C.srlShimTrafficReport(cNetinst)
-			C.srlShimEventLogReport(cNetinst)
 		} else {
 			d.mu.Lock()
 			inst.routes = make(map[string]*RouteInfo)
 			inst.learnedRoutes = make(map[string]*RouteInfo)
-			inst.eventLog = make([]*EventLogInfo, 0)
 			d.mu.Unlock()
 		}
 		C.free(unsafe.Pointer(cNetinst))
@@ -1105,37 +1091,6 @@ func (d *EigrpDaemon) OnTrafficReport(netinst, ifname string, rmcast, umcast, ru
 	}
 }
 
-func (d *EigrpDaemon) OnEventLogReport(netinst string, eventNum uint32, timestampMs uint64, msg string) {
-	inst := d.GetOrCreateInstance(netinst)
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	ts := fmt.Sprintf("%.3fs", float64(timestampMs)/1000.0)
-	if timestampMs > 1000000000000 {
-		t := time.UnixMilli(int64(timestampMs)).UTC()
-		ts = t.Format(time.RFC3339Nano)
-	}
-	entry := &EventLogInfo{
-		ID:        eventNum,
-		Timestamp: ts,
-		Message:   msg,
-	}
-	maxSize := int(inst.eventLogSize)
-	if maxSize <= 0 {
-		maxSize = 500
-	}
-	if inst.collecting {
-		inst.tempEventLog = append(inst.tempEventLog, entry)
-		if len(inst.tempEventLog) > maxSize {
-			inst.tempEventLog = inst.tempEventLog[len(inst.tempEventLog)-maxSize:]
-		}
-	} else {
-		inst.eventLog = append(inst.eventLog, entry)
-		if len(inst.eventLog) > maxSize {
-			inst.eventLog = inst.eventLog[len(inst.eventLog)-maxSize:]
-		}
-	}
-}
-
 func (d *EigrpDaemon) StartIPCServer(ctx context.Context) {
 	sockPath := "/var/run/srl_eigrpd_ipc.sock"
 	_ = os.Remove(sockPath)
@@ -1269,21 +1224,6 @@ func (d *EigrpDaemon) handleIPC(conn net.Conn) {
 		_ = json.NewEncoder(conn).Encode(IPCResponse{
 			Status:  "ok",
 			Message: msg,
-		})
-		go d.CollectAndPublish(context.Background())
-
-	case "clear-event-log":
-		cNetinst := C.CString(netinst)
-		C.srlShimEventLogClear(cNetinst)
-		C.free(unsafe.Pointer(cNetinst))
-		if inst := d.GetInstance(netinst); inst != nil {
-			d.mu.Lock()
-			inst.eventLog = make([]*EventLogInfo, 0)
-			d.mu.Unlock()
-		}
-		_ = json.NewEncoder(conn).Encode(IPCResponse{
-			Status:  "ok",
-			Message: fmt.Sprintf("Cleared EIGRP event log in network-instance %s", netinst),
 		})
 		go d.CollectAndPublish(context.Background())
 
@@ -1423,8 +1363,74 @@ func (d *EigrpDaemon) handleIPC(conn net.Conn) {
 	}
 }
 
+type syslogLevelWriter struct {
+	w *syslog.Writer
+}
+
+func formatSyslogLine(p []byte) string {
+	var fields map[string]interface{}
+	if err := json.Unmarshal(p, &fields); err == nil {
+		msg, _ := fields["message"].(string)
+		if src, _ := fields["source"].(string); src == "cshim" && msg != "" {
+			return msg
+		}
+		var extras []string
+		for k, v := range fields {
+			if k == "level" || k == "time" || k == "message" || k == "source" {
+				continue
+			}
+			extras = append(extras, fmt.Sprintf("%s=%v", k, v))
+		}
+		if len(extras) > 0 {
+			sort.Strings(extras)
+			return fmt.Sprintf("%s (%s)", msg, strings.Join(extras, " "))
+		}
+		if msg != "" {
+			return msg
+		}
+	}
+	return strings.TrimSpace(string(p))
+}
+
+func (sw *syslogLevelWriter) Write(p []byte) (int, error) {
+	if sw.w == nil {
+		return len(p), nil
+	}
+	_ = sw.w.Info(formatSyslogLine(p))
+	return len(p), nil
+}
+
+func (sw *syslogLevelWriter) WriteLevel(level zerolog.Level, p []byte) (int, error) {
+	if sw.w == nil {
+		return len(p), nil
+	}
+	line := formatSyslogLine(p)
+	switch level {
+	case zerolog.ErrorLevel, zerolog.FatalLevel, zerolog.PanicLevel:
+		_ = sw.w.Err(line)
+	case zerolog.WarnLevel:
+		_ = sw.w.Warning(line)
+	case zerolog.InfoLevel:
+		_ = sw.w.Info(line)
+	case zerolog.DebugLevel, zerolog.TraceLevel:
+		// Do not forward debug/trace to syslog unless explicitly promoted to Info
+	default:
+		_ = sw.w.Info(line)
+	}
+	return len(p), nil
+}
+
 func logMessage(level int, msg string) {
-	log.Info().Str("source", "cshim").Int("level", level).Msg(msg)
+	switch level {
+	case 0: // EIGRP_LOG_DEBUG
+		log.Debug().Str("source", "cshim").Msg(msg)
+	case 1, 2: // EIGRP_LOG_INFO, EIGRP_LOG_NOTICE
+		log.Info().Str("source", "cshim").Msg(msg)
+	case 3: // EIGRP_LOG_WARNING
+		log.Warn().Str("source", "cshim").Msg(msg)
+	default: // EIGRP_LOG_ERROR (4+)
+		log.Error().Str("source", "cshim").Msg(msg)
+	}
 }
 
 func main() {
@@ -1435,8 +1441,14 @@ func main() {
 		}
 	}
 
+	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339})
+	consoleWriter := zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339}
+	if sw, err := syslog.New(syslog.LOG_LOCAL6|syslog.LOG_INFO, "srl-eigrpd"); err == nil && sw != nil {
+		log.Logger = zerolog.New(zerolog.MultiLevelWriter(consoleWriter, &syslogLevelWriter{w: sw})).With().Timestamp().Logger()
+	} else {
+		log.Logger = log.Output(consoleWriter)
+	}
 	log.Info().Str("version", version).Msg("Starting Nokia SR Linux EIGRP NDK Daemon...")
 
 	if v := os.Getenv("SRL_EIGRP_DISABLE_PKT_FD"); v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes") {

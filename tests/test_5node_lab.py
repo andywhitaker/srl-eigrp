@@ -356,8 +356,10 @@ def test_5node_fs_instant_failover_vs_active_query(srl_exec):
             if "via 10.2.4.4 (3276800/1966080), ethernet-1/3.0 Feasible Successor" in out_top:
                 break
 
-        # 2. Clear event log on SRL2 so we capture the exact failover events
-        srl_exec("clab-eigrp-test-srl2", ["sr_cli", "tools network-instance default protocols eigrp event-log clear"])
+        # 2. Enable FSM trace-options on SRL2 and record buffer/messages line offset so we capture exact failover events
+        apply_cfg(srl_exec, "clab-eigrp-test-srl2", "set / network-instance default protocols eigrp trace-options trace [ fsm ]")
+        start_line_str = srl_exec("clab-eigrp-test-srl2", ["bash", "-c", "wc -l < /var/log/srlinux/buffer/messages || echo 0"]).strip()
+        start_line = int(start_line_str) if start_line_str.isdigit() else 0
 
         # 3. Bring down primary successor interface ethernet-1/2.0 on SRL2
         apply_cfg(srl_exec, "clab-eigrp-test-srl2", "set / network-instance default protocols eigrp interface ethernet-1/2.0 admin-state disable")
@@ -377,10 +379,18 @@ def test_5node_fs_instant_failover_vs_active_query(srl_exec):
                 break
         assert converged, f"Failover to 10.2.4.4 did not converge: {out_top}"
 
-        # 5. Inspect SRL2 event log:
+        # 5. Inspect SRL2 /var/log/srlinux/buffer/messages:
         #    - 5.5.5.5/32 had a Feasible Successor -> FC sat, NO DUAL state change to ACTIVE!
         #    - 3.3.3.3/32 had NO Feasible Successor -> FC not sat, DUAL state change PASSIVE -> ACTIVE_1 -> PASSIVE!
-        out_ev = srl_exec("clab-eigrp-test-srl2", ["sr_cli", "show network-instance default protocols eigrp event-log"])
+        out_ev = ""
+        for _ in range(10):
+            out_ev = srl_exec(
+                "clab-eigrp-test-srl2",
+                ["bash", "-c", f"tail -n +{start_line + 1} /var/log/srlinux/buffer/messages | grep srl-eigrpd || true"],
+            )
+            if "DUAL state change 3.3.3.3/32 Old: ACTIVE_1 New: PASSIVE" in out_ev:
+                break
+            time.sleep(0.5)
         assert "FC sat rdbmet/succmet: 1966080 2621440" in out_ev, f"Missing FC sat for 5.5.5.5/32 FS failover: {out_ev}"
         assert "DUAL state change 5.5.5.5/32" not in out_ev, f"5.5.5.5/32 had a Feasible Successor and must NOT go ACTIVE: {out_ev}"
         assert "DUAL state change 3.3.3.3/32 Old: PASSIVE New: ACTIVE_1" in out_ev, f"3.3.3.3/32 had no FS and should enter ACTIVE_1: {out_ev}"
@@ -399,6 +409,7 @@ def test_5node_fs_instant_failover_vs_active_query(srl_exec):
             """
             set / network-instance default protocols eigrp interface ethernet-1/2.0 admin-state enable
             delete / network-instance default protocols eigrp interface ethernet-1/3.0 delay
+            delete / network-instance default protocols eigrp trace-options
             """,
         )
 
@@ -415,26 +426,52 @@ def test_5node_fs_instant_failover_vs_active_query(srl_exec):
 def test_5node_peer_restart_recovery(srl_exec):
     """Verify restarting srl_eigrpd while neighbor hold timers are active properly detects peer restart
     (even when consecutive restarts reuse INIT sequence 1), re-arms t_holddown, and resyncs full topology."""
-    # 1. Restart SRL5 and verify dual-path recovery across SRL3 and SRL4
-    srl_exec("clab-eigrp-test-srl5", ["sr_cli", "tools system app-management application srl_eigrpd restart"])
-    assert wait_for_5node_convergence(srl_exec, timeout=25), "SRL5 failed to recover full 2-path topology after daemon restart"
+    try:
+        # 1. Restart SRL5 and verify dual-path recovery across SRL3 and SRL4
+        srl_exec("clab-eigrp-test-srl5", ["sr_cli", "tools system app-management application srl_eigrpd restart"])
+        assert wait_for_5node_convergence(srl_exec, timeout=25), "SRL5 failed to recover full 2-path topology after daemon restart"
 
-    # 2. Restart SRL1 twice in succession so SRL1 sends INIT with sequence=1 after SRL2 has already seen sequence=1
-    srl_exec("clab-eigrp-test-srl2", ["sr_cli", "tools network-instance default protocols eigrp event-log clear"])
-    srl_exec("clab-eigrp-test-srl1", ["sr_cli", "tools system app-management application srl_eigrpd restart"])
-    assert wait_for_5node_convergence(srl_exec, timeout=25), "SRL1 failed to recover topology after first daemon restart"
+        # 2. Restart SRL1 twice in succession so SRL1 sends INIT with sequence=1 after SRL2 has already seen sequence=1
+        apply_cfg(srl_exec, "clab-eigrp-test-srl2", "set / network-instance default protocols eigrp trace-options trace [ graceful-restart adjacencies ]")
+        start_line_str = srl_exec("clab-eigrp-test-srl2", ["bash", "-c", "wc -l < /var/log/srlinux/buffer/messages || echo 0"]).strip()
+        start_line = int(start_line_str) if start_line_str.isdigit() else 0
+        file_line_str = srl_exec("clab-eigrp-test-srl2", ["bash", "-c", "wc -l < /var/log/srlinux/file/messages || echo 0"]).strip()
+        file_line = int(file_line_str) if file_line_str.isdigit() else 0
 
-    srl_exec("clab-eigrp-test-srl1", ["sr_cli", "tools system app-management application srl_eigrpd restart"])
-    assert wait_for_5node_convergence(srl_exec, timeout=25), "SRL1 failed to recover topology after second consecutive daemon restart (INIT seq 1 reuse)"
+        srl_exec("clab-eigrp-test-srl1", ["sr_cli", "tools system app-management application srl_eigrpd restart"])
+        assert wait_for_5node_convergence(srl_exec, timeout=25), "SRL1 failed to recover topology after first daemon restart"
 
-    out_srl2_ev = srl_exec("clab-eigrp-test-srl2", ["sr_cli", "show network-instance default protocols eigrp event-log"])
-    assert "reason=peer-restart" in out_srl2_ev or "NSF peer restarted" in out_srl2_ev, (
-        f"SRL2 did not log peer-restart on SRL1 restart: {out_srl2_ev}"
-    )
-    out_srl2_nbr = srl_exec("clab-eigrp-test-srl2", ["sr_cli", "info from state network-instance default protocols eigrp neighbor 10.1.2.1"])
-    assert "hold-time" in out_srl2_nbr and "hold-time 0" not in out_srl2_nbr, (
-        f"SRL2 neighbor 10.1.2.1 hold timer left disarmed after peer restart: {out_srl2_nbr}"
-    )
+        srl_exec("clab-eigrp-test-srl1", ["sr_cli", "tools system app-management application srl_eigrpd restart"])
+        assert wait_for_5node_convergence(srl_exec, timeout=25), "SRL1 failed to recover topology after second consecutive daemon restart (INIT seq 1 reuse)"
+
+        out_srl2_ev = srl_exec(
+            "clab-eigrp-test-srl2",
+            ["bash", "-c", f"tail -n +{start_line + 1} /var/log/srlinux/buffer/messages | grep srl-eigrpd || true"],
+        )
+        out_srl2_file = srl_exec(
+            "clab-eigrp-test-srl2",
+            ["bash", "-c", f"tail -n +{file_line + 1} /var/log/srlinux/file/messages | grep srl-eigrpd || true"],
+        )
+        assert (
+            "reason=peer-restart" in out_srl2_ev
+            or "NSF peer restarted" in out_srl2_ev
+            or "peer restarted" in out_srl2_ev
+            or "peer restarted" in out_srl2_file
+        ), f"SRL2 did not log peer-restart on SRL1 restart: buffer={out_srl2_ev}\nfile={out_srl2_file}"
+        assert "ethernet-1/1.0" in out_srl2_ev or "ethernet-1/1.0" in out_srl2_file, (
+            f"Expected human-readable SR Linux interface name ethernet-1/1.0 in syslog: buffer={out_srl2_ev}\nfile={out_srl2_file}"
+        )
+        out_srl2_nbr = ""
+        for _ in range(10):
+            out_srl2_nbr = srl_exec("clab-eigrp-test-srl2", ["sr_cli", "info from state network-instance default protocols eigrp neighbor 10.1.2.1"])
+            if "hold-time" in out_srl2_nbr and "hold-time 0" not in out_srl2_nbr:
+                break
+            time.sleep(1)
+        assert "hold-time" in out_srl2_nbr and "hold-time 0" not in out_srl2_nbr, (
+            f"SRL2 neighbor 10.1.2.1 hold timer left disarmed after peer restart: {out_srl2_nbr}"
+        )
+    finally:
+        apply_cfg(srl_exec, "clab-eigrp-test-srl2", "delete / network-instance default protocols eigrp trace-options")
 
 
 IPV6_CFGS = {
@@ -1272,12 +1309,9 @@ def test_5node_timers_maxprefix_bwpercent_ribscale_and_tools(srl_exec):
                 break
         assert v6_rec, f"IPv6 route 2001:db8::5/128 did not recover after rapid AF toggle on SRL1: {out_v6}"
 
-        # 6. Operational tools: statistics clear, event-log clear, topology clear prefix, neighbor clear, graceful-shutdown
+        # 6. Operational tools: statistics clear, topology clear prefix, neighbor clear, graceful-shutdown
         out_sclr = srl_exec("clab-eigrp-test-srl1", ["sr_cli", "tools network-instance default protocols eigrp statistics clear"])
         assert "Success" in out_sclr or "Cleared" in out_sclr, f"statistics clear failed: {out_sclr}"
-
-        out_eclr = srl_exec("clab-eigrp-test-srl1", ["sr_cli", "tools network-instance default protocols eigrp event-log clear"])
-        assert "Success" in out_eclr or "Cleared" in out_eclr, f"event-log clear failed: {out_eclr}"
 
         out_pclr = srl_exec("clab-eigrp-test-srl1", ["sr_cli", "tools network-instance default protocols eigrp topology clear prefix 5.5.5.5/32"])
         assert "5.5.5.5/32" in out_pclr and ("Success" in out_pclr or "Cleared" in out_pclr), f"topology clear prefix failed: {out_pclr}"
@@ -1290,13 +1324,37 @@ def test_5node_timers_maxprefix_bwpercent_ribscale_and_tools(srl_exec):
 
         assert wait_for_5node_convergence(srl_exec, timeout=25)
 
-        # 7. Show CLI & State DB telemetry verification
+        # 7. Show CLI, Trace Options & State DB telemetry verification
+        tr_start_str = srl_exec("clab-eigrp-test-srl3", ["bash", "-c", "wc -l < /var/log/srlinux/buffer/messages || echo 0"]).strip()
+        tr_start_line = int(tr_start_str) if tr_start_str.isdigit() else 0
+        apply_cfg(srl_exec, "clab-eigrp-test-srl3", "set / network-instance default protocols eigrp trace-options trace [ fsm packets adjacencies ]")
         out_sum = srl_exec("clab-eigrp-test-srl3", ["sr_cli", "show network-instance default protocols eigrp summary"])
         assert "Operational State       : up" in out_sum and "3.3.3.3" in out_sum
+        assert "Trace Options           :" in out_sum and all(opt in out_sum for opt in ["fsm", "packets", "adjacencies"]), (
+            f"Trace Options missing in summary: {out_sum}"
+        )
         out_tf = srl_exec("clab-eigrp-test-srl3", ["sr_cli", "show network-instance default protocols eigrp traffic"])
         assert "ethernet-1/1.0" in out_tf
+        out_cfg_tr = srl_exec("clab-eigrp-test-srl3", ["sr_cli", "info network-instance default protocols eigrp trace-options"])
+        assert "adjacencies" in out_cfg_tr and "packets" in out_cfg_tr and "fsm" in out_cfg_tr, f"Config missing trace-options: {out_cfg_tr}"
         out_state = srl_exec("clab-eigrp-test-srl3", ["sr_cli", "info from state network-instance default protocols eigrp oper-state"])
-        assert "up" in out_state
+        assert "up" in out_state, f"State DB missing oper-state up: {out_state}"
+
+        # Verify new HELLO packet trace messages flow to /var/log/srlinux/buffer/messages with SR Linux interface names
+        trace_ok = False
+        out_buf = ""
+        for _ in range(10):
+            time.sleep(1)
+            out_buf = srl_exec(
+                "clab-eigrp-test-srl3",
+                ["bash", "-c", f"tail -n +{tr_start_line + 1} /var/log/srlinux/buffer/messages | grep srl-eigrpd || true"],
+            )
+            if "HELLO" in out_buf and "ethernet-1/" in out_buf:
+                trace_ok = True
+                break
+        assert trace_ok, f"Expected EIGRP HELLO trace logs with ethernet-1/ interface names in /var/log/srlinux/buffer/messages on SRL3: {out_buf}"
+        assert " on e1-" not in out_buf and "(e1-" not in out_buf, f"Unnormalized Linux netdev name leaked into syslog: {out_buf}"
+        apply_cfg(srl_exec, "clab-eigrp-test-srl3", "delete / network-instance default protocols eigrp trace-options")
     finally:
         restore_5node_baseline(srl_exec)
         srl_exec("clab-eigrp-test-srl1", ["sr_cli", "tools network-instance default protocols eigrp topology clear"])

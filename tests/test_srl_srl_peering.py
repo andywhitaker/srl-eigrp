@@ -2084,50 +2084,55 @@ EOF"""
     assert reverted, f"Bandwidth percent did not revert to default 50%: {out_if}"
 
 
-def test_event_log_and_tools_clear(srl_exec):
-    """Verify event-log-size configuration, show event-log CLI, State DB event-log/entry list, and tools event-log clear."""
+def test_trace_options_and_syslog(srl_exec):
+    """Verify trace-options configuration, State DB trace-options, and SR Linux /var/log/srlinux/buffer/messages logging."""
     try:
         cfg = """sr_cli << 'EOF'
 enter candidate
 discard stay
-set / network-instance default protocols eigrp event-log-size 250
+set / network-instance default protocols eigrp trace-options trace [ fsm packets adjacencies ]
 commit now
 EOF"""
         out_commit = srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", cfg])
         assert "committed" in out_commit.lower(), f"Commit failed: {out_commit}"
 
-        size_ok = False
+        trace_ok = False
+        out_cfg_tr = ""
         out_state = ""
         for _ in range(15):
             time.sleep(1)
+            out_cfg_tr = srl_exec("clab-srl-srl-eigrp-srl1", [
+                "sr_cli", "info network-instance default protocols eigrp trace-options"
+            ])
             out_state = srl_exec("clab-srl-srl-eigrp-srl1", [
                 "sr_cli", "info from state network-instance default protocols eigrp"
             ])
-            if "event-log-size 250" in out_state and "event-log {" in out_state and "entry " in out_state:
-                size_ok = True
+            if "fsm" in out_cfg_tr and "packets" in out_cfg_tr and "oper-state up" in out_state:
+                trace_ok = True
                 break
-        assert size_ok, f"State DB missing event-log-size 250 or event-log entries: {out_state}"
+        assert trace_ok, f"Missing trace-options or state DB oper-state up: cfg={out_cfg_tr} state={out_state}"
 
-        out_ev = srl_exec("clab-srl-srl-eigrp-srl1", [
-            "sr_cli", "show network-instance default protocols eigrp event-log"
+        out_sum = srl_exec("clab-srl-srl-eigrp-srl1", [
+            "sr_cli", "show network-instance default protocols eigrp summary"
         ])
-        assert "EIGRP Event Log for Network-Instance: default" in out_ev, f"Event log title missing: {out_ev}"
-        assert "Total Events:" in out_ev, f"Total Events footer missing: {out_ev}"
-        # Verify no duplicate timestamp prefix ("YYYY-MM-DDTHH:MM:SS.mmmZ HH:MM:SS.mmm ")
-        import re
-        assert not re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\s+\d{2}:\d{2}:\d{2}\.\d{3}\s+", out_ev), (
-            f"Duplicate timestamp prefix found in event-log output: {out_ev}"
-        )
+        assert "Trace Options" in out_sum and "fsm" in out_sum, f"Summary missing Trace Options: {out_sum}"
 
-        out_clear = srl_exec("clab-srl-srl-eigrp-srl1", [
-            "sr_cli", "tools network-instance default protocols eigrp event-log clear"
-        ])
-        assert "Success" in out_clear and "cleared eigrp event log" in out_clear.lower(), f"Tools event-log clear failed: {out_clear}"
+        log_ok = False
+        out_buf = ""
+        for _ in range(10):
+            time.sleep(1)
+            out_buf = srl_exec("clab-srl-srl-eigrp-srl1", [
+                "bash", "-c", "tail -n 100 /var/log/srlinux/buffer/messages | grep srl-eigrpd || true"
+            ])
+            if "srl-eigrpd" in out_buf:
+                log_ok = True
+                break
+        assert log_ok, f"Expected srl-eigrpd trace logs in /var/log/srlinux/buffer/messages: {out_buf}"
     finally:
         clean = """sr_cli << 'EOF'
 enter candidate
 discard stay
-delete / network-instance default protocols eigrp event-log-size
+delete / network-instance default protocols eigrp trace-options
 commit now
 EOF"""
         srl_exec("clab-srl-srl-eigrp-srl1", ["bash", "-c", clean])

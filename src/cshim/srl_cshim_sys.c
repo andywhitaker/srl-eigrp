@@ -36,6 +36,8 @@
 #include "eigrp_packet.h"
 #include "eigrp_prefix.h"
 #include "eigrp_eventlog.h"
+#include "eigrp_log.h"
+#include "eigrp_debug.h"
 #include "eigrp_auth.h"
 #include "eigrp_list.h"
 #include "eigrp_table.h"
@@ -807,7 +809,7 @@ static void srl_fd_multicast_membership_update(const char *netinst, eigrp_ifinde
                 int rc = setsockopt(b->fd, IPPROTO_IPV6, opt, &mreq6, sizeof(mreq6));
                 if (rc < 0 && errno != EADDRINUSE && errno != EADDRNOTAVAIL && errno != ENOENT && errno != ENODEV) {
                     if (srl_is_debug_enabled()) {
-                        srl_log(1, "CSHIM: setsockopt IPV6_%s_GROUP ifindex=%u fd=%d errno=%d (%s)",
+                        srl_log(EIGRP_LOG_WARNING, "CSHIM: setsockopt IPV6_%s_GROUP ifindex=%u fd=%d errno=%d (%s)",
                                 join ? "JOIN" : "DROP", (unsigned)ifindex, b->fd, errno, strerror(errno));
                     }
                 }
@@ -828,7 +830,7 @@ static void srl_fd_multicast_membership_update(const char *netinst, eigrp_ifinde
                 int rc = setsockopt(b->fd, IPPROTO_IP, opt, &mreq, sizeof(mreq));
                 if (rc < 0 && errno != EADDRINUSE && errno != EADDRNOTAVAIL && errno != ENOENT && errno != ENODEV) {
                     if (srl_is_debug_enabled()) {
-                        srl_log(1, "CSHIM: setsockopt IP_%s_MEMBERSHIP ifindex=%u fd=%d errno=%d (%s)",
+                        srl_log(EIGRP_LOG_WARNING, "CSHIM: setsockopt IP_%s_MEMBERSHIP ifindex=%u fd=%d errno=%d (%s)",
                                 join ? "ADD" : "DROP", (unsigned)ifindex, b->fd, errno, strerror(errno));
                     }
                 }
@@ -854,7 +856,7 @@ static void srl_fd_multicast_join_all_active(srl_binding_t *b) {
             }
             int rc = setsockopt(b->fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
             if (rc < 0 && errno != EADDRINUSE && errno != EADDRNOTAVAIL && srl_is_debug_enabled()) {
-                srl_log(1, "CSHIM: socket_open IP_ADD_MEMBERSHIP ifindex=%u fd=%d errno=%d (%s)",
+                srl_log(EIGRP_LOG_WARNING, "CSHIM: socket_open IP_ADD_MEMBERSHIP ifindex=%u fd=%d errno=%d (%s)",
                         (unsigned)ci->ifindex, b->fd, errno, strerror(errno));
             }
         } else if (is_v6 && ci->active_v6 && ci->ifindex > 0) {
@@ -864,7 +866,7 @@ static void srl_fd_multicast_join_all_active(srl_binding_t *b) {
             mreq6.ipv6mr_interface = (int)ci->ifindex;
             int rc = setsockopt(b->fd, IPPROTO_IPV6, IPV6_JOIN_GROUP, &mreq6, sizeof(mreq6));
             if (rc < 0 && errno != EADDRINUSE && errno != EADDRNOTAVAIL && srl_is_debug_enabled()) {
-                srl_log(1, "CSHIM: socket_open IPV6_JOIN_GROUP ifindex=%u fd=%d errno=%d (%s)",
+                srl_log(EIGRP_LOG_WARNING, "CSHIM: socket_open IPV6_JOIN_GROUP ifindex=%u fd=%d errno=%d (%s)",
                         (unsigned)ci->ifindex, b->fd, errno, strerror(errno));
             }
         }
@@ -1451,7 +1453,7 @@ eigrp_result_t eigrp_sys_socket_open(eigrp_instance_t *eigrp) {
             }
             pthread_mutex_unlock(&g_data_lock);
         } else if (srl_is_debug_enabled()) {
-            srl_log(1, "CSHIM WARN: Failed to open AF_PACKET socket: %s", strerror(errno));
+            srl_log(EIGRP_LOG_WARNING, "CSHIM WARN: Failed to open AF_PACKET socket: %s", strerror(errno));
         }
     } else {
         if (srl_is_debug_enabled()) {
@@ -1716,9 +1718,13 @@ int eigrp_sys_ipv4_packet_send(eigrp_instance_t *eigrp, eigrp_intf_t *ei,
 
     ssize_t ret = sendmsg(fd, &msg, flags);
     if (ret < 0) {
-        srl_log(1, "CSHIM TX ERR: sendmsg fd=%d ifindex=%u dst=%s len=%zu errno=%d (%s)",
-                fd, (unsigned)eigrp_intf_ifindex(ei),
-                inet_ntoa(sin.sin_addr), length, errno, strerror(errno));
+        int err = errno;
+        if (srl_is_debug_enabled()) {
+            srl_log(EIGRP_LOG_WARNING, "CSHIM TX ERR: sendmsg fd=%d ifindex=%u dst=%s len=%zu errno=%d (%s)",
+                    fd, (unsigned)eigrp_intf_ifindex(ei),
+                    inet_ntoa(sin.sin_addr), length, err, strerror(err));
+        }
+        return (err > 0) ? -err : -1;
     }
     return (int)ret;
 }
@@ -2416,11 +2422,19 @@ int eigrp_sys_ipv6_packet_send(eigrp_instance_t *eigrp, eigrp_intf_t *ei,
     }
 
     ssize_t ret = sendmsg(fd, &msg, flags);
+    if (ret < 0 && errno == EADDRNOTAVAIL) {
+        memset(&pktinfo->ipi6_addr, 0, sizeof(pktinfo->ipi6_addr));
+        ret = sendmsg(fd, &msg, flags);
+    }
     if (ret < 0) {
-        char dst_str[INET6_ADDRSTRLEN] = "";
-        inet_ntop(AF_INET6, &sin6.sin6_addr, dst_str, sizeof(dst_str));
-        srl_log(1, "CSHIM TX ERR V6: sendmsg fd=%d ifindex=%u dst=%s len=%zu errno=%d (%s)",
-                fd, (unsigned)eigrp_intf_ifindex(ei), dst_str, length, errno, strerror(errno));
+        int err = errno;
+        if (srl_is_debug_enabled()) {
+            char dst_str[INET6_ADDRSTRLEN] = "";
+            inet_ntop(AF_INET6, &sin6.sin6_addr, dst_str, sizeof(dst_str));
+            srl_log(EIGRP_LOG_WARNING, "CSHIM TX ERR V6: sendmsg fd=%d ifindex=%u dst=%s len=%zu errno=%d (%s)",
+                    fd, (unsigned)eigrp_intf_ifindex(ei), dst_str, length, err, strerror(err));
+        }
+        return (err > 0) ? -err : -1;
     }
     return (int)ret;
 }
@@ -2913,6 +2927,8 @@ void srl_resolve_v6_gateway(const char *netinst, eigrp_ifindex_t ifidx, char *nh
     pthread_mutex_unlock(&g_data_lock);
 }
 
+static __thread eigrp_instance_t *g_tls_eigrp_instance = NULL;
+
 static eigrp_result_t srl_instance_exec(eigrp_instance_t *runtime,
                                         eigrp_message_handler_t handler,
                                         void *arg) {
@@ -2921,7 +2937,11 @@ static eigrp_result_t srl_instance_exec(eigrp_instance_t *runtime,
         !runtime->shutdown && runtime->thread_running) {
         return eigrp_instance_message_call(runtime, handler, arg);
     }
-    return handler(runtime, arg);
+    eigrp_instance_t *prev = g_tls_eigrp_instance;
+    g_tls_eigrp_instance = runtime;
+    eigrp_result_t res = handler(runtime, arg);
+    g_tls_eigrp_instance = prev;
+    return res;
 }
 
 static void srl_intf_metric_update(eigrp_instance_t *runtime, eigrp_intf_t *ei);
@@ -3479,47 +3499,52 @@ int srlShimInterfacesScan(const char *netinst) {
         srlShimRouteWithdrawV6(ni, withdraw_v6[i]);
     }
 
-    for (struct ifaddrs *ifa = ifap; ifa; ifa = ifa->ifa_next) {
-        if (!ifa->ifa_addr) continue;
-        if (!(ifa->ifa_flags & IFF_UP)) continue;
-        if (strcmp(ifa->ifa_name, "gateway") == 0 || strcmp(ifa->ifa_name, "lo") == 0) continue;
+    for (int pass = 0; pass < 2; pass++) {
+        for (struct ifaddrs *ifa = ifap; ifa; ifa = ifa->ifa_next) {
+            if (!ifa->ifa_addr) continue;
+            if (!(ifa->ifa_flags & IFF_UP)) continue;
+            if (strcmp(ifa->ifa_name, "gateway") == 0 || strcmp(ifa->ifa_name, "lo") == 0) continue;
 
-        if (ifa->ifa_addr->sa_family == AF_INET) {
-            struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
-            char ip_str[INET_ADDRSTRLEN];
-            if (!inet_ntop(AF_INET, &sin->sin_addr, ip_str, sizeof(ip_str))) continue;
-            if (sin->sin_addr.s_addr == htonl(INADDR_LOOPBACK)) continue;
+            if (pass == 0 && ifa->ifa_addr->sa_family == AF_INET) {
+                struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
+                char ip_str[INET_ADDRSTRLEN];
+                if (!inet_ntop(AF_INET, &sin->sin_addr, ip_str, sizeof(ip_str))) continue;
+                if (sin->sin_addr.s_addr == htonl(INADDR_LOOPBACK)) continue;
 
-            uint32_t prefixlen = 32;
-            if (ifa->ifa_netmask) {
-                struct sockaddr_in *nm = (struct sockaddr_in *)ifa->ifa_netmask;
-                uint32_t mask = ntohl(nm->sin_addr.s_addr);
-                prefixlen = 0;
-                while (mask & 0x80000000U) {
-                    prefixlen++;
-                    mask <<= 1;
-                }
-            }
-            srlShimInterfaceAdd(ni, ifa->ifa_name, ip_str, prefixlen);
-        } else if (ifa->ifa_addr->sa_family == AF_INET6) {
-            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ifa->ifa_addr;
-            if (IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr) || IN6_IS_ADDR_MULTICAST(&sin6->sin6_addr)) continue;
-            char ip6_str[INET6_ADDRSTRLEN];
-            if (!inet_ntop(AF_INET6, &sin6->sin6_addr, ip6_str, sizeof(ip6_str))) continue;
-
-            uint32_t prefixlen = 64;
-            if (ifa->ifa_netmask) {
-                struct sockaddr_in6 *nm6 = (struct sockaddr_in6 *)ifa->ifa_netmask;
-                prefixlen = 0;
-                for (int b = 0; b < 16; b++) {
-                    uint8_t byte = nm6->sin6_addr.s6_addr[b];
-                    while (byte & 0x80) {
+                uint32_t prefixlen = 32;
+                if (ifa->ifa_netmask) {
+                    struct sockaddr_in *nm = (struct sockaddr_in *)ifa->ifa_netmask;
+                    uint32_t mask = ntohl(nm->sin_addr.s_addr);
+                    prefixlen = 0;
+                    while (mask & 0x80000000U) {
                         prefixlen++;
-                        byte <<= 1;
+                        mask <<= 1;
                     }
                 }
+                srlShimInterfaceAdd(ni, ifa->ifa_name, ip_str, prefixlen);
+            } else if (ifa->ifa_addr->sa_family == AF_INET6) {
+                struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ifa->ifa_addr;
+                if (IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr) || IN6_IS_ADDR_MULTICAST(&sin6->sin6_addr)) continue;
+                bool is_ll = IN6_IS_ADDR_LINKLOCAL(&sin6->sin6_addr);
+                if ((pass == 0 && !is_ll) || (pass == 1 && is_ll)) continue;
+
+                char ip6_str[INET6_ADDRSTRLEN];
+                if (!inet_ntop(AF_INET6, &sin6->sin6_addr, ip6_str, sizeof(ip6_str))) continue;
+
+                uint32_t prefixlen = 64;
+                if (ifa->ifa_netmask) {
+                    struct sockaddr_in6 *nm6 = (struct sockaddr_in6 *)ifa->ifa_netmask;
+                    prefixlen = 0;
+                    for (int b = 0; b < 16; b++) {
+                        uint8_t byte = nm6->sin6_addr.s6_addr[b];
+                        while (byte & 0x80) {
+                            prefixlen++;
+                            byte <<= 1;
+                        }
+                    }
+                }
+                srlShimInterfaceAddV6(ni, ifa->ifa_name, ip6_str, prefixlen);
             }
-            srlShimInterfaceAddV6(ni, ifa->ifa_name, ip6_str, prefixlen);
         }
     }
 
@@ -4514,9 +4539,11 @@ static eigrp_result_t srl_intf_enable_msg_cb(eigrp_instance_t *runtime, void *ar
         if (!ei) {
             ei = eigrp_intf_lookup_by_ifindex(runtime, ea->ifidx);
         }
-        if (ei) {
+        if (ei && (ei->t_hello != NULL || ei->operative)) {
             if (!strstr(ea->actual_ifname, "system") && !strstr(ea->actual_ifname, "lo")) {
-                eigrp_hello_send(ei, EIGRP_HELLO_GRACEFUL_SHUTDOWN, NULL);
+                if (ea->has_addr && !eigrp_intf_is_passive(ei)) {
+                    eigrp_hello_send(ei, EIGRP_HELLO_GRACEFUL_SHUTDOWN, NULL);
+                }
                 eigrp_nbr_clear_request_t req;
                 memset(&req, 0, sizeof(req));
                 req.interface_name = (ei->name && ei->name[0]) ? ei->name : ea->actual_ifname;
@@ -4534,6 +4561,17 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
     if (!ifname || !ifname[0]) return -1;
     const char *ni = (netinst && netinst[0]) ? netinst : "default";
 
+    if (!admin_up) {
+        pthread_mutex_lock(&g_data_lock);
+        for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+            if (strcmp(ci->netinst, ni) == 0 && srl_match_ifname(ci->ifname, ifname)) {
+                ci->active = false;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_data_lock);
+    }
+
     srlShimInterfacesScan(ni);
 
     eigrp_instance_t *runtime = srl_instance_get_afi(ni, EIGRP_AFI_IPV4);
@@ -4547,7 +4585,7 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
             break;
         }
     }
-    if (!found || (admin_up && (found->ifindex == 0 || found->address.prefix_length == 0))) {
+    if (admin_up && (!found || found->ifindex == 0 || found->address.prefix_length == 0)) {
         for (int retry = 0; retry < 5; retry++) {
             pthread_mutex_unlock(&g_data_lock);
             usleep(20000);
@@ -4559,7 +4597,7 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
                     break;
                 }
             }
-            if (found && (!admin_up || (found->ifindex > 0 && found->address.prefix_length > 0))) {
+            if (found && found->ifindex > 0 && found->address.prefix_length > 0) {
                 break;
             }
         }
@@ -4607,6 +4645,13 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
         pthread_mutex_unlock(&g_data_lock);
         srl_sync_intf_config(runtime, actual_ifname, passive, hello_interval, hold_time,
                              admin_up, split_horizon, next_hop_self, bandwidth, delay);
+        srl_intf_enable_args_t down_ea;
+        memset(&down_ea, 0, sizeof(down_ea));
+        down_ea.actual_ifname = actual_ifname;
+        down_ea.ifidx = ifidx;
+        down_ea.admin_up = false;
+        down_ea.has_addr = false;
+        (void)srl_instance_exec(runtime, srl_intf_enable_msg_cb, &down_ea);
         return 0;
     }
 
@@ -4640,12 +4685,10 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
 
     if (admin_up) {
         srl_intf_membership_update(ni, root_ifidx, true);
-    } else if (!active_v6) {
-        srl_intf_membership_update(ni, root_ifidx, false);
-    }
-    srl_update_bpf_filter_netinst(ni);
-    if (ifidx > 0) {
-        srl_fd_multicast_membership_update(ni, ifidx, false, admin_up);
+        srl_update_bpf_filter_netinst(ni);
+        if (ifidx > 0) {
+            srl_fd_multicast_membership_update(ni, ifidx, false, true);
+        }
     }
 
     eigrp_instance_context_t ctx;
@@ -4680,6 +4723,16 @@ int srlShimInterfaceEnable(const char *netinst, const char *ifname, bool passive
     };
     (void)srl_instance_exec(runtime, srl_intf_enable_msg_cb, &ea);
 
+    if (!admin_up) {
+        if (!active_v6) {
+            srl_intf_membership_update(ni, root_ifidx, false);
+        }
+        srl_update_bpf_filter_netinst(ni);
+        if (ifidx > 0) {
+            srl_fd_multicast_membership_update(ni, ifidx, false, false);
+        }
+    }
+
     explicit_bzero(eff_key, sizeof(eff_key));
     return 0;
 }
@@ -4691,6 +4744,17 @@ int srlShimInterfaceDisable(const char *netinst, const char *ifname) {
 int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passive, uint16_t hello_interval, uint16_t hold_time, bool admin_up, bool split_horizon, bool next_hop_self, uint32_t bandwidth, uint32_t delay) {
     if (!ifname || !ifname[0]) return -1;
     const char *ni = (netinst && netinst[0]) ? netinst : "default";
+
+    if (!admin_up) {
+        pthread_mutex_lock(&g_data_lock);
+        for (srl_intf_t *ci = g_interfaces; ci; ci = ci->next) {
+            if (strcmp(ci->netinst, ni) == 0 && srl_match_ifname(ci->ifname, ifname)) {
+                ci->active_v6 = false;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_data_lock);
+    }
 
     srlShimInterfacesScan(ni);
 
@@ -4705,8 +4769,8 @@ int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passi
             break;
         }
     }
-    if (!found || (admin_up && (found->ifindex == 0 ||
-        (found->address_v6.address.afi != EIGRP_AFI_IPV6 && found->global_v6.address.afi != EIGRP_AFI_IPV6)))) {
+    if (admin_up && (!found || found->ifindex == 0 ||
+        (found->address_v6.address.afi != EIGRP_AFI_IPV6 && found->global_v6.address.afi != EIGRP_AFI_IPV6))) {
         for (int retry = 0; retry < 5; retry++) {
             pthread_mutex_unlock(&g_data_lock);
             usleep(20000);
@@ -4718,8 +4782,8 @@ int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passi
                     break;
                 }
             }
-            if (found && (!admin_up || (found->ifindex > 0 &&
-                (found->address_v6.address.afi == EIGRP_AFI_IPV6 || found->global_v6.address.afi == EIGRP_AFI_IPV6)))) {
+            if (found && found->ifindex > 0 &&
+                (found->address_v6.address.afi == EIGRP_AFI_IPV6 || found->global_v6.address.afi == EIGRP_AFI_IPV6)) {
                 break;
             }
         }
@@ -4803,12 +4867,10 @@ int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passi
 
     if (admin_up) {
         srl_intf_membership_update(ni, root_ifidx, true);
-    } else if (!active_v4) {
-        srl_intf_membership_update(ni, root_ifidx, false);
-    }
-    srl_update_bpf_filter_netinst(ni);
-    if (ifidx > 0) {
-        srl_fd_multicast_membership_update(ni, ifidx, true, admin_up);
+        srl_update_bpf_filter_netinst(ni);
+        if (ifidx > 0) {
+            srl_fd_multicast_membership_update(ni, ifidx, true, true);
+        }
     }
 
     srl_sync_intf_config(runtime_v6, actual_ifname, passive, hello_interval, hold_time,
@@ -4834,6 +4896,16 @@ int srlShimInterfaceEnableV6(const char *netinst, const char *ifname, bool passi
         .eff_kc = eff_kc
     };
     (void)srl_instance_exec(runtime_v6, srl_intf_enable_msg_cb, &ea);
+
+    if (!admin_up) {
+        if (!active_v4) {
+            srl_intf_membership_update(ni, root_ifidx, false);
+        }
+        srl_update_bpf_filter_netinst(ni);
+        if (ifidx > 0) {
+            srl_fd_multicast_membership_update(ni, ifidx, true, false);
+        }
+    }
 
     if (has_v6) {
         if (admin_up && has_glob_v6) {
@@ -5517,7 +5589,7 @@ int srlShimInstanceCreateV6(const char *netinst, uint16_t asn, const char *route
             pthread_mutex_lock(&g_data_lock);
             g_pending_netinst[0] = '\0';
             pthread_mutex_unlock(&g_data_lock);
-            srl_log(1, "CSHIM V6: failed to create AF config %s: res=%d", inst_name, res);
+            srl_log(EIGRP_LOG_WARNING, "CSHIM V6: failed to create AF config %s: res=%d", inst_name, res);
             return -1;
         }
     }
@@ -5527,7 +5599,7 @@ int srlShimInstanceCreateV6(const char *netinst, uint16_t asn, const char *route
         pthread_mutex_lock(&g_data_lock);
         g_pending_netinst[0] = '\0';
         pthread_mutex_unlock(&g_data_lock);
-        srl_log(1, "CSHIM V6: runtime not found after create");
+        srl_log(EIGRP_LOG_WARNING, "CSHIM V6: runtime not found after create");
         return -1;
     }
 
@@ -5650,6 +5722,7 @@ typedef struct srl_rib_scale_entry {
     bool has_metrics;
     bool wide_metrics;
     uint8_t k_values[6];
+    uint32_t trace_flags;
     struct srl_rib_scale_entry *next;
 } srl_rib_scale_entry_t;
 
@@ -7046,136 +7119,609 @@ int srlShimTopologyClear(const char *netinst, const char *prefix_str) {
     return (int)total_affected;
 }
 
-int srlShimEventLogSizeUpdate(const char *netinst, uint32_t size) {
+static uint32_t srl_get_trace_flags(const char *netinst) {
     const char *ni = (netinst && netinst[0]) ? netinst : "default";
-    eigrp_instance_t *instances[32];
-    int count = 0;
+    uint32_t flags = 0;
     pthread_mutex_lock(&g_data_lock);
-    for (srl_binding_t *b = g_bindings; b && count < 32; b = b->next) {
-        if (strcmp(b->netinst, ni) == 0 && b->eigrp) {
-            instances[count++] = b->eigrp;
+    for (srl_rib_scale_entry_t *e = g_rib_scales; e; e = e->next) {
+        if (strcmp(e->netinst, ni) == 0) {
+            flags = e->trace_flags;
+            break;
         }
     }
     pthread_mutex_unlock(&g_data_lock);
+    return flags;
+}
 
-    for (int i = 0; i < count; i++) {
-        eigrp_instance_context_t ctx;
-        memset(&ctx, 0, sizeof(ctx));
-        ctx.runtime = instances[i];
-        ctx.config = eigrp_af_config_runtime_read(instances[i]);
-        if (size == 0 || size == EIGRP_EVENTLOG_DEFAULT_SIZE) {
-            (void)eigrp_eventlog_size_update(EIGRP_RESET, &ctx, EIGRP_EVENTLOG_DEFAULT_SIZE);
+static uint32_t srl_any_trace_flags(void) {
+    uint32_t all_flags = 0;
+    pthread_mutex_lock(&g_data_lock);
+    for (srl_rib_scale_entry_t *e = g_rib_scales; e; e = e->next) {
+        all_flags |= e->trace_flags;
+    }
+    pthread_mutex_unlock(&g_data_lock);
+    return all_flags;
+}
+
+int srlShimTraceOptionsUpdate(const char *netinst, uint32_t flags) {
+    const char *ni = (netinst && netinst[0]) ? netinst : "default";
+    uint32_t all_flags = 0;
+
+    pthread_mutex_lock(&g_data_lock);
+    srl_rib_scale_entry_t *entry = srl_get_or_create_rib_scale_locked(ni);
+    if (entry) {
+        entry->trace_flags = flags;
+    }
+    for (srl_rib_scale_entry_t *e = g_rib_scales; e; e = e->next) {
+        all_flags |= e->trace_flags;
+    }
+    pthread_mutex_unlock(&g_data_lock);
+
+    unsigned long dbg_general = 0;
+    unsigned long dbg_nei = 0;
+    unsigned long dbg_tx = 0;
+    unsigned long dbg_notif = 0;
+    unsigned long pkt_flags = 0;
+
+    if (all_flags & SRL_TRACE_ADJACENCIES) {
+        dbg_nei |= EIGRP_DEBUG_NEI_ALL;
+        dbg_tx |= (EIGRP_DEBUG_TRANSMIT_STARTUP | EIGRP_DEBUG_TRANSMIT_PEERDOWN);
+    }
+    if (all_flags & SRL_TRACE_PACKETS) {
+        pkt_flags = EIGRP_DEBUG_SEND_RECV | EIGRP_DEBUG_PACKET_DETAIL;
+        dbg_tx |= EIGRP_DEBUG_TRANSMIT_ALL;
+    }
+    if (all_flags & SRL_TRACE_ROUTES) {
+        dbg_notif |= EIGRP_DEBUG_NOTIFICATION_RIB;
+        dbg_general |= EIGRP_DEBUG_DETAIL;
+    }
+    if (all_flags & SRL_TRACE_FSM) {
+        dbg_general |= EIGRP_DEBUG_FSM;
+        dbg_tx |= EIGRP_DEBUG_TRANSMIT_SIA;
+    }
+    if (all_flags & SRL_TRACE_GRACEFUL_RESTART) {
+        dbg_general |= EIGRP_DEBUG_NSF;
+    }
+    if (all_flags & SRL_TRACE_TIMERS) {
+        dbg_general |= EIGRP_DEBUG_TIMERS;
+        dbg_nei |= EIGRP_DEBUG_NEI_SIATIMER;
+    }
+    if (all_flags & SRL_TRACE_EVENTS) {
+        dbg_general |= EIGRP_DEBUG_EVENT;
+        dbg_notif |= EIGRP_DEBUG_NOTIFICATIONS;
+    }
+
+    term_debug_eigrp = dbg_general;
+    conf_debug_eigrp = dbg_general;
+    term_debug_eigrp_nei = dbg_nei;
+    conf_debug_eigrp_nei = dbg_nei;
+    term_debug_eigrp_transmit = dbg_tx;
+    conf_debug_eigrp_transmit = dbg_tx;
+    term_debug_eigrp_notifications = dbg_notif;
+    conf_debug_eigrp_notifications = dbg_notif;
+    for (int i = 0; i < EIGRP_DEBUG_PACKET_CATEGORY_MAX; i++) {
+        term_debug_eigrp_packet[i] = pkt_flags;
+        conf_debug_eigrp_packet[i] = pkt_flags;
+    }
+
+    return 0;
+}
+
+#define SRL_LOG_RL_SLOTS 32
+#define SRL_LOG_RL_COOLDOWN_MS 5000ULL
+
+typedef struct {
+    uint32_t hash;
+    uint64_t last_ms;
+    uint32_t suppressed;
+} srl_log_rl_slot_t;
+
+static srl_log_rl_slot_t g_log_rl[SRL_LOG_RL_SLOTS];
+static pthread_mutex_t g_log_rl_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint32_t srl_log_hash_str(const char *s) {
+    uint32_t h = 2166136261u;
+    if (!s) return h;
+    while (*s) {
+        h ^= (uint8_t)(*s++);
+        h *= 16777619u;
+    }
+    return h ? h : 1u;
+}
+
+static bool srl_log_allow_rate_limited(uint32_t key, uint32_t *suppressed_out) {
+    if (suppressed_out) *suppressed_out = 0;
+    uint64_t now = srl_monotime_msec();
+    bool allow = true;
+    pthread_mutex_lock(&g_log_rl_lock);
+    srl_log_rl_slot_t *slot = &g_log_rl[key % SRL_LOG_RL_SLOTS];
+    if (slot->hash == key && slot->last_ms != 0 && (now - slot->last_ms) < SRL_LOG_RL_COOLDOWN_MS) {
+        slot->suppressed++;
+        allow = false;
+    } else {
+        if (slot->hash == key && suppressed_out) {
+            *suppressed_out = slot->suppressed;
+        }
+        slot->hash = key;
+        slot->last_ms = now;
+        slot->suppressed = 0;
+        allow = true;
+    }
+    pthread_mutex_unlock(&g_log_rl_lock);
+    return allow;
+}
+
+static void srl_format_srl_ifname(const char *raw_name, char *out, size_t out_len) {
+    if (!out || out_len == 0) return;
+    if (!raw_name || !raw_name[0]) {
+        out[0] = '\0';
+        return;
+    }
+    const char *d = raw_name;
+    if (strncmp(d, "srl", 3) == 0 || strncmp(d, "clab", 4) == 0) {
+        const char *dash = strchr(d, '-');
+        if (dash) d = dash + 1;
+    }
+    int c = 0, p = 0, s = 0, n = 0;
+    if ((sscanf(d, "e%d-%d.%d%n", &c, &p, &s, &n) == 3 && d[n] == '\0') ||
+        (sscanf(d, "e%d-%d-%d%n", &c, &p, &s, &n) == 3 && d[n] == '\0') ||
+        (sscanf(d, "e%d-%d_%d%n", &c, &p, &s, &n) == 3 && d[n] == '\0')) {
+        snprintf(out, out_len, "ethernet-%d/%d.%d", c, p, s);
+        return;
+    }
+    if (sscanf(d, "e%d-%d%n", &c, &p, &n) == 2 && d[n] == '\0') {
+        snprintf(out, out_len, "ethernet-%d/%d", c, p);
+        return;
+    }
+    srl_strlcpy(out, raw_name, out_len);
+}
+
+static bool srl_is_ifname_delim_before(char c) {
+    return c == ' ' || c == '(' || c == '[' || c == '\t' || c == ',';
+}
+
+static bool srl_is_ifname_delim_after(char c) {
+    return c == '\0' || c == ' ' || c == ')' || c == ']' || c == ':' || c == ',' || c == '\t' || c == '\n';
+}
+
+static void srl_normalize_log_ifnames(const char *in, char *out, size_t out_len) {
+    if (!out || out_len == 0) return;
+    if (!in) {
+        out[0] = '\0';
+        return;
+    }
+    size_t out_idx = 0;
+    const char *p = in;
+    while (*p && out_idx + 1 < out_len) {
+        bool at_token_start = (p == in) || srl_is_ifname_delim_before(*(p - 1));
+        if (at_token_start && *p == 'e' && isdigit((unsigned char)p[1])) {
+            const char *q = p + 1;
+            int card = 0, port = 0, sub = 0;
+            bool has_sub = false;
+            while (isdigit((unsigned char)*q)) {
+                card = card * 10 + (*q - '0');
+                q++;
+            }
+            if (*q == '-' && isdigit((unsigned char)q[1])) {
+                q++;
+                while (isdigit((unsigned char)*q)) {
+                    port = port * 10 + (*q - '0');
+                    q++;
+                }
+                if ((*q == '.' || *q == '-' || *q == '_') && isdigit((unsigned char)q[1])) {
+                    has_sub = true;
+                    q++;
+                    while (isdigit((unsigned char)*q)) {
+                        sub = sub * 10 + (*q - '0');
+                        q++;
+                    }
+                }
+                if (srl_is_ifname_delim_after(*q)) {
+                    char repl[64];
+                    int n = has_sub ? snprintf(repl, sizeof(repl), "ethernet-%d/%d.%d", card, port, sub)
+                                    : snprintf(repl, sizeof(repl), "ethernet-%d/%d", card, port);
+                    if (n > 0) {
+                        size_t copy_len = (size_t)n;
+                        if (out_idx + copy_len >= out_len) {
+                            copy_len = out_len - 1 - out_idx;
+                        }
+                        memcpy(out + out_idx, repl, copy_len);
+                        out_idx += copy_len;
+                        p = q;
+                        continue;
+                    }
+                }
+            }
+        }
+        out[out_idx++] = *p++;
+    }
+    out[out_idx] = '\0';
+}
+
+static void srl_enrich_eventlog_ifname(const char *netinst, const char *in_msg, char *out_buf, size_t out_size) {
+    if (!in_msg || !out_buf || out_size == 0) return;
+    const char *tag = strstr(in_msg, "ifindex ");
+    if (!tag) {
+        srl_strlcpy(out_buf, in_msg, out_size);
+        return;
+    }
+    const char *num_start = tag + 8;
+    char *num_end = NULL;
+    unsigned long idx = strtoul(num_start, &num_end, 10);
+    if (num_end == num_start || idx == 0) {
+        srl_strlcpy(out_buf, in_msg, out_size);
+        return;
+    }
+    const char *raw_ifname = srl_get_ifname_by_index(netinst, (eigrp_ifindex_t)idx);
+    if (!raw_ifname || !raw_ifname[0]) {
+        srl_strlcpy(out_buf, in_msg, out_size);
+        return;
+    }
+    char srl_ifname[64];
+    srl_format_srl_ifname(raw_ifname, srl_ifname, sizeof(srl_ifname));
+    size_t prefix_len = (size_t)(tag - in_msg);
+    snprintf(out_buf, out_size, "%.*sinterface %s (ifindex %lu)%s",
+             (int)prefix_len, in_msg, srl_ifname, idx, num_end);
+}
+
+static eigrp_instance_t *srl_current_thread_instance(void) {
+    if (g_tls_eigrp_instance) {
+        return g_tls_eigrp_instance;
+    }
+    pthread_t self = pthread_self();
+    eigrp_instance_t *found = NULL;
+    pthread_mutex_lock(&g_data_lock);
+    for (srl_binding_t *b = g_bindings; b; b = b->next) {
+        if (b->eigrp && b->eigrp->thread_started && pthread_equal(self, b->eigrp->thread)) {
+            found = b->eigrp;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_data_lock);
+    return found;
+}
+
+void __wrap_eigrp_log(eigrp_log_level_t level, const char *format, ...) {
+    if (!format) return;
+
+    char raw_buf[512];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(raw_buf, sizeof(raw_buf), format, args);
+    va_end(args);
+
+    char buf[576];
+    srl_normalize_log_ifnames(raw_buf, buf, sizeof(buf));
+
+    eigrp_instance_t *cur_inst = srl_current_thread_instance();
+    uint32_t eff_flags = cur_inst ? srl_get_trace_flags(srl_netinst_by_instance(cur_inst))
+                                  : srl_any_trace_flags();
+
+    if (strcmp(buf, "All reply received") == 0 && (eff_flags & (SRL_TRACE_FSM | SRL_TRACE_EVENTS)) == 0) {
+        return;
+    }
+    if (strncmp(buf, "Prefix Filtered:", 16) == 0 && (eff_flags & (SRL_TRACE_ROUTES | SRL_TRACE_EVENTS)) == 0) {
+        return;
+    }
+    if (strncmp(buf, "EIGRP: Ignored HELLO, no routerid for IPv6", 42) == 0) {
+        return;
+    }
+
+    if (level == EIGRP_LOG_DEBUG) {
+        if (strncmp(buf, "Neighbor ", 9) == 0 && strstr(buf, "is down:") != NULL) {
+            level = EIGRP_LOG_WARNING;
         } else {
-            (void)eigrp_eventlog_size_update(EIGRP_SET, &ctx, size);
+            if (eff_flags == 0) {
+                return;
+            }
+            if (strncmp(buf, "EIGRP router-id auto ", 21) == 0 && (eff_flags & SRL_TRACE_EVENTS) == 0) {
+                return;
+            }
+            if (strncmp(buf, "GR receive:", 11) == 0 && (eff_flags & (SRL_TRACE_GRACEFUL_RESTART | SRL_TRACE_EVENTS)) == 0) {
+                return;
+            }
+            if ((strncmp(buf, "EIGRP QUERY:", 12) == 0 ||
+                 strncmp(buf, "EIGRP REPLY:", 12) == 0 ||
+                 strncmp(buf, "EIGRP SIA-QUERY:", 16) == 0 ||
+                 strncmp(buf, "EIGRP SIA-REPLY:", 16) == 0) &&
+                (eff_flags & (SRL_TRACE_FSM | SRL_TRACE_PACKETS | SRL_TRACE_EVENTS)) == 0) {
+                return;
+            }
+            if ((strncmp(buf, "EIGRP: add static neighbor", 26) == 0 ||
+                 strncmp(buf, "EIGRP: delete static neighbor", 29) == 0) &&
+                (eff_flags & (SRL_TRACE_ADJACENCIES | SRL_TRACE_EVENTS)) == 0) {
+                return;
+            }
+            level = EIGRP_LOG_INFO;
+        }
+    } else if (level == EIGRP_LOG_INFO && strncmp(buf, "Neighbor ", 9) == 0) {
+        level = EIGRP_LOG_WARNING;
+    }
+
+    if (level == EIGRP_LOG_WARNING && strncmp(buf, "Neighbor ", 9) != 0 && (eff_flags & SRL_TRACE_PACKETS) == 0) {
+        uint32_t suppressed = 0;
+        uint32_t key = srl_log_hash_str(buf);
+        if (!srl_log_allow_rate_limited(key, &suppressed)) {
+            return;
+        }
+        if (suppressed > 0) {
+            srl_log((int)level, "%s (suppressed %u similar warnings)", buf, suppressed);
+            return;
         }
     }
-    return 0;
+
+    srl_log((int)level, "%s", buf);
 }
 
-static eigrp_result_t srl_eventlog_clear_msg_cb(eigrp_instance_t *runtime, void *arg) {
-    (void)arg;
-    if (!runtime) return EIGRP_RESULT_INVALID_ARGUMENT;
-    eigrp_instance_context_t ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.runtime = runtime;
-    ctx.config = eigrp_af_config_runtime_read(runtime);
-    return eigrp_eventlog_clear(&ctx);
-}
+eigrp_result_t __wrap_eigrp_eventlog_msg_add(eigrp_instance_t *eigrp, uint16_t opcode,
+                                             const eigrp_prefix_t *addr,
+                                             eventmsg_arg_t arg1, eventmsg_arg_t arg2,
+                                             eventmsg_arg_t arg3, eventmsg_arg_t arg4) {
+    if (!eigrp || !opcode) {
+        return EIGRP_RESULT_INVALID_ARGUMENT;
+    }
 
-int srlShimEventLogClear(const char *netinst) {
-    const char *ni = (netinst && netinst[0]) ? netinst : "default";
-    eigrp_instance_t *instances[32];
-    int count = 0;
-    pthread_mutex_lock(&g_data_lock);
-    for (srl_binding_t *b = g_bindings; b && count < 32; b = b->next) {
-        if (strcmp(b->netinst, ni) == 0 && b->eigrp) {
-            instances[count++] = b->eigrp;
+    const char *netinst = srl_netinst_by_instance(eigrp);
+    uint32_t flags = srl_get_trace_flags(netinst);
+
+    bool should_log = false;
+    bool rate_limit = false;
+    eigrp_log_level_t level = EIGRP_LOG_INFO;
+    uint32_t req_mask = 0;
+
+    switch (opcode) {
+    case EIGRP_EVENTLOG_OPCODE_NEIGHBOR_STATE_CHANGE:
+        if (arg1 == EIGRP_NEIGHBOR_UP || arg2 == EIGRP_NEIGHBOR_UP || arg2 == EIGRP_NEIGHBOR_DOWN) {
+            should_log = true;
+            level = EIGRP_LOG_WARNING;
+        } else {
+            req_mask = SRL_TRACE_ADJACENCIES | SRL_TRACE_EVENTS;
+        }
+        break;
+
+    case EIGRP_EVENTLOG_OPCODE_INTERFACE_STATE:
+        should_log = true;
+        level = (arg1 == EIGRP_EVENTLOG_INTERFACE_STATE_MULTICAST_JOIN_FAILED)
+                    ? EIGRP_LOG_ERROR
+                    : EIGRP_LOG_WARNING;
+        break;
+
+    case EIGRP_EVENTLOG_OPCODE_IPV6_NO_ROUTER_ID: {
+        pthread_mutex_lock(&g_data_lock);
+        bool creating = (g_pending_netinst[0] != '\0');
+        pthread_mutex_unlock(&g_data_lock);
+        if (creating) {
+            return EIGRP_RESULT_SUCCESS;
+        }
+        should_log = true;
+        rate_limit = true;
+        level = EIGRP_LOG_WARNING;
+        break;
+    }
+
+    case EIGRP_EVENTLOG_OPCODE_RTP_RETRY_LIMIT:
+    case EIGRP_EVENTLOG_OPCODE_NSF_EVENT:
+    case EIGRP_EVENTLOG_OPCODE_SIA_EXPIRE:
+    case EIGRP_EVENTLOG_OPCODE_PREFIX_LIMIT_PEER:
+        should_log = true;
+        level = EIGRP_LOG_WARNING;
+        break;
+
+    case EIGRP_EVENTLOG_OPCODE_PREFIX_LIMIT_REJECT:
+        should_log = true;
+        rate_limit = true;
+        level = EIGRP_LOG_WARNING;
+        break;
+
+    case EIGRP_EVENTLOG_OPCODE_ROUTE_ENCODE_FAILURE:
+        should_log = true;
+        rate_limit = (flags & SRL_TRACE_PACKETS) == 0;
+        level = EIGRP_LOG_ERROR;
+        break;
+
+    case EIGRP_EVENTLOG_OPCODE_PACKET_TX_FAILURE: {
+        long tx_err = -(long)(intptr_t)arg4;
+        if (tx_err == EADDRNOTAVAIL || tx_err == ENETDOWN || tx_err == ENETUNREACH ||
+            tx_err == ENODEV || tx_err == ENXIO) {
+            req_mask = SRL_TRACE_PACKETS | SRL_TRACE_EVENTS;
+        } else {
+            should_log = true;
+            rate_limit = (flags & SRL_TRACE_PACKETS) == 0;
+            level = EIGRP_LOG_ERROR;
+        }
+        break;
+    }
+
+    case EIGRP_EVENTLOG_OPCODE_PACKET_REJECT:
+        if (arg2 == EIGRP_EVENTLOG_PACKET_REJECT_PASSIVE_INTERFACE ||
+            arg2 == EIGRP_EVENTLOG_PACKET_REJECT_NO_NEIGHBOR ||
+            arg2 == EIGRP_EVENTLOG_PACKET_REJECT_CR_NOT_ELIGIBLE ||
+            arg2 == EIGRP_EVENTLOG_PACKET_REJECT_NO_INTERFACE) {
+            req_mask = SRL_TRACE_PACKETS | SRL_TRACE_EVENTS;
+        } else {
+            should_log = true;
+            rate_limit = (flags & SRL_TRACE_PACKETS) == 0;
+            level = EIGRP_LOG_WARNING;
+        }
+        break;
+
+    case EIGRP_EVENTLOG_OPCODE_DUAL_STATE_CHANGE:
+    case EIGRP_EVENTLOG_OPCODE_DUAL_FIND_FS:
+    case EIGRP_EVENTLOG_OPCODE_DUAL_FC_SAT:
+    case EIGRP_EVENTLOG_OPCODE_DUAL_FC_NOT_SAT:
+    case EIGRP_EVENTLOG_OPCODE_DUAL_ACTIVE_PEERS:
+    case EIGRP_EVENTLOG_OPCODE_REPLY_STATUS:
+        req_mask = SRL_TRACE_FSM | SRL_TRACE_EVENTS;
+        break;
+
+    case EIGRP_EVENTLOG_OPCODE_DUAL_METRIC_SET:
+    case EIGRP_EVENTLOG_OPCODE_SUCCESSOR_CHANGE:
+        req_mask = SRL_TRACE_FSM | SRL_TRACE_ROUTES | SRL_TRACE_EVENTS;
+        break;
+
+    case EIGRP_EVENTLOG_OPCODE_QUERY_RX:
+    case EIGRP_EVENTLOG_OPCODE_REPLY_RX:
+    case EIGRP_EVENTLOG_OPCODE_REPLY_TX:
+        req_mask = SRL_TRACE_FSM | SRL_TRACE_PACKETS | SRL_TRACE_EVENTS;
+        break;
+
+    case EIGRP_EVENTLOG_OPCODE_SIA_QUERY_TX:
+    case EIGRP_EVENTLOG_OPCODE_SIA_QUERY_RX:
+    case EIGRP_EVENTLOG_OPCODE_SIA_REPLY_TX:
+    case EIGRP_EVENTLOG_OPCODE_SIA_REPLY_RX:
+        req_mask = SRL_TRACE_FSM | SRL_TRACE_TIMERS | SRL_TRACE_PACKETS | SRL_TRACE_EVENTS;
+        break;
+
+    case EIGRP_EVENTLOG_OPCODE_PACKET_RX:
+    case EIGRP_EVENTLOG_OPCODE_PACKET_TX:
+    case EIGRP_EVENTLOG_OPCODE_RTP_ACK:
+        req_mask = SRL_TRACE_PACKETS | SRL_TRACE_EVENTS;
+        break;
+
+    case EIGRP_EVENTLOG_OPCODE_RTP_RETRANSMIT:
+        req_mask = SRL_TRACE_PACKETS | SRL_TRACE_TIMERS | SRL_TRACE_EVENTS;
+        break;
+
+    case EIGRP_EVENTLOG_OPCODE_RTP_ACK_UNEXPECTED:
+        req_mask = SRL_TRACE_PACKETS | SRL_TRACE_ADJACENCIES | SRL_TRACE_EVENTS;
+        break;
+
+    case EIGRP_EVENTLOG_OPCODE_PEER_CAPABILITY:
+        req_mask = SRL_TRACE_ADJACENCIES | SRL_TRACE_EVENTS;
+        break;
+
+    case EIGRP_EVENTLOG_OPCODE_RTP_INIT_RX:
+    case EIGRP_EVENTLOG_OPCODE_RTP_INIT_DECISION:
+    case EIGRP_EVENTLOG_OPCODE_RTP_INIT_EOT:
+    case EIGRP_EVENTLOG_OPCODE_RTP_INIT_RESYNC:
+    case EIGRP_EVENTLOG_OPCODE_RTP_INIT_SYNC:
+    case EIGRP_EVENTLOG_OPCODE_RTP_INIT_STATE:
+        req_mask = SRL_TRACE_ADJACENCIES | SRL_TRACE_GRACEFUL_RESTART | SRL_TRACE_EVENTS;
+        break;
+
+    case EIGRP_EVENTLOG_OPCODE_RTP_INIT_HOLD:
+        req_mask = SRL_TRACE_ADJACENCIES | SRL_TRACE_GRACEFUL_RESTART | SRL_TRACE_TIMERS | SRL_TRACE_EVENTS;
+        break;
+
+    case EIGRP_EVENTLOG_OPCODE_SUMMARY_METRIC:
+    case EIGRP_EVENTLOG_OPCODE_SUMMARY_COMPONENT:
+    case EIGRP_EVENTLOG_OPCODE_SUMMARY_WITHDRAW:
+    case EIGRP_EVENTLOG_OPCODE_RIB_ROUTE_UPDATE:
+    case EIGRP_EVENTLOG_OPCODE_RIB_ROUTE_DELETE:
+    case EIGRP_EVENTLOG_OPCODE_REDIST_ROUTE_UPDATE:
+    case EIGRP_EVENTLOG_OPCODE_REDIST_ROUTE_WITHDRAW:
+    case EIGRP_EVENTLOG_OPCODE_REDIST_ROUTE_FILTERED:
+    case EIGRP_EVENTLOG_OPCODE_REDIST_ROUTE_REJECT:
+    case EIGRP_EVENTLOG_OPCODE_TOPOLOGY_ROUTE_DELETE:
+    case EIGRP_EVENTLOG_OPCODE_POISON_REVERSE:
+    case EIGRP_EVENTLOG_OPCODE_ROUTE_FILTERED:
+    case EIGRP_EVENTLOG_OPCODE_OFFSET_APPLIED:
+    case EIGRP_EVENTLOG_OPCODE_RIB_INSTALL:
+    case EIGRP_EVENTLOG_OPCODE_RIB_WITHDRAW:
+        req_mask = SRL_TRACE_ROUTES | SRL_TRACE_EVENTS;
+        break;
+
+    case EIGRP_EVENTLOG_OPCODE_UPDATE_PACKETIZED:
+        req_mask = SRL_TRACE_ROUTES | SRL_TRACE_PACKETS | SRL_TRACE_EVENTS;
+        break;
+
+    default:
+        req_mask = SRL_TRACE_EVENTS;
+        break;
+    }
+
+    if (!should_log && (flags & req_mask) != 0) {
+        should_log = true;
+        level = EIGRP_LOG_INFO;
+    }
+
+    if (!should_log) {
+        return EIGRP_RESULT_SUCCESS;
+    }
+
+    uint32_t suppressed = 0;
+    if (rate_limit) {
+        uint32_t rl_key = ((uint32_t)eigrp->vrf_id << 24) ^ ((uint32_t)opcode << 16) ^ ((uint32_t)arg2 & 0xFFFFu);
+        if (rl_key == 0) rl_key = 1u;
+        if (!srl_log_allow_rate_limited(rl_key, &suppressed)) {
+            return EIGRP_RESULT_SUCCESS;
         }
     }
-    pthread_mutex_unlock(&g_data_lock);
 
-    for (int i = 0; i < count; i++) {
-        (void)srl_instance_exec(instances[i], srl_eventlog_clear_msg_cb, NULL);
+    eigrp_eventlog_msg_t entry;
+    memset(&entry, 0, sizeof(entry));
+    entry.timestamp = eigrp_sys_wallclock_msec();
+    entry.opcode = opcode;
+    if (addr) {
+        entry.addr = *addr;
     }
-    return 0;
-}
+    entry.arg1 = arg1;
+    entry.arg2 = arg2;
+    entry.arg3 = arg3;
+    entry.arg4 = arg4;
 
-typedef struct {
-    uint32_t event_num;
-    uint64_t timestamp_ms;
-    char msg[256];
-} srl_rep_event_t;
-
-typedef struct {
-    srl_rep_event_t *events;
-    int count;
-    int capacity;
-} srl_eventlog_report_ctx_t;
-
-static eigrp_result_t srl_eventlog_iter_cb(uint32_t event_number, const eigrp_eventlog_msg_t *entry, const char *format, void *arg) {
-    (void)event_number;
-    (void)format;
-    srl_eventlog_report_ctx_t *ctx = (srl_eventlog_report_ctx_t *)arg;
-    if (!ctx || !entry) return EIGRP_RESULT_SUCCESS;
-    if (ctx->count >= ctx->capacity) {
-        int new_cap = (ctx->capacity > 0) ? (ctx->capacity * 2) : 512;
-        srl_rep_event_t *new_ev = realloc(ctx->events, (size_t)new_cap * sizeof(srl_rep_event_t));
-        if (!new_ev) return EIGRP_RESULT_SUCCESS;
-        ctx->events = new_ev;
-        ctx->capacity = new_cap;
+    char raw_buf[384];
+    raw_buf[0] = '\0';
+    if (eigrp_eventlog_msg_format(&entry, raw_buf, sizeof(raw_buf)) != EIGRP_RESULT_SUCCESS) {
+        return EIGRP_RESULT_SUCCESS;
     }
-    srl_rep_event_t *ev = &ctx->events[ctx->count++];
-    ev->event_num = (uint32_t)ctx->count;
-    ev->timestamp_ms = entry->timestamp;
-    ev->msg[0] = '\0';
-    (void)eigrp_eventlog_msg_format(entry, ev->msg, sizeof(ev->msg));
-    if (strlen(ev->msg) > 13 &&
-        ev->msg[2] == ':' && ev->msg[5] == ':' && ev->msg[8] == '.' && ev->msg[12] == ' ') {
-        memmove(ev->msg, ev->msg + 13, strlen(ev->msg + 13) + 1);
+
+    const char *msg = raw_buf;
+    if (strlen(msg) > 13 && msg[2] == ':' && msg[5] == ':' && msg[8] == '.' && msg[12] == ' ') {
+        msg += 13;
     }
+
+    char enriched_buf[448];
+    srl_enrich_eventlog_ifname(netinst, msg, enriched_buf, sizeof(enriched_buf));
+
+    const char *af_str = (eigrp_instance_afi(eigrp) == EIGRP_AFI_IPV6) ? "ipv6-unicast" : "ipv4-unicast";
+    if (suppressed > 0) {
+        srl_log((int)level, "[ni=%s as=%u %s] %s (suppressed %u similar events)",
+                netinst, (unsigned)eigrp->AS, af_str, enriched_buf, suppressed);
+    } else {
+        srl_log((int)level, "[ni=%s as=%u %s] %s",
+                netinst, (unsigned)eigrp->AS, af_str, enriched_buf);
+    }
+
     return EIGRP_RESULT_SUCCESS;
 }
 
-static eigrp_result_t srl_eventlog_report_msg_cb(eigrp_instance_t *runtime, void *arg) {
-    srl_eventlog_report_ctx_t *rctx = (srl_eventlog_report_ctx_t *)arg;
-    if (!runtime || !rctx) return EIGRP_RESULT_INVALID_ARGUMENT;
-    eigrp_instance_context_t ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.runtime = runtime;
-    ctx.config = eigrp_af_config_runtime_read(runtime);
-    return eigrp_eventlog_msg_iterate(&ctx, srl_eventlog_iter_cb, rctx);
-}
+int srlTestLoggingCheck(void) {
+    char out[256];
 
-void srlShimEventLogReport(const char *netinst) {
-    const char *ni = (netinst && netinst[0]) ? netinst : "default";
-    eigrp_instance_t *instances[32];
-    int count = 0;
-    int capacity = 512;
-    srl_rep_event_t *events = calloc((size_t)capacity, sizeof(srl_rep_event_t));
-    if (!events) return;
+    srl_format_srl_ifname("e1-1.0", out, sizeof(out));
+    if (strcmp(out, "ethernet-1/1.0") != 0) return -1;
 
-    srl_eventlog_report_ctx_t rctx = {
-        .events = events,
-        .count = 0,
-        .capacity = capacity
-    };
+    srl_format_srl_ifname("e1-2-100", out, sizeof(out));
+    if (strcmp(out, "ethernet-1/2.100") != 0) return -2;
 
-    pthread_mutex_lock(&g_data_lock);
-    for (srl_binding_t *b = g_bindings; b && count < 32; b = b->next) {
-        if (strcmp(b->netinst, ni) == 0 && b->eigrp) {
-            instances[count++] = b->eigrp;
-        }
-    }
-    pthread_mutex_unlock(&g_data_lock);
+    srl_format_srl_ifname("e1-3", out, sizeof(out));
+    if (strcmp(out, "ethernet-1/3") != 0) return -3;
 
-    for (int i = 0; i < count; i++) {
-        (void)srl_instance_exec(instances[i], srl_eventlog_report_msg_cb, &rctx);
-    }
+    srl_format_srl_ifname("system0.0", out, sizeof(out));
+    if (strcmp(out, "system0.0") != 0) return -4;
 
-    for (int i = 0; i < rctx.count; i++) {
-        srlGoEventLogReport((char *)ni, rctx.events[i].event_num, rctx.events[i].timestamp_ms, rctx.events[i].msg);
-    }
-    free(rctx.events);
+    srl_normalize_log_ifnames("Neighbor 10.1.2.2 (e1-1.0) is up: new adjacency", out, sizeof(out));
+    if (strcmp(out, "Neighbor 10.1.2.2 (ethernet-1/1.0) is up: new adjacency") != 0) return -5;
+
+    srl_normalize_log_ifnames("EIGRP: Sending HELLO on e1-2.0", out, sizeof(out));
+    if (strcmp(out, "EIGRP: Sending HELLO on ethernet-1/2.0") != 0) return -6;
+
+    srl_normalize_log_ifnames("interface e1-1.0: EIGRP authentication failed", out, sizeof(out));
+    if (strcmp(out, "interface ethernet-1/1.0: EIGRP authentication failed") != 0) return -7;
+
+    srlTestRegisterInterface("default", "e1-1.0", 34, 10, "10.1.2.1", 30, false, true);
+    srl_enrich_eventlog_ifname("default", "Peer 10.1.2.2/32: PENDING -> UP ifindex 34", out, sizeof(out));
+    srlTestClearInterfaces();
+    if (strcmp(out, "Peer 10.1.2.2/32: PENDING -> UP interface ethernet-1/1.0 (ifindex 34)") != 0) return -8;
+
+    srlShimTraceOptionsUpdate("default", 0);
+    srlShimTraceOptionsUpdate("vrf-test", SRL_TRACE_FSM | SRL_TRACE_PACKETS);
+    if (srl_get_trace_flags("default") != 0) return -9;
+    if (srl_get_trace_flags("vrf-test") != (SRL_TRACE_FSM | SRL_TRACE_PACKETS)) return -10;
+    srlShimTraceOptionsUpdate("vrf-test", 0);
+
+    return 0;
 }
 
 static eigrp_result_t srl_statistics_clear_msg_cb(eigrp_instance_t *runtime, void *arg) {

@@ -2,7 +2,7 @@ package main
 
 /*
 #cgo CFLAGS: -I../../upstream/eigrp/eigrp/code -I../../cshim
-#cgo LDFLAGS: -rdynamic -L../../cshim -L../../upstream/eigrp/eigrp/code -Wl,--wrap=eigrp_topology_prefix_admit -Wl,--wrap=eigrp_nbr_prefix_admit -Wl,--wrap=eigrp_update_receive -Wl,--wrap=eigrp_query_receive -Wl,--wrap=eigrp_topology_neighbor_down -Wl,--wrap=eigrp_nbr_codec_select -Wl,--wrap=eigrp_nbr_codec_update -Wl,--start-group -leigrp-core -lsrl-cshim -Wl,--end-group -lpthread -ldl -lstdc++
+#cgo LDFLAGS: -rdynamic -L../../cshim -L../../upstream/eigrp/eigrp/code -Wl,--wrap=eigrp_topology_prefix_admit -Wl,--wrap=eigrp_nbr_prefix_admit -Wl,--wrap=eigrp_update_receive -Wl,--wrap=eigrp_query_receive -Wl,--wrap=eigrp_topology_neighbor_down -Wl,--wrap=eigrp_nbr_codec_select -Wl,--wrap=eigrp_nbr_codec_update -Wl,--wrap=eigrp_log -Wl,--wrap=eigrp_eventlog_msg_add -Wl,--start-group -leigrp-core -lsrl-cshim -Wl,--end-group -lpthread -ldl -lstdc++
 #include <stdlib.h>
 #include "srl_cshim.h"
 */
@@ -466,13 +466,6 @@ func ShimInterfacesReport(netinst string) {
 	C.srlShimInterfacesReport(cNetinst)
 }
 
-//export srlGoEventLogReport
-func srlGoEventLogReport(netinst *C.char, eventNum C.uint32_t, timestampMs C.uint64_t, msg *C.char) {
-	if daemonApp != nil {
-		daemonApp.OnEventLogReport(C.GoString(netinst), uint32(eventNum), uint64(timestampMs), C.GoString(msg))
-	}
-}
-
 // ShimInterfaceBandwidthPercentUpdate updates the interface bandwidth-percent configuration.
 func ShimInterfaceBandwidthPercentUpdate(netinst, ifname, afiName string, percent uint32) int {
 	cNetinst := C.CString(netinst)
@@ -547,29 +540,20 @@ func ShimTopologyClear(netinst, prefix string) int {
 	return int(C.srlShimTopologyClear(cNetinst, cPfx))
 }
 
-// ShimEventLogSizeUpdate updates the DUAL event log size for a network instance.
-func ShimEventLogSizeUpdate(netinst string, size uint32) int {
+// ShimTraceOptionsUpdate updates the trace-options bitmask for a network instance.
+func ShimTraceOptionsUpdate(netinst string, flags uint32) int {
 	cNetinst := C.CString(netinst)
 	defer C.free(unsafe.Pointer(cNetinst))
-	return int(C.srlShimEventLogSizeUpdate(cNetinst, C.uint32_t(size)))
-}
-
-// ShimEventLogClear clears the DUAL event log for a network instance.
-func ShimEventLogClear(netinst string) int {
-	cNetinst := C.CString(netinst)
-	defer C.free(unsafe.Pointer(cNetinst))
-	return int(C.srlShimEventLogClear(cNetinst))
-}
-
-// ShimEventLogReport triggers DUAL event log reporting for a network instance.
-func ShimEventLogReport(netinst string) {
-	cNetinst := C.CString(netinst)
-	defer C.free(unsafe.Pointer(cNetinst))
-	C.srlShimEventLogReport(cNetinst)
+	return int(C.srlShimTraceOptionsUpdate(cNetinst, C.uint32_t(flags)))
 }
 
 // ShimTestRel030OverridesCheck runs unit checks on rel-0.3.0 CShim overrides.
 func ShimTestRel030OverridesCheck() int {
 	return int(C.srlTestRel030OverridesCheck())
+}
+
+// ShimTestLoggingCheck runs CShim unit checks on SR Linux interface name normalization and per-VRF trace-options.
+func ShimTestLoggingCheck() int {
+	return int(C.srlTestLoggingCheck())
 }
 

@@ -17,7 +17,7 @@ build: cshim
 	mkdir -p bin
 	cd src/cmd/srl-eigrpd && go build -ldflags="-s -w" -a -v -o ../../../bin/srl-eigrpd .
 
-VERSION ?= 0.1.3
+VERSION ?= 0.1.4
 
 package: build
 	mkdir -p dist

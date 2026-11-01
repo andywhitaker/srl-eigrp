@@ -21,7 +21,7 @@ On standalone SR Linux switches or virtual appliances (SR Linux VM):
 
 1. **Transfer the Package**:
    ```bash
-   scp dist/srl-eigrpd_0.1.3_amd64.deb admin@<switch-ip>:/tmp/
+   scp dist/srl-eigrpd_0.1.4_amd64.deb admin@<switch-ip>:/tmp/
    ```
 
 2. **Install via Debian Package Manager**:
@@ -31,7 +31,7 @@ On standalone SR Linux switches or virtual appliances (SR Linux VM):
    A:srl1# bash
    
    # In bash:
-   sudo dpkg -i /tmp/srl-eigrpd_0.1.3_amd64.deb
+   sudo dpkg -i /tmp/srl-eigrpd_0.1.4_amd64.deb
    exit
    ```
 
@@ -73,7 +73,7 @@ topology:
   kinds:
     nokia_srlinux:
       binds:
-        - dist/srl-eigrpd_0.1.3_amd64.deb:/tmp/srl-eigrpd.deb:ro
+        - dist/srl-eigrpd_0.1.4_amd64.deb:/tmp/srl-eigrpd.deb:ro
   nodes:
     srl1:
       kind: nokia_srlinux
@@ -167,7 +167,6 @@ The package includes native CLI plugins extending both `show` and `tools` operat
 | `show ... protocols eigrp routes` | Routes programmed in FIB, next-hops, composite metric, route type (Internal/External), and preference |
 | `show ... protocols eigrp topology` | DUAL topology table showing passive/active prefixes, successor count, Feasible Distance (FD), and Reported Distance (RD) |
 | `show ... protocols eigrp traffic` | Interface packet counters (reliable/unreliable multicast, unicast, retransmissions, CR packets) |
-| `show ... protocols eigrp event-log` | DUAL finite state machine and protocol event history log (sequence IDs, timestamps, and event descriptions) |
 | `show ... ipv4 route eigrp [prefix]` | EIGRP learned IPv4 routing table installed in FIB |
 | `show ... ipv6 route eigrp [prefix]` | EIGRP learned IPv6 routing table installed in FIB |
 | `show ... ipv4 route` | Native Nokia IPv4 route table showing installed EIGRP prefixes (rendered as `eigrp`) |
@@ -195,7 +194,6 @@ Total Routes: 1
 | `tools ... neighbor bfd-down <peer-ip>` | Triggers immediate neighbor teardown upon BFD session down notification |
 | `tools ... topology clear [prefix <cidr>]` | Clears the entire EIGRP DUAL topology table (or a single prefix) and triggers route resynchronization with active peers |
 | `tools ... statistics clear` | Resets all per-interface EIGRP packet traffic counters to zero |
-| `tools ... event-log clear` | Clears all recorded entries in the EIGRP protocol event log |
 | `tools ... graceful-restart planned-restart` | Initiates planned graceful restart (NSF) with hello graceful-shutdown signaling and FIB route retention |
 | `tools ... graceful-shutdown` | Sends EIGRP Goodbye (graceful shutdown) packets across active interfaces |
 | `tools ... restart` | Performs a fast protocol soft-restart / neighbor reset |
@@ -354,12 +352,12 @@ set / network-instance default protocols eigrp interface ethernet-1/1.0 bandwidt
 set / network-instance default protocols eigrp interface ethernet-1/1.0 delay 100
 ```
 
-### 8. Protocol Timers, Hop Count Limits, Maximum Prefix & Event Log Size
-Configure DUAL Stuck-in-Active (SIA) timer, hop count limits, topology prefix limits (`maximum-prefix`), and protocol event log history size (`event-log-size`):
+### 8. Protocol Timers, Hop Count Limits, Maximum Prefix & Trace Options
+Configure DUAL Stuck-in-Active (SIA) timer, hop count limits, topology prefix limits (`maximum-prefix`), and SR Linux native protocol `trace-options` (`adjacencies`, `packets`, `routes`, `fsm`, `graceful-restart`, `timers`, `events`, `all`) routed to `/var/log/srlinux/buffer/messages` (while critical events such as neighbor up/down, SIA, authentication mismatches, and prefix limits are always logged to `/var/log/srlinux/file/messages`):
 ```text
 set / network-instance default protocols eigrp timers active-time 3
 set / network-instance default protocols eigrp address-family ipv4-unicast maximum-hops 100
-set / network-instance default protocols eigrp event-log-size 500
+set / network-instance default protocols eigrp trace-options trace [ adjacencies fsm graceful-restart ]
 set / network-instance default protocols eigrp address-family ipv4-unicast maximum-prefix limit 1000 threshold 75 warning-only false
 ```
 
@@ -636,8 +634,8 @@ make deploy-srl
 make test-srl
 ```
 **52 Automated Tests Executed (100% Pass Rate):**
-- **IPv4 Default Instance**: Neighbor discovery, FIB route injection (preference 90), data plane ping, CLI show summary/neighbor/routes/interfaces/topology/traffic/event-log, State DB verification, CPM filter validation, tools neighbor clear, reset-all, topology clear, statistics clear & event-log clear.
-- **Config & Policy Enhancements**: Default-interface configuration, passive interface inheritance, named metrics keys, routing-policy metric augmentation, `default-metric`, `maximum-prefix`, `traffic-share-balanced`, `auto-summary`, `bandwidth-percent`, `event-log-size`, and dynamic interface deletion and re-addition.
+- **IPv4 Default Instance**: Neighbor discovery, FIB route injection (preference 90), data plane ping, CLI show summary/neighbor/routes/interfaces/topology/traffic, State DB verification, CPM filter validation, tools neighbor clear, reset-all, topology clear, and statistics clear.
+- **Config & Policy Enhancements**: Default-interface configuration, passive interface inheritance, named metrics keys, routing-policy metric augmentation, `default-metric`, `maximum-prefix`, `traffic-share-balanced`, `auto-summary`, `bandwidth-percent`, `trace-options`, and dynamic interface deletion and re-addition.
 - **Dual Admin/Oper State & Summarization**: Dual administrative and operational state modeling across all administrative controls, and dynamic summary-address tracking in State DB.
 - **Multi-VRF (`ip-vrf`)**: Secondary VRF (`vrf-1`) neighbor peering, isolated FIB injection, dataplane ping, CLI show reports, State DB streaming, and operational tools.
 - **IPv6 EIGRP**: IPv6 enable/disable lifecycle, link-local multicast neighbor peering (`ff02::a`), IPv6 FIB route installation, IPv6 data plane ping, CLI show commands, State DB telemetry, IPv6 tools clear, and IPv6 passive interface toggling.
@@ -690,5 +688,5 @@ make all
 # Clean build artifacts
 make clean
 ```
-The output `.deb` package will be created in `dist/srl-eigrpd_0.1.3_amd64.deb`.
+The output `.deb` package will be created in `dist/srl-eigrpd_0.1.4_amd64.deb`.
 

@@ -150,26 +150,6 @@ class Plugin(ToolsPlugin):
                 callback=self.tools_clear_topology
             )
 
-        evlog = eigrp.get_command_or_none("event-log")
-        if not evlog:
-            evlog = eigrp.add_command(
-                Syntax("event-log", help="EIGRP event log operations"),
-                update_location=False
-            )
-        if not evlog.has_command("clear"):
-            evlog.add_command(
-                Syntax("clear", help="Clear EIGRP protocol event log"),
-                update_location=False,
-                callback=self.tools_clear_event_log
-            )
-
-        if not eigrp.has_command("clear-event-log"):
-            eigrp.add_command(
-                Syntax("clear-event-log", help="Clear EIGRP protocol event log"),
-                update_location=False,
-                callback=self.tools_clear_event_log
-            )
-
         stats = eigrp.get_command_or_none("statistics")
         if not stats:
             stats = eigrp.add_command(
@@ -314,17 +294,6 @@ class Plugin(ToolsPlugin):
             output.print_line(f"Success: {res.get('message', 'EIGRP topology table cleared')}")
         else:
             output.print_line(f"Error: {res.get('message', 'Failed to clear EIGRP topology')}")
-
-    def tools_clear_event_log(self, state, output, arguments, **kwargs):
-        netinst = "default"
-        if hasattr(state, "line_commands") and state.line_commands.has_node("network-instance"):
-            netinst = state.line_commands.get_node("network-instance").get_or("name", "default")
-
-        res = send_ipc({"action": "clear-event-log", "netinst": netinst})
-        if res.get("status") == "ok":
-            output.print_line(f"Success: {res.get('message', 'EIGRP event log cleared')}")
-        else:
-            output.print_line(f"Error: {res.get('message', 'Failed to clear EIGRP event log')}")
 
     def tools_clear_statistics(self, state, output, arguments, **kwargs):
         netinst = "default"

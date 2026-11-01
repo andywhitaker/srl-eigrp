@@ -101,18 +101,26 @@ bool srlTestMatchRootWireIfname(const char *dev_name, const char *base_name);
 bool srlTestIsLocalPrefix(const char *netinst, const char *prefix_str, bool is_v6);
 void srlTestClearInterfaces(void);
 uint32_t srlTestRunBPFFilter(const uint32_t *ifindexes, size_t num_if, const uint8_t *pkt, size_t pkt_len, uint32_t ifindex);
-extern void srlGoEventLogReport(char *netinst, uint32_t event_num, uint64_t timestamp_ms, char *msg);
 int srlShimInterfaceBandwidthPercentUpdate(const char *netinst, const char *ifname, const char *afi_name, uint32_t percent);
 int srlShimTrafficShareBalancedUpdate(const char *netinst, const char *afi_name, bool balanced);
 int srlShimAutoSummaryUpdate(const char *netinst, const char *afi_name, bool enabled);
 int srlShimDefaultMetricUpdate(const char *netinst, const char *afi_name, uint32_t bw, uint32_t delay, uint8_t reliability, uint8_t load, uint32_t mtu);
 int srlShimMaxPrefixUpdate(const char *netinst, const char *afi_name, uint32_t max_prefixes, uint8_t threshold, bool warning_only);
 int srlShimTopologyClear(const char *netinst, const char *prefix_str);
-int srlShimEventLogSizeUpdate(const char *netinst, uint32_t size);
-int srlShimEventLogClear(const char *netinst);
-void srlShimEventLogReport(const char *netinst);
 int srlShimStatisticsClear(const char *netinst);
 int srlTestRel030OverridesCheck(void);
+
+#define SRL_TRACE_ADJACENCIES      (1u << 0)
+#define SRL_TRACE_PACKETS          (1u << 1)
+#define SRL_TRACE_ROUTES           (1u << 2)
+#define SRL_TRACE_FSM              (1u << 3)
+#define SRL_TRACE_GRACEFUL_RESTART (1u << 4)
+#define SRL_TRACE_TIMERS           (1u << 5)
+#define SRL_TRACE_EVENTS           (1u << 6)
+#define SRL_TRACE_ALL              (0x7Fu)
+
+int srlShimTraceOptionsUpdate(const char *netinst, uint32_t flags);
+int srlTestLoggingCheck(void);
 
 
 #ifdef __cplusplus

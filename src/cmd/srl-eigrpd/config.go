@@ -1205,13 +1205,42 @@ type AddressFamilyConfig struct {
 	MaximumPrefix        *MaxPrefixConfig    `json:"maximum-prefix,omitempty"`
 }
 
+type TraceOptionsConfig struct {
+	Trace []string `json:"trace,omitempty"`
+}
+
+func computeTraceFlags(traces []string) uint32 {
+	var flags uint32
+	for _, t := range traces {
+		switch strings.ToLower(strings.TrimSpace(t)) {
+		case "adjacencies":
+			flags |= uint32(C.SRL_TRACE_ADJACENCIES)
+		case "packets":
+			flags |= uint32(C.SRL_TRACE_PACKETS)
+		case "routes":
+			flags |= uint32(C.SRL_TRACE_ROUTES)
+		case "fsm":
+			flags |= uint32(C.SRL_TRACE_FSM)
+		case "graceful-restart":
+			flags |= uint32(C.SRL_TRACE_GRACEFUL_RESTART)
+		case "timers":
+			flags |= uint32(C.SRL_TRACE_TIMERS)
+		case "events":
+			flags |= uint32(C.SRL_TRACE_EVENTS)
+		case "all":
+			flags |= uint32(C.SRL_TRACE_ALL)
+		}
+	}
+	return flags
+}
+
 type EigrpConfig struct {
 	AdminState       string                  `json:"admin-state"`
 	AutonomousSystem uint16                  `json:"autonomous-system"`
 	RouterId         string                  `json:"router-id"`
 	RibScale         *uint8                  `json:"rib-scale,omitempty"`
 	WideMetrics      *bool                   `json:"wide-metrics,omitempty"`
-	EventLogSize     *uint32                 `json:"event-log-size,omitempty"`
+	TraceOptions     *TraceOptionsConfig     `json:"trace-options,omitempty"`
 	GracefulRestart  *GracefulRestartConfig  `json:"graceful-restart,omitempty"`
 	Timers           *TimersConfig           `json:"timers,omitempty"`
 	Metrics          *MetricsConfig          `json:"metrics,omitempty"`
@@ -1702,16 +1731,16 @@ func (d *EigrpDaemon) applyInstanceFeatures(inst *EigrpInstance) {
 	}
 	d.mu.RLock()
 	netinst := inst.netinst
-	evSize := inst.eventLogSize
-	if evSize == 0 {
-		evSize = 500
+	var traceOpts []string
+	if inst.adminState != "disable" && inst.asn != 0 && len(inst.traceOptions) > 0 {
+		traceOpts = append([]string(nil), inst.traceOptions...)
 	}
 	d.mu.RUnlock()
 
 	cNetinst := C.CString(netinst)
 	defer C.free(unsafe.Pointer(cNetinst))
 
-	C.srlShimEventLogSizeUpdate(cNetinst, C.uint32_t(evSize))
+	C.srlShimTraceOptionsUpdate(cNetinst, C.uint32_t(computeTraceFlags(traceOpts)))
 
 	for _, afName := range []string{"ipv4-unicast", "ipv6-unicast"} {
 		d.mu.RLock()
@@ -2887,27 +2916,38 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 		return
 	}
 
-	// 6c4. Handle sub-path event-log-size notification
-	if strings.Contains(jsPath, ".protocols.eigrp.event-log-size") || strings.Contains(jsPath, ".protocols.eigrp.event_log_size") {
+	// 6c4. Handle sub-path trace-options notification
+	if strings.Contains(jsPath, ".protocols.eigrp.trace-options") || strings.Contains(jsPath, ".protocols.eigrp.trace_options") {
 		inst := d.GetOrCreateInstance(netinst)
-		var evSize uint32 = 500
+		var traces []string
 		if op != ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE {
-			if err := json.Unmarshal([]byte(jsonStr), &evSize); err != nil || evSize == 0 {
-				var leaf struct {
-					EventLogSize uint32 `json:"event-log-size"`
+			var tc TraceOptionsConfig
+			if err := json.Unmarshal([]byte(jsonStr), &tc); err == nil && len(tc.Trace) > 0 {
+				traces = tc.Trace
+			} else {
+				var wrapped struct {
+					TraceOptions *TraceOptionsConfig `json:"trace-options"`
 				}
-				if err := json.Unmarshal([]byte(jsonStr), &leaf); err == nil && leaf.EventLogSize > 0 {
-					evSize = leaf.EventLogSize
+				if err := json.Unmarshal([]byte(jsonStr), &wrapped); err == nil && wrapped.TraceOptions != nil {
+					traces = wrapped.TraceOptions.Trace
 				} else {
-					evSize = 500
+					var arr []string
+					if err := json.Unmarshal([]byte(jsonStr), &arr); err == nil {
+						traces = arr
+					} else {
+						var single string
+						if err := json.Unmarshal([]byte(jsonStr), &single); err == nil && single != "" {
+							traces = []string{single}
+						}
+					}
 				}
 			}
 		}
 		d.mu.Lock()
-		inst.eventLogSize = evSize
+		inst.traceOptions = traces
 		d.mu.Unlock()
 		d.applyInstanceFeatures(inst)
-		log.Info().Str("netinst", netinst).Uint32("event_log_size", evSize).Msg("Updated EIGRP event-log-size via sub-path notification")
+		log.Info().Str("netinst", netinst).Strs("trace", traces).Msg("Updated EIGRP trace-options via sub-path notification")
 		go d.CollectAndPublish(context.Background())
 		return
 	}
@@ -4022,10 +4062,10 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 	} else {
 		inst.wideMetrics = true
 	}
-	if conf.EventLogSize != nil && *conf.EventLogSize > 0 {
-		inst.eventLogSize = *conf.EventLogSize
-	} else if inst.eventLogSize == 0 {
-		inst.eventLogSize = 500
+	if conf.TraceOptions != nil {
+		inst.traceOptions = append([]string(nil), conf.TraceOptions.Trace...)
+	} else {
+		inst.traceOptions = nil
 	}
 	if conf.GracefulRestart != nil {
 		inst.gracefulRestart = conf.GracefulRestart
@@ -4121,6 +4161,7 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 			}
 		}
 		d.mu.Unlock()
+		C.srlShimTraceOptionsUpdate(cNetinst, 0)
 		C.srlShimInstanceDelete(cNetinst)
 		C.srlShimInstanceDeleteV6(cNetinst, C.uint16_t(inst.asn))
 		log.Info().Str("netinst", netinst).Msg("EIGRP instance disabled")
@@ -4129,14 +4170,16 @@ func (d *EigrpDaemon) HandleConfigNotification(cfg *ndk.ConfigNotification) {
 	}
 
 	if conf.AutonomousSystem > 0 {
-		// Apply rib-scale and metrics before instance creation so initial Hellos use configured metric version
+		// Apply rib-scale, trace-options, and metrics before instance creation so initial Hellos use configured settings
 		C.srl_set_rib_scale(cNetinst, C.uint8_t(inst.ribScale))
 		metrics := conf.Metrics
 		d.mu.Lock()
 		inst.metrics = metrics
 		scale := inst.ribScale
 		wm := inst.wideMetrics
+		traceFlags := computeTraceFlags(inst.traceOptions)
 		d.mu.Unlock()
+		C.srlShimTraceOptionsUpdate(cNetinst, C.uint32_t(traceFlags))
 		d.applyMetrics(netinst, metrics, scale, wm)
 
 		cRouterId := C.CString(conf.RouterId)

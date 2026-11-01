@@ -830,18 +830,17 @@ func TestTelemetryReorganizedPathsAndSchemaRank(t *testing.T) {
 		t.Fatalf("unexpected statistics counters: %+v", stats)
 	}
 
-	// Verify schemaRank orders topology.prefix, topology.prefix.route, and event-log.entry strictly
+	// Verify schemaRank orders topology.prefix and topology.prefix.route strictly
 	rRoot := schemaRank(`.network_instance{.name=="default"}.protocols.eigrp`)
 	rDefAf := schemaRank(`.network_instance{.name=="default"}.protocols.eigrp.default-interface.address-family{.name=="ipv4-unicast"}`)
 	rIntf := schemaRank(`.network_instance{.name=="default"}.protocols.eigrp.interface{.interface-name=="ethernet-1/1.0"}`)
 	rAf := schemaRank(`.network_instance{.name=="default"}.protocols.eigrp.address-family{.name=="ipv4-unicast"}`)
 	rTopoPfx := schemaRank(`.network_instance{.name=="default"}.protocols.eigrp.topology.prefix{.prefix=="10.0.0.0/24"}`)
 	rTopoRt := schemaRank(`.network_instance{.name=="default"}.protocols.eigrp.topology.prefix{.prefix=="10.0.0.0/24"}.route{.next-hop=="10.0.0.2"}`)
-	rEvLog := schemaRank(`.network_instance{.name=="default"}.protocols.eigrp.event-log.entry{.id==1}`)
 
-	if !(rRoot < rAf && rAf < rDefAf && rDefAf < rEvLog && rEvLog < rIntf && rIntf < rTopoPfx && rTopoPfx < rTopoRt) {
-		t.Fatalf("invalid schemaRank ordering: root=%d af=%d defAf=%d evLog=%d intf=%d topoPfx=%d topoRt=%d",
-			rRoot, rAf, rDefAf, rEvLog, rIntf, rTopoPfx, rTopoRt)
+	if !(rRoot < rAf && rAf < rDefAf && rDefAf < rIntf && rIntf < rTopoPfx && rTopoPfx < rTopoRt) {
+		t.Fatalf("invalid schemaRank ordering: root=%d af=%d defAf=%d intf=%d topoPfx=%d topoRt=%d",
+			rRoot, rAf, rDefAf, rIntf, rTopoPfx, rTopoRt)
 	}
 }
 

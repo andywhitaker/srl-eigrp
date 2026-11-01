@@ -426,6 +426,43 @@ module srl_nokia-eigrp {
     uses eigrp-interface-address-family-config;
   }
 
+  grouping eigrp-trace-options {
+    container trace-options {
+      description
+        "Configure EIGRP protocol trace options for diagnostic logging to SR Linux syslog";
+      leaf-list trace {
+        type enumeration {
+          enum adjacencies {
+            description "Trace EIGRP neighbor adjacency state transitions and hello negotiations";
+          }
+          enum packets {
+            description "Trace EIGRP packet transmission and reception";
+          }
+          enum routes {
+            description "Trace EIGRP topology table, successor selection, and RIB route updates";
+          }
+          enum fsm {
+            description "Trace DUAL finite state machine transitions and Feasibility Condition evaluations";
+          }
+          enum graceful-restart {
+            description "Trace EIGRP Non-Stop Forwarding (NSF) and Graceful Restart events";
+          }
+          enum timers {
+            description "Trace EIGRP hello, hold, and SIA timer expirations and updates";
+          }
+          enum events {
+            description "Trace general EIGRP protocol and interface events";
+          }
+          enum all {
+            description "Enable all EIGRP trace categories";
+          }
+        }
+        description
+          "List of EIGRP trace categories to emit to /var/log/srlinux/buffer/messages";
+      }
+    }
+  }
+
   grouping eigrp-top {
     container eigrp {
       presence "Configure EIGRP protocol";
@@ -456,13 +493,6 @@ module srl_nokia-eigrp {
         type boolean;
         default true;
         description "Enable RFC 7868 64-bit wide metrics";
-      }
-      leaf event-log-size {
-        type uint32 {
-          range "0..100000";
-        }
-        default 500;
-        description "Maximum number of entries in the DUAL event log";
       }
       leaf oper-state {
         config false;
@@ -712,18 +742,7 @@ module srl_nokia-eigrp {
         uses eigrp-default-interface-config;
       }
 
-      container event-log {
-        config false;
-        description "DUAL finite state machine and protocol event log";
-        list entry {
-          key "id";
-          srl_nokia-ext:unordered-state-list "true";
-          description "DUAL finite state machine and protocol event log entries";
-          leaf id { type uint32; description "Event sequence number"; }
-          leaf timestamp { type string; description "Event timestamp"; }
-          leaf message { type string; description "Formatted event description"; }
-        }
-      }
+      uses eigrp-trace-options;
 
       list interface {
         key "interface-name";

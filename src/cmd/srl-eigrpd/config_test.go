@@ -420,7 +420,7 @@ func TestConfig_UpstreamFeaturesSubPaths(t *testing.T) {
 	}
 	netinst := "default"
 
-	// 1. Per-AFI traffic-share-balanced, auto-summary, maximum-paths, maximum-hops, import-policy, and top-level event-log-size
+	// 1. Per-AFI traffic-share-balanced, auto-summary, maximum-paths, maximum-hops, import-policy, and top-level trace-options
 	d.HandleConfigNotification(&ndk.ConfigNotification{
 		Key:  &ndk.ConfigKey{JsPath: `.network_instance{.name=="default"}.protocols.eigrp.address-family{.name=="ipv4-unicast"}.traffic-share-balanced`},
 		Data: &ndk.ConfigData{DataType: &ndk.ConfigData_Json{Json: `true`}},
@@ -447,8 +447,8 @@ func TestConfig_UpstreamFeaturesSubPaths(t *testing.T) {
 		Op:   ndk.SdkMgrOperation_SDK_MGR_OPERATION_CREATE,
 	})
 	d.HandleConfigNotification(&ndk.ConfigNotification{
-		Key:  &ndk.ConfigKey{JsPath: `.network_instance{.name=="default"}.protocols.eigrp.event-log-size`},
-		Data: &ndk.ConfigData{DataType: &ndk.ConfigData_Json{Json: `1000`}},
+		Key:  &ndk.ConfigKey{JsPath: `.network_instance{.name=="default"}.protocols.eigrp.trace-options`},
+		Data: &ndk.ConfigData{DataType: &ndk.ConfigData_Json{Json: `{"trace":["fsm","packets"]}`}},
 		Op:   ndk.SdkMgrOperation_SDK_MGR_OPERATION_CREATE,
 	})
 
@@ -471,8 +471,17 @@ func TestConfig_UpstreamFeaturesSubPaths(t *testing.T) {
 	if ip := inst.GetAfiImportPolicy("ipv4-unicast"); ip != "import-v4" {
 		t.Fatalf("expected ipv4-unicast import-policy import-v4, got %s", ip)
 	}
-	if inst.eventLogSize != 1000 {
-		t.Fatalf("expected eventLogSize 1000, got %d", inst.eventLogSize)
+	if len(inst.traceOptions) != 2 || inst.traceOptions[0] != "fsm" || inst.traceOptions[1] != "packets" {
+		t.Fatalf("expected traceOptions [fsm packets], got %+v", inst.traceOptions)
+	}
+
+	// Delete trace-options
+	d.HandleConfigNotification(&ndk.ConfigNotification{
+		Key: &ndk.ConfigKey{JsPath: `.network_instance{.name=="default"}.protocols.eigrp.trace-options`},
+		Op:  ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE,
+	})
+	if len(inst.traceOptions) != 0 {
+		t.Fatalf("expected traceOptions to be cleared on DELETE, got %+v", inst.traceOptions)
 	}
 
 	// 2. Per-AFI default-metric and maximum-prefix on ipv4-unicast
@@ -587,30 +596,18 @@ func TestConfig_UpstreamFeaturesSubPaths(t *testing.T) {
 	}
 }
 
-func TestEventLogReportAndSizeLimit(t *testing.T) {
-	d := &EigrpDaemon{
-		instances: make(map[string]*EigrpInstance),
+func TestTraceOptionsAndShimWrappers(t *testing.T) {
+	if got := computeTraceFlags(nil); got != 0 {
+		t.Fatalf("expected 0 for nil trace options, got 0x%x", got)
 	}
-	inst := newEigrpInstance("default")
-	inst.eventLogSize = 3
-	d.instances["default"] = inst
-
-	d.OnEventLogReport("default", 1, 1000, "DUAL event 1")
-	d.OnEventLogReport("default", 2, 2000, "DUAL event 2")
-	d.OnEventLogReport("default", 3, 3000, "DUAL event 3")
-	d.OnEventLogReport("default", 4, 4000, "DUAL event 4")
-
-	d.mu.RLock()
-	evCount := len(inst.eventLog)
-	firstID := inst.eventLog[0].ID
-	lastID := inst.eventLog[evCount-1].ID
-	d.mu.RUnlock()
-
-	if evCount != 3 {
-		t.Fatalf("expected eventLog trimmed to size 3, got %d", evCount)
+	if got := computeTraceFlags([]string{"adjacencies", "fsm"}); got != (0x01 | 0x08) {
+		t.Fatalf("expected 0x09 for adjacencies+fsm, got 0x%x", got)
 	}
-	if firstID != 2 || lastID != 4 {
-		t.Fatalf("expected event IDs [2..4], got first=%d last=%d", firstID, lastID)
+	if got := computeTraceFlags([]string{"all"}); got != 0x7F {
+		t.Fatalf("expected 0x7F for all, got 0x%x", got)
+	}
+	if got := computeTraceFlags([]string{"packets", "routes", "graceful-restart", "timers", "events"}); got != (0x02 | 0x04 | 0x10 | 0x20 | 0x40) {
+		t.Fatalf("expected 0x76 for remaining options, got 0x%x", got)
 	}
 
 	// Test Shim wrappers
@@ -619,10 +616,13 @@ func TestEventLogReportAndSizeLimit(t *testing.T) {
 	_ = ShimAutoSummaryUpdate("default", "ipv4-unicast", false)
 	_ = ShimDefaultMetricUpdate("default", "ipv4-unicast", 100000, 100, 255, 1, 1500)
 	_ = ShimMaxPrefixUpdate("default", "ipv4-unicast", 1000, 75, true)
-	_ = ShimEventLogSizeUpdate("default", 500)
-	_ = ShimEventLogClear("default")
-	ShimEventLogReport("default")
+	_ = ShimTraceOptionsUpdate("default", computeTraceFlags([]string{"fsm", "packets"}))
+	_ = ShimTraceOptionsUpdate("default", 0)
 	_ = ShimTopologyClear("default", "")
+
+	if rc := ShimTestLoggingCheck(); rc != 0 {
+		t.Fatalf("ShimTestLoggingCheck failed with code %d", rc)
+	}
 }
 
 func TestSummaryAddressAndMaxPrefixLeafDeletes(t *testing.T) {
